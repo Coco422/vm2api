@@ -147,14 +147,17 @@ export function inspectContainer(name) {
     'docker',
     'inspect',
     '--format',
-    '{{.State.Running}}|{{.State.Pid}}|{{.HostConfig.NetworkMode}}|{{.State.StartedAt}}|{{.Config.Image}}|{{.Config.Hostname}}|{{index .Config.Labels "kin.vm.runtime"}}|{{index .Config.Labels "kin.vm.role"}}',
+    '{{.State.Running}}|{{.State.Pid}}|{{.HostConfig.NetworkMode}}|{{.State.StartedAt}}|{{.Config.Image}}|{{.Config.Hostname}}|{{index .Config.Labels "kin.vm.runtime"}}|{{index .Config.Labels "kin.vm.role"}}|{{.State.Restarting}}',
     name,
   ])
   if (!r.ok) return null
-  const [running, pid, networkMode, startedAt, image, hostname, runtime, role] = r.stdout.split('|')
+  const [running, pid, networkMode, startedAt, image, hostname, runtime, role, restarting] = r.stdout.split('|')
+  // Docker reports Running=true during a restart-policy backoff; nothing can be exec'd there.
+  const crashLooping = restarting === 'true'
   return {
     name,
-    running: running === 'true',
+    running: running === 'true' && !crashLooping,
+    restarting: crashLooping,
     pid: Number(pid) || 0,
     ip: networkMode === 'host' ? PUBLIC_IP : null,
     networkMode: networkMode || null,
@@ -369,9 +372,10 @@ export function slotContainerNetworkMismatch(existing, vm) {
   return (existing?.networkMode || '') !== want
 }
 
-/** Reload must recreate (not restart) when the kernel is dead, egress network moved, or a GPT slot still runs kin-kernel. */
+/** Reload must recreate (not restart) when the kernel is dead, the container crash-loops, egress network moved, or a GPT slot still runs kin-kernel. */
 export function slotWorkerNeedsRecreate(existing, vm, paths) {
   if (!existing) return false
+  if (existing.restarting) return true
   if (codexContainerStale(existing, vm)) return true
   if (!slotKernelAlive(existing, paths, vm)) return true
   return slotContainerNetworkMismatch(existing, vm)
@@ -559,10 +563,11 @@ export function writeWorkerFiles(vm, projectRoot, { transparent, routing } = {})
   return { ...paths, kernelSocket: kernel?.socketPath || paths.kernelSocket }
 }
 
-/** Running slots survive Node deploy. Only an explicit recreate may docker rm -f. */
+/** Running slots survive Node deploy. Only an explicit recreate or a crash-looping container may docker rm -f. */
 export function shouldReplaceSlotContainer({ existing, recreate = false, network, image, runtime } = {}) {
   if (!existing) return false
   if (recreate === true) return true
+  if (existing.restarting) return true
   if (existing.running) return false
   const wrongNet = network != null && existing.networkMode && existing.networkMode !== network
   const wrongImg = image != null && existing.image && existing.image !== image

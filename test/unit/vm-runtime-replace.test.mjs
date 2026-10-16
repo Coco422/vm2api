@@ -151,6 +151,19 @@ test('kvm runner on the wrong egress network is recreated', (t) => {
   assert.equal(slotWorkerNeedsRecreate(existing, vm, paths), true)
 })
 
+test('crash-looping kvm runner is replaced and recreated on reload even on the right network', (t) => {
+  const runDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-reload-kvm-loop-'))
+  t.after(() => fs.rmSync(runDir, { recursive: true, force: true }))
+  const vm = { id: 'vm-08', runtime: { type: 'kvm' }, proxy: { id: 'px-a' } }
+  const paths = { kernelSocket: path.join(runDir, 'kernel.sock') }
+  const existing = { running: false, restarting: true, networkMode: 'kin-eg-px-a', runtime: 'kvm', image: 'img' }
+  assert.equal(slotWorkerNeedsRecreate(existing, vm, paths), true)
+  assert.equal(
+    shouldReplaceSlotContainer({ existing, recreate: false, network: 'kin-eg-px-a', image: 'img', runtime: 'kvm' }),
+    true,
+  )
+})
+
 test('unbound slot does not recreate for a missing desired network', (t) => {
   const runDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-reload-nopx-'))
   t.after(() => fs.rmSync(runDir, { recursive: true, force: true }))
