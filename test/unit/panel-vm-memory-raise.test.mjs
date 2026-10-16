@@ -62,10 +62,14 @@ test('PATCH vm memory raises docker limit and returns memory_raise payload', asy
   const root = tmpProject('vm-01')
   try {
     const execImpl = mockExec()
-    const { handlePanel, response } = handler(root, { machine: { memory: '1g' } }, {
-      raiseDockerSlotMemory: (projectRoot, vm, memory, opts) =>
-        raiseDockerSlotMemory(projectRoot, vm, memory, { ...opts, execImpl }),
-    })
+    const { handlePanel, response } = handler(
+      root,
+      { machine: { memory: '1g' } },
+      {
+        raiseDockerSlotMemory: (projectRoot, vm, memory, opts) =>
+          raiseDockerSlotMemory(projectRoot, vm, memory, { ...opts, execImpl }),
+      },
+    )
     await patchVm(handlePanel)
     assert.equal(response.status, 200, JSON.stringify(response.body).slice(0, 500))
     assert.equal(response.body?.data?.memory_raise?.memory, '1g')

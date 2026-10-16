@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { toast } from 'sonner'
 import type { Vm } from '@/types/panel-vm'
+import { toast } from 'sonner'
 import { patchVm } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -15,7 +15,7 @@ import {
   DialogTrigger,
 } from '@/components/ui/dialog'
 import { Segmented } from '@/components/choice-tiles'
-import { dashboardQueryOptions } from '@/features/dashboard/queries'
+import { dashboardQueryOptions } from '@/features/overview/queries'
 import {
   runtimeTypeOf,
   VM_MEMORY_LABELS,
@@ -25,7 +25,8 @@ import {
 import { vmQueryOptions, vmsListQueryOptions } from '@/features/vm/queries'
 
 function configuredMemory(vm: Vm): VmMemoryOption | string {
-  const raw = vm.machine?.memory || (vm.runtime?.memory as string | undefined) || '512m'
+  const raw =
+    vm.machine?.memory || (vm.runtime?.memory as string | undefined) || '512m'
   return VM_MEMORY_OPTIONS.includes(raw as VmMemoryOption)
     ? (raw as VmMemoryOption)
     : String(raw)
@@ -103,7 +104,12 @@ function VmMemoryBlockInner({ vm }: { vm: Vm }) {
         </div>
         <Dialog open={open} onOpenChange={setOpen}>
           <DialogTrigger asChild>
-            <Button type='button' size='sm' variant='outline' className='h-7 text-xs'>
+            <Button
+              type='button'
+              size='sm'
+              variant='outline'
+              className='h-7 text-xs'
+            >
               提升
             </Button>
           </DialogTrigger>

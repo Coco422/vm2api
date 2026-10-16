@@ -56,12 +56,12 @@ import {
 import { VmUsagePanel } from '@/features/vm/usage-windows'
 import { refreshBlockedReason } from '@/features/vm/vm-action-menu'
 import { useVmActions } from '@/features/vm/vm-actions-context'
+import { VmMemoryBlock } from '@/features/vm/vm-memory-block'
 import {
   canReclaimVm,
   resolveOwnerUsername,
   vmOriginLabel,
 } from '@/features/vm/vm-owner'
-import { VmMemoryBlock } from '@/features/vm/vm-memory-block'
 import { VmSchedulingBlock } from '@/features/vm/vm-scheduling'
 
 function Section({

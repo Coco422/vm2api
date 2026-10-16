@@ -7,12 +7,7 @@ import { execFileSync } from 'node:child_process'
 import { slotHost } from './slot-host.mjs'
 import { containerName } from './vm-runtime.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
-import {
-  memoryMiB,
-  slotMemory,
-  validateVmConfigPatch,
-  VM_MEMORY_OPTIONS,
-} from './machine-spec.mjs'
+import { memoryMiB, slotMemory, validateVmConfigPatch, VM_MEMORY_OPTIONS } from './machine-spec.mjs'
 import { patchVmRecord } from './vm-registry.mjs'
 
 function defaultExec(argv, opts = {}) {
@@ -62,12 +57,7 @@ function dockerExec(vm, argv, execImpl, timeout) {
 
 export function inspectDockerContainerMemory(vm, execImpl = defaultExec) {
   const name = containerName(vm?.id)
-  const r = dockerExec(
-    vm,
-    ['docker', 'inspect', '-f', '{{.HostConfig.Memory}}', name],
-    execImpl,
-    10_000,
-  )
+  const r = dockerExec(vm, ['docker', 'inspect', '-f', '{{.HostConfig.Memory}}', name], execImpl, 10_000)
   if (!r.ok) {
     return {
       ok: false,
@@ -116,12 +106,7 @@ export function raiseDockerSlotMemory(projectRoot, vm, requestedMemory, { routin
 
   const mem = validated.memory
   const name = containerName(vm.id)
-  const update = dockerExec(
-    vm,
-    ['docker', 'update', '--memory', mem, '--memory-swap', mem, name],
-    execImpl,
-    15_000,
-  )
+  const update = dockerExec(vm, ['docker', 'update', '--memory', mem, '--memory-swap', mem, name], execImpl, 15_000)
   if (!update.ok) {
     const inspected = inspectDockerContainerMemory(vm, execImpl)
     return {

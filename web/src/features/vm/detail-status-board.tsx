@@ -375,7 +375,7 @@ export function VmStatusBoard(props: Props) {
                 {proxyNamedLabel(proxy)}
               </span>
             </Field>
-            <div className='py-2 space-y-2'>
+            <div className='space-y-2 py-2'>
               <VmSchedulingBlock vm={vm} conc={conc} rpm={rpm} />
               <VmMemoryBlock vm={vm} />
             </div>
