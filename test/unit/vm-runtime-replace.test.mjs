@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import {
   shouldReplaceSlotContainer,
+  ensureSlotImage,
   proxyEndpointFromUrl,
   proxyEndpointFromVm,
   readWorkerProxyEndpoint,
@@ -162,6 +163,19 @@ test('crash-looping kvm runner is replaced and recreated on reload even on the r
     shouldReplaceSlotContainer({ existing, recreate: false, network: 'kin-eg-px-a', image: 'img', runtime: 'kvm' }),
     true,
   )
+})
+
+test('ensureSlotImage refreshes a cached tag and falls back to it when the registry is unreachable', () => {
+  const calls = []
+  const registry = (pullOk) => (argv) => {
+    calls.push(argv.slice(0, 3).join(' '))
+    return { ok: argv[1] === 'pull' ? pullOk : true }
+  }
+  assert.equal(ensureSlotImage('debian-12', { runtime: 'kvm', run: registry(true) }).action, 'pulled')
+  assert.deepEqual(calls, ['docker pull ghcr.io/dofastted/kin-kvm-debian:12'])
+  calls.length = 0
+  assert.equal(ensureSlotImage('debian-12', { runtime: 'kvm', run: registry(false) }).action, 'present')
+  assert.deepEqual(calls, ['docker pull ghcr.io/dofastted/kin-kvm-debian:12', 'docker image inspect'])
 })
 
 test('unbound slot does not recreate for a missing desired network', (t) => {

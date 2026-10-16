@@ -63,12 +63,16 @@ export function timezoneForIndex(i) {
   return US_TIMEZONES[(Number(i) - 1) % US_TIMEZONES.length]
 }
 
-/** Pull the guest image, falling back to the in-repo Dockerfile when the registry is unreachable. */
+/**
+ * Runner tags are mutable: re-pull before creating a container so runner fixes reach
+ * hosts that cached an older tag. Unreachable registry falls back to the local image,
+ * then to the in-repo Dockerfile.
+ */
 export function ensureSlotImage(kernel, { run = sh, projectRoot, runtime } = {}) {
   const kvm = runtime === 'kvm' || runtime === RUNTIME_KVM
   const image = kvm ? kvmImageForKernel(kernel) : imageForKernel(kernel)
-  if (run(['docker', 'image', 'inspect', image], { timeout: 10_000 }).ok) return { ok: true, action: 'present', image }
   if (run(['docker', 'pull', image], { timeout: 300_000 }).ok) return { ok: true, action: 'pulled', image }
+  if (run(['docker', 'image', 'inspect', image], { timeout: 10_000 }).ok) return { ok: true, action: 'present', image }
   if (kvm) {
     const dir = path.join(projectRoot || MODULE_ROOT, KVM_BUILD_DIR)
     if (!fs.existsSync(path.join(dir, 'Dockerfile'))) {
