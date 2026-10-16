@@ -1,8 +1,12 @@
 # Changelog
 
-## 未发布
+## 1.3.180 — 2026-10-16
+
 - 已有 Docker 槽可通过面板 `PATCH /api/panel/vms/:id`（`machine.memory`）或槽位详情「内存 → 提升」在线上调容器内存：先 `docker update --memory … --memory-swap …`，读回 `HostConfig.Memory` 一致后才写入 `machine.memory` / `runtime.memory`；失败不写配置。不支持降配或 KVM。（#441）
 - 修复槽位开机成功后仍保留旧 PID、启动时间或停止标记：保存普通槽与 Codex 启动返回的运行信息，并保留等待就绪期间已写入的运行字段，避免在线升内存后 `runtime.memory` 被旧启动快照覆盖；凭证调度规则不变。（#479）
+- 修复 GitHub Release 查询失败却显示「已是最新」：失败及失效缓存返回 `check_status: failed`，`latest` / `latest_tag` / `update_available` 为 `null`；面板显示「检查失败」、隐藏失效最新版本号并禁用自动升级。自动升级发现版本失败时返回 HTTP 502 / `release_check_failed`，显式指定版本的升级仍可用。外部 API 调用方需区分未知的 `null` 与无更新的 `false`。（#480）
+
+已部署机升级：更新 Node 控制面与 `web/dist`，重启一次 Node。无迁移、无新依赖、无 payload 变更，不必 `wrap-cli/sync`，不必重建或重启槽位容器。在线升内存仅在主动操作时生效；不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
 
 ## 1.3.179 — 2026-10-16
 
