@@ -1,1 +1,1 @@
-@file:/workspace/src/lib/identity/claude-code-only.mjs
+@file:/tmp/ch1.txt

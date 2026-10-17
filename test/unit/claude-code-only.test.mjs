@@ -1,1 +1,1 @@
-@file:/workspace/test/unit/claude-code-only.test.mjs
+@file:/tmp/ch3.txt
