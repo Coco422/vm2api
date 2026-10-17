@@ -1,1 +1,1 @@
-test
+@file:/tmp/payload_file_0.txt
