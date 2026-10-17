@@ -1,1 +1,1 @@
-@file:/tmp/push-file-0.json
+@file:/workspace/docs/PROTOCOL.md
