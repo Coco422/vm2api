@@ -1,1 +1,1 @@
-@file:/tmp/pf-content-2.txt
+@file:/workspace/src/lib/identity/crs-persona.mjs

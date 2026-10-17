@@ -1,1 +1,1 @@
-@file:/tmp/pf-content-1.txt
+@file:/workspace/src/lib/identity/claude-code-only.mjs

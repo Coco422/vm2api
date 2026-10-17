@@ -1,1 +1,1 @@
-@file:/tmp/pf-content-3.txt
+@file:/workspace/test/unit/claude-code-only.test.mjs
