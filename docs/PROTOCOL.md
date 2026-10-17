@@ -1,1 +1,1 @@
-@file:/tmp/ch0.txt
+@file:/tmp/push-file-0.json
