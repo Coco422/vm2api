@@ -1,1 +1,1 @@
-file:///workspace/docs/PROTOCOL.md
+/workspace/docs/PROTOCOL.md
