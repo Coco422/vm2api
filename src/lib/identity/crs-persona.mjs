@@ -1,1 +1,1 @@
-@file:/tmp/ch2.txt
+@file:/workspace/src/lib/identity/crs-persona.mjs
