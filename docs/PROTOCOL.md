@@ -1,1 +1,1 @@
-@LOAD_FROM_PYTHON
+@LOAD_FROM:/tmp/pf_0.json
