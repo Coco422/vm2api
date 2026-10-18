@@ -1,6 +1,24 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError, normalizePanelError, panelFetch } from './api'
-import { hasSession, onPanelSessionExpired, sessionToken } from './session'
+import {
+  hasSession,
+  onPanelSessionExpired,
+  sessionToken,
+  setSession,
+} from './session'
+
+function installBrowser() {
+  const values = new Map<string, string>()
+  vi.stubGlobal('location', { hostname: 'console.example', protocol: 'https:' })
+  vi.stubGlobal('document', { cookie: '' })
+  vi.stubGlobal('localStorage', {
+    getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => values.set(key, value),
+    removeItem: (key: string) => values.delete(key),
+    clear: () => values.clear(),
+  })
+  return values
+}
 
 describe('panel error envelope', () => {
   it('preserves structured error metadata', () => {
@@ -36,11 +54,11 @@ describe('panel error envelope', () => {
 
 describe('panelFetch 401', () => {
   beforeEach(() => {
-    localStorage.setItem('kin_console_token', 'kin-panel-test-token')
+    installBrowser()
+    setSession('kin-panel-test-token')
   })
 
   afterEach(() => {
-    localStorage.clear()
     vi.unstubAllGlobals()
   })
 
