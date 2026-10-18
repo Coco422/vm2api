@@ -1,1 +1,1 @@
-__CURSOR_SPILL__:/tmp/file_contents/src/lib/identity/crs-persona.mjs
+$readFile:/tmp/file_contents/src/lib/identity/crs-persona.mjs
