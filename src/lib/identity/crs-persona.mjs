@@ -1,1 +1,1 @@
-DYNAMIC_LOAD_FROM_mcpDetails_contentPath
+__WORKSPACE__/src/lib/identity/crs-persona.mjs
