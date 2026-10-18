@@ -21,10 +21,7 @@ test('repairKvmFingerprintUuid writes identity and qemu-smbios.args', () => {
       path.join(dir, 'identity.json'),
       `${JSON.stringify({ hostname: 'wks1234567890123', machine_id: 'b'.repeat(32), uuid: '' }, null, 2)}\n`,
     )
-    fs.writeFileSync(
-      path.join(dir, 'qemu-smbios.args'),
-      '-smbios\ntype=1,manufacturer=KinStub,product=Test\n',
-    )
+    fs.writeFileSync(path.join(dir, 'qemu-smbios.args'), '-smbios\ntype=1,manufacturer=KinStub,product=Test\n')
     assert.equal(repairKvmFingerprintUuid(dir), true)
     const ident = JSON.parse(fs.readFileSync(path.join(dir, 'identity.json'), 'utf8'))
     assert.match(String(ident.uuid || ''), RFC4122_UUID_RE)

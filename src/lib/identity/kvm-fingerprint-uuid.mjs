@@ -126,7 +126,11 @@ export function repairKvmFingerprintUuid(dir) {
   let changed = false
   if (!isRfc4122Uuid(String(data.uuid || '').trim())) {
     data.uuid = uuid
-    if (data.hardware && typeof data.hardware === 'object' && !isRfc4122Uuid(String(data.hardware.hardware_uuid || '').trim())) {
+    if (
+      data.hardware &&
+      typeof data.hardware === 'object' &&
+      !isRfc4122Uuid(String(data.hardware.hardware_uuid || '').trim())
+    ) {
       data.hardware.hardware_uuid = uuid
     }
     atomicWriteJson(identPath, data, { mode: 0o600 })
