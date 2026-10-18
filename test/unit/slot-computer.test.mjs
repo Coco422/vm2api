@@ -25,7 +25,7 @@ test('missing kin-computer binary throws computer_service_missing', () => {
   }
 })
 
-test('kvm fingerprint with empty uuid is not ready and is regenerated', () => {
+test('kvm fingerprint with empty uuid is repaired in place with RFC4122 writeback', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-computer-bad-uuid-'))
   const vm = { id: 'vm-bad-uuid', kernel: 'ubuntu-24.04', runtime: { type: 'kvm' } }
   const dir = path.join(root, 'vms', vm.id, 'kvm', 'fingerprint')
@@ -36,10 +36,33 @@ test('kvm fingerprint with empty uuid is not ready and is regenerated', () => {
   )
   fs.writeFileSync(path.join(dir, 'qemu-smbios.args'), '-smbios\ntype=1,manufacturer=KinStub,product=Test\n')
   const fixed = ensureSlotComputer(root, vm)
-  assert.equal(fixed.created, true)
+  assert.equal(fixed.created, false)
   const ident = JSON.parse(fs.readFileSync(path.join(fixed.dir, 'identity.json'), 'utf8'))
   assert.match(String(ident.uuid || ''), RFC4122_UUID_RE)
+  const args = fs.readFileSync(path.join(fixed.dir, 'qemu-smbios.args'), 'utf8')
+  assert.match(args, new RegExp(`-uuid\\s*\\n${ident.uuid}`, 'm'))
+  assert.match(args, new RegExp(`uuid=${ident.uuid}`))
   fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('kin-computer empty uuid after create is coerced before acceptance', () => {
+  const prev = process.env.KIN_COMPUTER_STUB_EMPTY_UUID
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-computer-empty-create-'))
+  try {
+    process.env.KIN_COMPUTER_STUB_EMPTY_UUID = '1'
+    const vm = { id: 'vm-empty-create', kernel: 'ubuntu-24.04', runtime: { type: 'kvm' } }
+    const first = ensureSlotComputer(root, vm)
+    assert.equal(first.created, true)
+    const ident = JSON.parse(fs.readFileSync(path.join(first.dir, 'identity.json'), 'utf8'))
+    assert.match(String(ident.uuid || ''), RFC4122_UUID_RE)
+    const args = fs.readFileSync(path.join(first.dir, 'qemu-smbios.args'), 'utf8')
+    assert.doesNotMatch(args, /-uuid\s*\n\s*\n/)
+    assert.match(args, new RegExp(`uuid=${ident.uuid}`))
+  } finally {
+    if (prev == null) delete process.env.KIN_COMPUTER_STUB_EMPTY_UUID
+    else process.env.KIN_COMPUTER_STUB_EMPTY_UUID = prev
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })
 
 test('linux computer is written once and device_id stays 64-bit', () => {
