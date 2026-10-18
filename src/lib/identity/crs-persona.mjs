@@ -1,1 +1,1 @@
-PLACEHOLDER
+DYNAMIC_LOAD_FROM_mcpDetails_contentPath
