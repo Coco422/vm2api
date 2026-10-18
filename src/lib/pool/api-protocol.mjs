@@ -294,17 +294,27 @@ export async function runApiInference({
       }
     }
     const assembled = assembler.message
-    const hop = { body: assembled, stopReason: assembled?.stop_reason, sawMessageStop }
-    // Non-stream verified delivery requires message_stop (or SSE error above), not stop_reason alone.
-    const complete = resultBase.ok && sawMessageStop && isCompleteAssistantMessage(hop)
+    if (!sawMessageStop) {
+      return {
+        ...resultBase,
+        ok: false,
+        body: assembled || { type: 'error', error: { message: 'empty api upstream' } },
+        usage: assembled?.usage || null,
+        terminalState: assembled || committed ? 'incomplete' : 'rejected',
+        committed,
+        sawMessageStop: false,
+      }
+    }
+    const hop = { body: assembled, stopReason: assembled?.stop_reason, sawMessageStop: true }
+    const complete = resultBase.ok && isCompleteAssistantMessage(hop)
     return {
       ...resultBase,
       ok: complete,
       body: assembled || { type: 'error', error: { message: 'empty api upstream' } },
       usage: assembled?.usage || null,
-      terminalState: complete ? 'verified' : assembled ? 'incomplete' : 'rejected',
+      terminalState: complete ? 'verified' : 'incomplete',
       committed,
-      sawMessageStop,
+      sawMessageStop: true,
     }
   }
 
