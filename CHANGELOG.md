@@ -6,6 +6,7 @@
 - GPT/Codex 默认同账号重试 3 次、最多换号 3 次（401/403/429 直接换号；总尝试仍为 12；首条 SSE 发出后不再重试）。已有 `routing.json` 里写过 `failover` 字段的部署，仅重启不会自动变成上述新默认，须在面板「重试与切号」修改或手动合并配置。（#538）
 - 修复 API 后端非流式路径在上游 SSE 仅有 `message_start`、或仅有 `stop_reason` 而无 `message_stop` 时仍返回 200 的问题；须见到 `message_stop`（或 SSE `error` 终态）才视为 verified，否则 `incomplete_response`（502）。（#528）
 - 修复新建 KVM 槽位因 kin-computer 空 UUID 被写成 `qemu -uuid -` 而崩溃：控制面校验指纹 UUID、坏档案重生成，并在启动前强制回填合法 RFC4122 UUID。（#513）
+- 默认控制面镜像在 helpers 阶段编译并落地 `kin-api-kernel`，入口脚本同步刷新该二进制；缺失或无法就绪时在启动阶段失败，避免 API Endpoint 请求才报 `api_kernel_transport`。（#527）
 
 ## 1.3.190 — 2026-10-18
 
