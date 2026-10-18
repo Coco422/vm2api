@@ -3,6 +3,7 @@
 ## 未发布
 
 - 修复未配置 PUBLIC_BASE_URL / PUBLIC_HOST 且 HOST=0.0.0.0 时 /health、/v1/meta 返回不可访问的 base_url；监听地址不再作为对外 URL 回退。
+- 面板会话在 `verifyPanelSession` 成功时滑动续期：剩余有效期不足一半（7 天 TTL）时写回 `exp` 并持久化；控制台请求 `/api/panel/*` 若返回 401 则清本地登录态、跳转登录页并提示「登录已过期」。（#516）
 
 ## 1.3.190 — 2026-10-18
 
