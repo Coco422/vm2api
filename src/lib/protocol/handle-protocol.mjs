@@ -1082,9 +1082,10 @@ export function createHandleProtocol(deps) {
         if (result?.ok && protocol !== 'anthropic.messages') res.write('data: [DONE]\n\n')
         return res.end()
       }
-      if (!result?.ok) {
+      if (!result?.ok || isIncompleteAssistantMessage(result)) {
         if (isClientCancelledResult(result)) return finishClientCancel(res, result, logBag)
-        const mapped = mapProtocolClientError(result, logBag, 'upstream_error')
+        const failed = isIncompleteAssistantMessage(result) ? incompleteAssistantClientError(result) : result
+        const mapped = mapProtocolClientError(failed, logBag, failed?.body?.error?.code || 'upstream_error')
         stats.errors++
         return sendMapped(res, mapped)
       }

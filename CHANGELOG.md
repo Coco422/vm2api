@@ -2,6 +2,8 @@
 
 ## 未发布
 
+- 修复 API 后端非流式路径在上游 SSE 仅有 `message_start`、缺少 `message_stop` 等终端事件时仍返回 200 的问题；未完整收流时改为 `incomplete_response`（502），与 Go worker 终端判定一致。
+
 ## 1.3.190 — 2026-10-18
 
 - 增加 Responses WebSocket 入口及全局/GPT 两级推理 WS 开关；关闭 WS 不关闭 HTTP/SSE，也不影响终端/集群连接。每轮复用原鉴权、范围、调度、日志与计费链路；连接内续接回放完整历史，未知 ID 明确要求全量重放，不伪造原生上游连接复用。
