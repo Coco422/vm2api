@@ -11,9 +11,10 @@ export type ConsoleResult = KeyResult & {
   items?: KeyResult[]
 }
 
-export function endpointHasTestableKey(
-  endpoint: { apiKey: string; keyId?: string }
-): boolean {
+export function endpointHasTestableKey(endpoint: {
+  apiKey: string
+  keyId?: string
+}): boolean {
   return Boolean(endpoint.apiKey.trim() || endpoint.keyId)
 }
 

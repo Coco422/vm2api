@@ -256,8 +256,7 @@ export async function runAnthropicConsole({
 
   const keys = directKeys(input, store)
   const index = Number.isInteger(Number(input?.key_index)) ? Number(input.key_index) : null
-  const selected =
-    index == null ? keys : keys.filter((key) => key.row === index)
+  const selected = index == null ? keys : keys.filter((key) => key.row === index)
   if (!selected.length) {
     throw Object.assign(new Error('要测试的 key 不存在'), { code: 'key_not_found', status: 400 })
   }
