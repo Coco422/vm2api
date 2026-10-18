@@ -1,1 +1,1 @@
-@file:/tmp/payload_file_2.txt
+file:///workspace/src/lib/identity/claude-code-only.mjs
