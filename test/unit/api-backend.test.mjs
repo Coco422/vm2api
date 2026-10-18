@@ -11,6 +11,7 @@ import { CRS_OFFICIAL_AGENT_PROMPT } from '../../src/lib/identity/crs-persona.mj
 import { sessionIdFromOutboundBody } from '../../src/lib/identity/identity-rewrite.mjs'
 import { DEFAULT_AGENT_STANDING } from '../../src/lib/identity/persona-template.mjs'
 import { resolveInferenceBackend, messagesUrl, runApiInference } from '../../src/lib/pool/api-protocol.mjs'
+import { createClaudeMessageAssembler, applyClaudeSSELineToMessage } from '../../src/lib/protocol/convert.mjs'
 
 function fakeResponse() {
   return { headersSent: false, on() {}, once() {}, off() {}, write() {}, end() {} }
@@ -21,6 +22,14 @@ function messageStart() {
     type: 'message_start',
     message: { type: 'message', role: 'assistant', content: [], model: 'upstream-model' },
   })}\n\n`
+}
+
+function messageStop() {
+  return `data: ${JSON.stringify({ type: 'message_stop' })}\n\n`
+}
+
+function completeAnthropicSse(extraEvents = '') {
+  return messageStart() + extraEvents + messageStop()
 }
 
 test('only a managed key explicitly marked api uses the Anthropic address path', () => {
@@ -60,7 +69,7 @@ test('API backend applies the global official_full persona setting', async () =>
     req.on('end', () => {
       received = JSON.parse(Buffer.concat(chunks).toString('utf8'))
       res.writeHead(200, { 'content-type': 'text/event-stream' })
-      res.end(messageStart())
+      res.end(completeAnthropicSse())
     })
   })
   await new Promise((resolve, reject) => {
@@ -1140,6 +1149,219 @@ test('Responses API backend keeps parallel done-only tools in one stream state',
     assert.equal(wire.split('data: [DONE]').length - 1, 1)
   } finally {
     kernel.closeAllConnections()
+    await new Promise((resolve) => kernel.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('API Anthropic non-stream rejects message_start without message_stop', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-api-incomplete-'))
+  const socket = path.join(root, 'run', 'api-kernel.sock')
+  fs.mkdirSync(path.dirname(socket), { recursive: true })
+  const kernel = http.createServer((req, res) => {
+    req.resume()
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.end(messageStart())
+    })
+  })
+  await new Promise((resolve) => kernel.listen(socket, resolve))
+  try {
+    const result = await runApiInference({
+      cfg: { paths: { data: root } },
+      res: { headersSent: false, write: () => {} },
+      protocol: 'anthropic.messages',
+      clientStream: false,
+      deliveryMode: 'verified',
+      convertedBody: { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] },
+      inbound: {},
+      converters: { createClaudeMessageAssembler, applyClaudeSSELineToMessage },
+      scheduler: {
+        pick: () => ({
+          ok: true,
+          endpoint: { id: 'ep', kind: 'claude', protocol: 'anthropic', base_url: 'https://fixture.invalid' },
+          key: { id: 'key', api_key: 'fixture' },
+          upstream_model: 'claude-haiku-4-5',
+        }),
+      },
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.terminalState, 'incomplete')
+    assert.equal(result.sawMessageStop, false)
+    assert.equal(result.body?.type, 'message')
+  } finally {
+    kernel.closeAllConnections()
+    await new Promise((resolve) => kernel.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('API Anthropic non-stream rejects stop_reason and text without message_stop', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-api-delta-no-stop-'))
+  const socket = path.join(root, 'run', 'api-kernel.sock')
+  fs.mkdirSync(path.dirname(socket), { recursive: true })
+  const kernel = http.createServer((req, res) => {
+    req.resume()
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      const events = [
+        {
+          type: 'message_start',
+          message: { type: 'message', role: 'assistant', content: [], model: 'claude-haiku-4-5' },
+        },
+        { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+        { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'hello' } },
+        { type: 'content_block_stop', index: 0 },
+        {
+          type: 'message_delta',
+          delta: { stop_reason: 'end_turn', stop_sequence: null },
+          usage: { output_tokens: 1 },
+        },
+      ]
+      res.end(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''))
+    })
+  })
+  await new Promise((resolve) => kernel.listen(socket, resolve))
+  try {
+    const result = await runApiInference({
+      cfg: { paths: { data: root } },
+      res: { headersSent: false, write: () => {} },
+      protocol: 'anthropic.messages',
+      clientStream: false,
+      deliveryMode: 'verified',
+      convertedBody: { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] },
+      inbound: {},
+      converters: { createClaudeMessageAssembler, applyClaudeSSELineToMessage },
+      scheduler: {
+        pick: () => ({
+          ok: true,
+          endpoint: { id: 'ep', kind: 'claude', protocol: 'anthropic', base_url: 'https://fixture.invalid' },
+          key: { id: 'key', api_key: 'fixture' },
+          upstream_model: 'claude-haiku-4-5',
+        }),
+      },
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.terminalState, 'incomplete')
+    assert.equal(result.sawMessageStop, false)
+    assert.equal(result.body?.content?.[0]?.text, 'hello')
+  } finally {
+    kernel.closeAllConnections()
+    await new Promise((resolve) => kernel.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('API Anthropic non-stream accepts message_stop as terminal', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-api-complete-'))
+  const socket = path.join(root, 'run', 'api-kernel.sock')
+  fs.mkdirSync(path.dirname(socket), { recursive: true })
+  const kernel = http.createServer((req, res) => {
+    req.resume()
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.end(completeAnthropicSse())
+    })
+  })
+  await new Promise((resolve) => kernel.listen(socket, resolve))
+  try {
+    const result = await runApiInference({
+      cfg: { paths: { data: root } },
+      res: { headersSent: false, write: () => {} },
+      protocol: 'anthropic.messages',
+      clientStream: false,
+      deliveryMode: 'verified',
+      convertedBody: { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] },
+      inbound: {},
+      converters: { createClaudeMessageAssembler, applyClaudeSSELineToMessage },
+      scheduler: {
+        pick: () => ({
+          ok: true,
+          endpoint: { id: 'ep', kind: 'claude', protocol: 'anthropic', base_url: 'https://fixture.invalid' },
+          key: { id: 'key', api_key: 'fixture' },
+          upstream_model: 'claude-haiku-4-5',
+        }),
+      },
+    })
+    assert.equal(result.ok, true)
+    assert.equal(result.terminalState, 'verified')
+    assert.equal(result.sawMessageStop, true)
+    assert.equal(result.body?.type, 'message')
+  } finally {
+    kernel.closeAllConnections()
+    await new Promise((resolve) => kernel.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('API backend non-stream maps incomplete assistant hops to incomplete_response', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-api-incomplete-http-'))
+  const routingFile = path.join(root, 'routing.json')
+  const socketPath = path.join(root, 'run', 'api-kernel.sock')
+  fs.mkdirSync(path.dirname(socketPath), { recursive: true })
+  fs.writeFileSync(routingFile, JSON.stringify({ compatibility: { persona_preset: 'zero' } }))
+  const kernel = http.createServer((req, res) => {
+    req.resume()
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.end(messageStart())
+    })
+  })
+  await new Promise((resolve) => kernel.listen(socketPath, resolve))
+  const response = fakeResponse()
+  const handler = createHandleProtocol({
+    json: (_res, status, body) => {
+      response.status = status
+      response.body = body
+      return body
+    },
+    writeSSEHeaders() {},
+    readBody: async () => ({
+      model: 'claude-haiku-4-5',
+      stream: false,
+      max_tokens: 32,
+      messages: [{ role: 'user', content: 'hello' }],
+    }),
+    requireAuth: () => true,
+    cfg: {
+      rewrite: { enabled: false },
+      intercept: { rules: [] },
+      distill: { enabled: false },
+      limits: { max_body_bytes: 1024 * 1024, upstream_timeout_ms: 2000 },
+      paths: { data: root },
+    },
+    requestLog: { start: () => ({ request_id: 'api-incomplete-test' }), finish() {} },
+    stickyRouter: {},
+    accountQuota: {},
+    apiKeyStore: { acquire: () => ({ ok: true }), release() {} },
+    apiScheduler: {
+      pick: () => ({
+        ok: true,
+        endpoint: { id: 'ep-test', kind: 'claude', protocol: 'anthropic', base_url: 'https://upstream.invalid' },
+        upstream_model: 'claude-haiku-4-5',
+        key: { id: 'key-test', api_key: 'secret' },
+      }),
+    },
+    apiEndpointStore: {},
+    stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },
+    routingConfigPath: routingFile,
+    routingConfig: { compatibility: { persona_preset: 'zero' }, failover: {} },
+    groupsRepo: { rateMultiplier: () => 1 },
+  })
+  const req = {
+    method: 'POST',
+    url: '/v1/messages',
+    headers: { authorization: 'Bearer sk-vm-api', 'user-agent': 'test-client' },
+    apiKeyKind: 'managed',
+    apiKeyRecord: { category: 'api' },
+    once() {},
+    off() {},
+  }
+  try {
+    await handler.handleProtocol(req, response, 'anthropic.messages', '/v1/messages')
+    assert.equal(response.status, 502)
+    assert.equal(response.body.error.code, 'incomplete_response')
+  } finally {
     await new Promise((resolve) => kernel.close(resolve))
     fs.rmSync(root, { recursive: true, force: true })
   }
