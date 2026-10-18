@@ -111,7 +111,9 @@ const BIND_WILDCARD_HOSTS = new Set(['0.0.0.0', '::', '[::]'])
 
 /** Listen/bind addresses that must never appear in client-facing URLs. */
 export function isBindWildcardHost(host) {
-  const h = String(host ?? '').trim().toLowerCase()
+  const h = String(host ?? '')
+    .trim()
+    .toLowerCase()
   return BIND_WILDCARD_HOSTS.has(h)
 }
 

@@ -1,11 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import {
-  isBindWildcardHost,
-  resolvePublicBaseUrl,
-  resolvePublicHost,
-  loadConfig,
-} from '../../src/lib/core/config.mjs'
+import { isBindWildcardHost, resolvePublicBaseUrl, resolvePublicHost, loadConfig } from '../../src/lib/core/config.mjs'
 
 test('isBindWildcardHost rejects listen wildcards', () => {
   assert.equal(isBindWildcardHost('0.0.0.0'), true)
