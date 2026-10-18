@@ -149,10 +149,38 @@ export function codexFailoverBudget(routing = {}) {
   const failover = routing?.failover || {}
   const attempts = Number(failover.max_total_attempts)
   const switches = Number(failover.max_account_switches)
+  const sameRetries = Number(failover.max_same_account_retries)
   return {
     maxAttempts: Number.isFinite(attempts) && attempts > 0 ? Math.min(64, Math.floor(attempts)) : 12,
-    maxSwitches: Number.isFinite(switches) && switches >= 0 ? Math.min(63, Math.floor(switches)) : 10,
+    maxSwitches: Number.isFinite(switches) && switches >= 0 ? Math.min(63, Math.floor(switches)) : 3,
+    maxSameAccountRetries: Number.isFinite(sameRetries) && sameRetries >= 0 ? Math.min(16, Math.floor(sameRetries)) : 3,
   }
+}
+
+/** Same-account retries are only useful for transient failures; auth and quota errors switch seats. */
+export function isRetryableSameCodexAccount(
+  result,
+  { headersSent = false, conversionError = null, signal = null } = {},
+) {
+  if (!result || result.ok === true || result.committed === true || headersSent || conversionError) return false
+  if (signal?.aborted) return false
+  const status = Number(result.status) || 0
+  const code = String(result.body?.error?.code || result.error_code || '')
+  const message = String(result.body?.error?.message || result.error || '')
+  if (
+    /content_policy|refusal|usage_policy|guard|tool_arguments_mismatch|upstream_protocol_error/i.test(
+      `${code} ${message}`,
+    )
+  )
+    return false
+  if (result.transportError === true || status === 0) return true
+  if (status === 408) return true
+  if (status === 500 || status === 502 || status === 503 || status === 504) {
+    return (
+      code === '' || /server_error|provider_error|upstream_error|overloaded_error|internal_error|transport/i.test(code)
+    )
+  }
+  return false
 }
 
 function applyCodexRebuildBody(body, sessionId, mode) {
@@ -565,6 +593,9 @@ export async function handleCodexProtocol({
   const deadline = Date.now() + codexWaitTimeoutMs(routing)
   const gone = clientGoneSignal(req, res)
   const failoverBudget = codexFailoverBudget(routing)
+  const sameRetryDelay = Number(routing?.failover?.same_account_retry_delay_ms)
+  const sameRetryDelayMs =
+    Number.isFinite(sameRetryDelay) && sameRetryDelay >= 0 ? Math.min(10_000, sameRetryDelay) : 100
   logBag.via = 'codex-kernel'
   logBag.attempt_count = 0
   let last = null
@@ -707,57 +738,83 @@ export async function handleCodexProtocol({
         const outboundHeaders = codexKernelHeaders(req.headers, outboundBody, session)
         if (captureOutbound) logBag.outbound_body = outboundBody
         logBag.outbound_headers = redactHeaders(outboundHeaders)
-        const result = await runCodexKernelHop({
-          hop,
-          args: {
-            exec: execFor(projectRoot, vm),
-            signal: gone.signal,
-            body: outboundBody,
-            reqHeaders: req.headers,
-            envelope: {
+        let hopEmitted = false
+        const runHop = () =>
+          runCodexKernelHop({
+            hop,
+            args: {
+              exec: execFor(projectRoot, vm),
+              signal: gone.signal,
               body: outboundBody,
-              headers: outboundHeaders,
-              stream: true,
-              session,
-              options: { ...codexKernelRequestOptions(routing), installation_id: written?.installationId },
+              reqHeaders: req.headers,
+              envelope: {
+                body: outboundBody,
+                headers: outboundHeaders,
+                stream: true,
+                session,
+                options: { ...codexKernelRequestOptions(routing), installation_id: written?.installationId },
+              },
             },
-          },
-          onReasoningFallback: ({ body: retryBody }) => {
-            if (captureOutbound) logBag.outbound_body = retryBody
-          },
-          onEvent: async (line) => {
-            if (conversionError) return
-            const tier = serviceTierFromSseLine(line)
-            if (tier) responseServiceTier = tier
-            const seen = usageFromSseLine(line)
-            if (seen) streamedUsage = preferUsage(streamedUsage, seen)
-            if (!stream) {
-              chunks.push(line)
-              return
-            }
-            if (!res.headersSent) writeSSEHeaders(res)
-            if (protocol !== 'openai.responses') {
-              try {
-                const mapped =
-                  protocol === 'anthropic.messages'
-                    ? responsesSseToAnthropicEvents(line, anthropicSse)
-                    : responsesSseToChatChunk(line, 'codex', chatSse)
-                if (mapped) res.write(mapped)
-              } catch (error) {
-                if (error.code !== 'tool_arguments_mismatch') throw error
-                conversionError = { type: 'upstream_protocol_error', code: error.code, message: error.message }
-                res.write(
-                  protocol === 'anthropic.messages'
-                    ? `event: error\ndata: ${JSON.stringify({ type: 'error', error: conversionError })}\n\n`
-                    : `data: ${JSON.stringify({ error: conversionError })}\n\ndata: [DONE]\n\n`,
-                )
+            onReasoningFallback: ({ body: retryBody }) => {
+              if (captureOutbound) logBag.outbound_body = retryBody
+            },
+            onEvent: async (line) => {
+              hopEmitted = true
+              if (conversionError) return
+              const tier = serviceTierFromSseLine(line)
+              if (tier) responseServiceTier = tier
+              const seen = usageFromSseLine(line)
+              if (seen) streamedUsage = preferUsage(streamedUsage, seen)
+              if (!stream) {
+                chunks.push(line)
+                return
               }
-              return
-            }
-            const named = nameSseEvent(line)
-            if (named) res.write(named)
-          },
-        })
+              if (!res.headersSent) writeSSEHeaders(res)
+              if (protocol !== 'openai.responses') {
+                try {
+                  const mapped =
+                    protocol === 'anthropic.messages'
+                      ? responsesSseToAnthropicEvents(line, anthropicSse)
+                      : responsesSseToChatChunk(line, 'codex', chatSse)
+                  if (mapped) res.write(mapped)
+                } catch (error) {
+                  if (error.code !== 'tool_arguments_mismatch') throw error
+                  conversionError = { type: 'upstream_protocol_error', code: error.code, message: error.message }
+                  res.write(
+                    protocol === 'anthropic.messages'
+                      ? `event: error\ndata: ${JSON.stringify({ type: 'error', error: conversionError })}\n\n`
+                      : `data: ${JSON.stringify({ error: conversionError })}\n\ndata: [DONE]\n\n`,
+                  )
+                }
+                return
+              }
+              const named = nameSseEvent(line)
+              if (named) res.write(named)
+            },
+          })
+        let result = await runHop()
+        // A transient seat-local failure gets the same account up to N retries
+        // before the request spends a switch. 401/403/429 are never retried here:
+        // they are credential/account state and must move to another seat.
+        let sameAccountRetries = result?.transport_retried || result?.reasoning_history_retried ? 1 : 0
+        while (
+          sameAccountRetries < failoverBudget.maxSameAccountRetries &&
+          attempts < failoverBudget.maxAttempts &&
+          isRetryableSameCodexAccount(result, {
+            headersSent: res.headersSent || hopEmitted,
+            conversionError,
+            signal: gone.signal,
+          })
+        ) {
+          sameAccountRetries += 1
+          attempts += 1
+          hops += 1
+          logBag.attempt_count = hops
+          logBag.codex_same_account_retried = sameAccountRetries
+          await new Promise((resolve) => setTimeout(resolve, sameRetryDelayMs))
+          hopEmitted = false
+          result = await runHop()
+        }
         // The log and total duration share ingress time; pool scoring keeps hop TTFT.
         logBag.first_token_ms = Number.isFinite(result?.firstTokenAt)
           ? Math.max(0, result.firstTokenAt - requestStartedAt)
@@ -831,7 +888,7 @@ export async function handleCodexProtocol({
         reportOpenAIAttempt(vm.id, attemptKind, result?.ttftMs ?? null)
         const failureHold = codexFailureHold(result)
         if (failureHold) holdOpenAIAccount(vm.id, failureHold)
-        if (res.headersSent) {
+        if (res.headersSent || hopEmitted) {
           stats.errors++
           logBag.error_code = result?.body?.error?.code || 'codex_upstream'
           logBag.upstream_status = result?.status || 0
