@@ -303,8 +303,6 @@ groupsRepo = new GroupsRepo()
 const apiEndpointStore = new ApiEndpointStore({ dataDir: cfg.paths.data })
 const apiScheduler = new ApiScheduler()
 apiScheduler.reload(apiEndpointStore.listRaw())
-ensureApiKernelToken(apiKernelPaths(cfg).tokenPath)
-startApiKernelProcess(cfg)
 const panelUsers = new PanelUserStore({ dataDir: cfg.paths.data, projectRoot: cfg.paths.project })
 try {
   panelUsers.bootstrapFromEnv(getPanelAdmin())
