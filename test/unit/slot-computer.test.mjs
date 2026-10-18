@@ -4,6 +4,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { RFC4122_UUID_RE } from '../../src/lib/identity/rfc4122-uuid.mjs'
 import { DEVICE_ID_RE, HOSTNAME_RE, MACHINE_ID_RE } from '../../src/lib/identity/workstation-fingerprint.mjs'
 import { assignComputerFingerprint, ensureSlotComputer } from '../../src/lib/identity/slot-computer.mjs'
 
@@ -22,6 +23,23 @@ test('missing kin-computer binary throws computer_service_missing', () => {
     else process.env.KIN_COMPUTER_BIN = prev
     fs.rmSync(root, { recursive: true, force: true })
   }
+})
+
+test('kvm fingerprint with empty uuid is not ready and is regenerated', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-computer-bad-uuid-'))
+  const vm = { id: 'vm-bad-uuid', kernel: 'ubuntu-24.04', runtime: { type: 'kvm' } }
+  const dir = path.join(root, 'vms', vm.id, 'kvm', 'fingerprint')
+  fs.mkdirSync(dir, { recursive: true })
+  fs.writeFileSync(
+    path.join(dir, 'identity.json'),
+    `${JSON.stringify({ hostname: 'wks1234567890123', machine_id: 'a'.repeat(32), uuid: '' }, null, 2)}\n`,
+  )
+  fs.writeFileSync(path.join(dir, 'qemu-smbios.args'), '-smbios\ntype=1,manufacturer=KinStub,product=Test\n')
+  const fixed = ensureSlotComputer(root, vm)
+  assert.equal(fixed.created, true)
+  const ident = JSON.parse(fs.readFileSync(path.join(fixed.dir, 'identity.json'), 'utf8'))
+  assert.match(String(ident.uuid || ''), RFC4122_UUID_RE)
+  fs.rmSync(root, { recursive: true, force: true })
 })
 
 test('linux computer is written once and device_id stays 64-bit', () => {

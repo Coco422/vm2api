@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url'
 import { isKvmRuntime } from '../vm/runtime-kind.mjs'
 import { atomicWriteJson } from '../vm/vm-file.mjs'
 import { generateWorkstationFingerprint, HOSTNAME_RE, MACHINE_ID_RE } from './workstation-fingerprint.mjs'
+import { isRfc4122Uuid } from './rfc4122-uuid.mjs'
 
 const MAC_RE = /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..')
@@ -43,7 +44,8 @@ function linuxComputer(dir) {
   const guest_machine_id = String(data.machine_id || '')
     .trim()
     .toLowerCase()
-  if (!HOSTNAME_RE.test(hostname) || !MACHINE_ID_RE.test(guest_machine_id)) return null
+  const uuid = String(data.uuid || '').trim()
+  if (!HOSTNAME_RE.test(hostname) || !MACHINE_ID_RE.test(guest_machine_id) || !isRfc4122Uuid(uuid)) return null
   try {
     if (!fs.statSync(smbios).size) return null
   } catch {
@@ -105,6 +107,7 @@ export function ensureSlotComputer(projectRoot, vm) {
     missing.code = 'computer_service_missing'
     throw missing
   }
+  if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true })
   fs.mkdirSync(dir, { recursive: true })
   try {
     runChecked(

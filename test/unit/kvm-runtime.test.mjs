@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { RFC4122_UUID_RE } from '../../src/lib/identity/rfc4122-uuid.mjs'
 import { buildKvmRunArgs, computerDockerArgs, shouldPublishComputer } from '../../src/lib/vm/vm-runtime.mjs'
 import { writeKernelConfig } from '../../src/lib/transport/rust-kernel-supervisor.mjs'
 
@@ -92,6 +93,37 @@ test('an existing container keeps its baked computer name', () => {
   assert.equal(shouldPublishComputer({ running: false, id: 'stopped' }), false)
   assert.equal(shouldPublishComputer(null), true)
   assert.equal(shouldPublishComputer(undefined), true)
+})
+
+test('kvm env coerces missing or invalid fingerprint uuid for QEMU', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kvm-fp-bad-uuid-'))
+  const kvmDir = path.join(root, 'kvm')
+  fs.mkdirSync(path.join(kvmDir, 'fingerprint'), { recursive: true })
+  fs.writeFileSync(
+    path.join(kvmDir, 'fingerprint', 'qemu-smbios.args'),
+    ['-smbios', 'type=1,manufacturer=ASUS,product=System Product Name,sku=SKU', ''].join('\n'),
+  )
+  const args = buildKvmRunArgs({
+    vm,
+    name: 'kin-02',
+    image: 'ghcr.io/example/kin-kvm-ubuntu:24.04',
+    hostName: 'guest-02',
+    network: 'kin-eg-px',
+    memory: '1g',
+    accel: 'tcg',
+    uid: 10002,
+    gid: 987,
+    home: '/data/vms/vm-02/cli-home',
+    runDir: '/data/vms/vm-02/run',
+    kvmDir,
+    shares: 'home,run',
+  })
+  const uuidEnv = args.find((arg) => String(arg).startsWith('KIN_KVM_SMBIOS_UUID='))
+  assert.ok(uuidEnv)
+  const value = String(uuidEnv).slice('KIN_KVM_SMBIOS_UUID='.length)
+  assert.notEqual(value, '-')
+  assert.match(value, RFC4122_UUID_RE)
+  fs.rmSync(root, { recursive: true, force: true })
 })
 
 test('kvm env uses fingerprint SMBIOS and does not carry smc or rom', () => {

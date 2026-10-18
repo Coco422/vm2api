@@ -19,6 +19,7 @@ import { ensureSlotClaudeOwnership, chownSlotRuntimeFile, replaceSlotOwnedFile }
 import { materializeWrapCli } from './wrap-cli-runtime.mjs'
 import { ensureGuestMachineIdFile } from '../identity/workstation-fingerprint.mjs'
 import { ensureSlotComputer, rememberComputer } from '../identity/slot-computer.mjs'
+import { coerceRfc4122Uuid } from '../identity/rfc4122-uuid.mjs'
 import { boundProxyUrl, ensureProxyEgress, isLocalEgressProxy, slotNetworkForVm } from './egress.mjs'
 import { socksProxyEndpoint } from './socks-address.mjs'
 import { assertProxyAllowed } from './proxy-policy.mjs'
@@ -628,7 +629,7 @@ function kvmEnvPairs(vm, { uid, gid, memMb, accel, hostName, machineId, shares, 
     `KIN_KVM_SMBIOS_VERSION=${s.version}`,
     `KIN_KVM_SMBIOS_FAMILY=${s.family}`,
     `KIN_KVM_SMBIOS_SERIAL=${s.serial}`,
-    `KIN_KVM_SMBIOS_UUID=${s.uuid}`,
+    `KIN_KVM_SMBIOS_UUID=${coerceRfc4122Uuid(s.uuid)}`,
     `KIN_KVM_DISK_SERIAL=${m.disk_serial}`,
     `KIN_KVM_HOSTNAME=${hostName}`,
     `KIN_KVM_MACHINE_ID=${machineId}`,
@@ -695,7 +696,7 @@ function readFingerprintSmbios(kvmDir) {
     version: pick('version'),
     family: pick('family'),
     serial: pick('serial'),
-    uuid: String(fields.uuid || uuid || '-').trim() || '-',
+    uuid: coerceRfc4122Uuid(String(fields.uuid || uuid || '').trim()),
   }
 }
 
