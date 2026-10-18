@@ -7,6 +7,7 @@
 - 修复 API 后端非流式路径在上游 SSE 仅有 `message_start`、或仅有 `stop_reason` 而无 `message_stop` 时仍返回 200 的问题；须见到 `message_stop`（或 SSE `error` 终态）才视为 verified，否则 `incomplete_response`（502）。（#528）
 - 修复新建 KVM 槽位因 kin-computer 空 UUID 被写成 `qemu -uuid -` 而崩溃：控制面校验指纹 UUID、坏档案重生成，并在启动前强制回填合法 RFC4122 UUID。（#513）
 - 默认控制面镜像在 helpers 阶段编译并落地 `kin-api-kernel`，入口脚本同步刷新该二进制；缺失或无法就绪时在启动阶段失败，避免 API Endpoint 请求才报 `api_kernel_transport`。（#527）
+- 修复删除租户后已分配 VM 残留 `owner_user_id`、无法回到公共号池参与额度切号的问题：删除时收回管理员分配的 VM，启动时补修已删除用户的旧记录；租户自建 VM 保持隔离，调度开关、额度冷却与凭证不变。升级只需更新 Node 控制面并重启，无数据库迁移或槽位重建。
 
 ## 1.3.190 — 2026-10-18
 
