@@ -1197,6 +1197,8 @@ server.on('clientError', (err, socket) => {
   )
 })
 
+const publicEndpoint = (suffix) => (cfg.base_url ? `${cfg.base_url}${suffix}` : null)
+
 const pub = {
   base_url: cfg.base_url,
   api_key_set: !!cfg.api_key,
@@ -1207,13 +1209,13 @@ const pub = {
   capabilities: GATEWAY_CAPABILITIES,
   limitations: LIMITATIONS,
   endpoints: {
-    health: `${cfg.base_url}/health`,
-    chat: `${cfg.base_url}/v1/chat/completions`,
-    responses: `${cfg.base_url}/v1/responses`,
-    messages: `${cfg.base_url}/v1/messages`,
-    count_tokens: `${cfg.base_url}/v1/messages/count_tokens`,
-    usage: `${cfg.base_url}/v1/usage`,
-    intercept_rules: `${cfg.base_url}/admin/intercept/rules`,
+    health: publicEndpoint('/health'),
+    chat: publicEndpoint('/v1/chat/completions'),
+    responses: publicEndpoint('/v1/responses'),
+    messages: publicEndpoint('/v1/messages'),
+    count_tokens: publicEndpoint('/v1/messages/count_tokens'),
+    usage: publicEndpoint('/v1/usage'),
+    intercept_rules: publicEndpoint('/admin/intercept/rules'),
   },
 }
 // Never persist the raw API key. Public snapshot only.

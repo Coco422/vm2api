@@ -2,6 +2,8 @@
 
 ## 未发布
 
+- 修复未配置 PUBLIC_BASE_URL / PUBLIC_HOST 且 HOST=0.0.0.0 时 /health、/v1/meta 返回不可访问的 base_url；监听地址不再作为对外 URL 回退。
+
 ## 1.3.190 — 2026-10-18
 
 - 增加 Responses WebSocket 入口及全局/GPT 两级推理 WS 开关；关闭 WS 不关闭 HTTP/SSE，也不影响终端/集群连接。每轮复用原鉴权、范围、调度、日志与计费链路；连接内续接回放完整历史，未知 ID 明确要求全量重放，不伪造原生上游连接复用。
