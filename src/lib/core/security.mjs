@@ -74,9 +74,7 @@ export function getPanelAdmin() {
   }
 }
 
-/** Panel session lifetime (sliding window on each verify). */
-export const PANEL_SESSION_TTL_MS = 7 * 24 * 3600 * 1000
-const SESSION_TTL_MS = PANEL_SESSION_TTL_MS
+const SESSION_TTL_MS = 7 * 24 * 3600 * 1000
 const panelSessions = new Map() // sha256(token) -> { user, role, exp }
 let _authenticateUser = null
 let _lookupRole = null

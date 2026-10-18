@@ -1,5 +1,10 @@
 import type { VmActiveHours, VmQuotaOverride } from '@/types/panel-vm'
-import { apiBase, clearSession, hasSession, sessionToken } from '@/lib/session'
+import {
+  apiBase,
+  expirePanelSession,
+  hasSession,
+  sessionToken,
+} from '@/lib/session'
 
 export type PanelErrorMetadata = {
   type?: string
@@ -102,16 +107,22 @@ function unwrapEnvelope(payload: unknown, status: number): unknown {
   return body.data !== undefined ? body.data : payload
 }
 
+function isPanelApiPath(path: string): boolean {
+  return path.startsWith('/api/panel/') && path !== '/api/panel/login'
+}
+
 export async function panelFetch(
   path: string,
   opts: RequestInit = {}
 ): Promise<Response> {
   const url = `${apiBase() || ''}${path}`
-  return fetch(url, {
+  const res = await fetch(url, {
     ...opts,
     credentials: 'include',
     headers: { ...authHeaders(), ...(opts.headers || {}) },
   })
+  if (res.status === 401 && isPanelApiPath(path)) expirePanelSession()
+  return res
 }
 
 export async function api<T = unknown>(
@@ -122,7 +133,6 @@ export async function api<T = unknown>(
   const res = await panelFetch(path, opts)
   const json = (await res.json().catch(() => ({}))) as Json
   if (res.status === 401) {
-    clearSession()
     throw apiErrorFrom(json, res.status, '登录已过期')
   }
   if (!res.ok) {

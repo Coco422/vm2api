@@ -4,6 +4,8 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
+const PANEL_SESSION_TTL_MS = 7 * 24 * 3600 * 1000
+
 test('panel admin has no hard-coded password fallback', async () => {
   const previous = process.env.KIN_ADMIN_PASSWORD
   delete process.env.KIN_ADMIN_PASSWORD
@@ -74,8 +76,8 @@ test('verifyPanelSession sliding-renews exp when remaining TTL is under half', a
     const after = JSON.parse(fs.readFileSync(file, 'utf8'))
     const expAfterVerify = after[storedKey].exp
     assert.ok(expBeforeVerify <= Date.now() + 61_000)
-    assert.ok(expAfterVerify >= Date.now() + security2.PANEL_SESSION_TTL_MS - 5_000)
-    assert.ok(expAfterVerify <= Date.now() + security2.PANEL_SESSION_TTL_MS + 1_000)
+    assert.ok(expAfterVerify >= Date.now() + PANEL_SESSION_TTL_MS - 5_000)
+    assert.ok(expAfterVerify <= Date.now() + PANEL_SESSION_TTL_MS + 1_000)
   } finally {
     if (previous == null) delete process.env.KIN_DATA_DIR
     else process.env.KIN_DATA_DIR = previous
@@ -94,7 +96,7 @@ test('verifyPanelSession does not renew when more than half of TTL remains', asy
     const raw = JSON.parse(fs.readFileSync(file, 'utf8'))
     const storedKey = Object.keys(raw)[0]
     const now = Date.now()
-    raw[storedKey].exp = now + Math.floor(security.PANEL_SESSION_TTL_MS * 0.75)
+    raw[storedKey].exp = now + Math.floor(PANEL_SESSION_TTL_MS * 0.75)
     fs.writeFileSync(file, JSON.stringify(raw))
 
     const security2 = await import(`../../src/lib/core/security.mjs?norel2=${Date.now()}`)
