@@ -1,1 +1,1 @@
-__WORKSPACE__/src/lib/identity/crs-persona.mjs
+__CURSOR_SPILL__:/tmp/file_contents/src/lib/identity/crs-persona.mjs
