@@ -295,7 +295,8 @@ export async function runApiInference({
     }
     const assembled = assembler.message
     const hop = { body: assembled, stopReason: assembled?.stop_reason, sawMessageStop }
-    const complete = resultBase.ok && isCompleteAssistantMessage(hop)
+    // Non-stream verified delivery requires message_stop (or SSE error above), not stop_reason alone.
+    const complete = resultBase.ok && sawMessageStop && isCompleteAssistantMessage(hop)
     return {
       ...resultBase,
       ok: complete,

@@ -2,7 +2,7 @@
 
 ## 未发布
 
-- 修复 API 后端非流式路径在上游 SSE 仅有 `message_start`、缺少 `message_stop` 等终端事件时仍返回 200 的问题；未完整收流时改为 `incomplete_response`（502），与 Go worker 终端判定一致。
+- 修复 API 后端非流式路径在上游 SSE 仅有 `message_start`、或仅有 `stop_reason` 而无 `message_stop` 时仍返回 200 的问题；须见到 `message_stop`（或 SSE `error` 终态）才视为 verified，否则 `incomplete_response`（502）。
 
 ## 1.3.190 — 2026-10-18
 

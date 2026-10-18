@@ -1200,6 +1200,62 @@ test('API Anthropic non-stream rejects message_start without message_stop', asyn
   }
 })
 
+test('API Anthropic non-stream rejects stop_reason and text without message_stop', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-api-delta-no-stop-'))
+  const socket = path.join(root, 'run', 'api-kernel.sock')
+  fs.mkdirSync(path.dirname(socket), { recursive: true })
+  const kernel = http.createServer((req, res) => {
+    req.resume()
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      const events = [
+        {
+          type: 'message_start',
+          message: { type: 'message', role: 'assistant', content: [], model: 'claude-haiku-4-5' },
+        },
+        { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+        { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'hello' } },
+        { type: 'content_block_stop', index: 0 },
+        {
+          type: 'message_delta',
+          delta: { stop_reason: 'end_turn', stop_sequence: null },
+          usage: { output_tokens: 1 },
+        },
+      ]
+      res.end(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''))
+    })
+  })
+  await new Promise((resolve) => kernel.listen(socket, resolve))
+  try {
+    const result = await runApiInference({
+      cfg: { paths: { data: root } },
+      res: { headersSent: false, write: () => {} },
+      protocol: 'anthropic.messages',
+      clientStream: false,
+      deliveryMode: 'verified',
+      convertedBody: { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] },
+      inbound: {},
+      converters: { createClaudeMessageAssembler, applyClaudeSSELineToMessage },
+      scheduler: {
+        pick: () => ({
+          ok: true,
+          endpoint: { id: 'ep', kind: 'claude', protocol: 'anthropic', base_url: 'https://fixture.invalid' },
+          key: { id: 'key', api_key: 'fixture' },
+          upstream_model: 'claude-haiku-4-5',
+        }),
+      },
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.terminalState, 'incomplete')
+    assert.equal(result.sawMessageStop, false)
+    assert.equal(result.body?.content?.[0]?.text, 'hello')
+  } finally {
+    kernel.closeAllConnections()
+    await new Promise((resolve) => kernel.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('API Anthropic non-stream accepts message_stop as terminal', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-api-complete-'))
   const socket = path.join(root, 'run', 'api-kernel.sock')
