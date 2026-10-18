@@ -10,11 +10,7 @@ import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import { CRS_OFFICIAL_AGENT_PROMPT } from '../../src/lib/identity/crs-persona.mjs'
 import { sessionIdFromOutboundBody } from '../../src/lib/identity/identity-rewrite.mjs'
 import { DEFAULT_AGENT_STANDING } from '../../src/lib/identity/persona-template.mjs'
-import {
-  resolveInferenceBackend,
-  messagesUrl,
-  runApiInference,
-} from '../../src/lib/pool/api-protocol.mjs'
+import { resolveInferenceBackend, messagesUrl, runApiInference } from '../../src/lib/pool/api-protocol.mjs'
 import { createClaudeMessageAssembler, applyClaudeSSELineToMessage } from '../../src/lib/protocol/convert.mjs'
 
 function fakeResponse() {
