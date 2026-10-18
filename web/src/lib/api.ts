@@ -123,7 +123,7 @@ export async function api<T = unknown>(
   const json = (await res.json().catch(() => ({}))) as Json
   if (res.status === 401) {
     clearSession()
-    throw apiErrorFrom(json, res.status, '鉴权失效，请重新登录')
+    throw apiErrorFrom(json, res.status, '登录已过期')
   }
   if (!res.ok) {
     throw apiErrorFrom(json, res.status, res.statusText || '请求失败')

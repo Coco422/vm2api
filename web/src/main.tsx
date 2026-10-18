@@ -37,7 +37,7 @@ const queryClient = new QueryClient({
     onError: (error) => {
       if (error instanceof ApiError && error.status === 401) {
         useAuthStore.getState().signOut()
-        toast.error('鉴权失效，请重新登录')
+        toast.error('登录已过期')
         if (!window.location.hash.startsWith('#/login')) {
           window.location.hash = '/login'
         }
