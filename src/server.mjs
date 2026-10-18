@@ -51,12 +51,7 @@ import { SettingsRepo } from './lib/db/repos/settings-repo.mjs'
 import { ApiEndpointStore } from './lib/admin/api-endpoints.mjs'
 import { ApiScheduler } from './lib/pool/api-scheduler.mjs'
 import { resolveInferenceBackend } from './lib/pool/api-protocol.mjs'
-import {
-  startApiKernelProcess,
-  apiKernelPaths,
-  ensureApiKernelToken,
-  apiKernelSnapshot,
-} from './lib/transport/api-kernel-client.mjs'
+import { bootApiKernel, apiKernelPaths, apiKernelSnapshot } from './lib/transport/api-kernel-client.mjs'
 import { PanelUserStore } from './lib/admin/panel-users.mjs'
 import { RequestLogStore } from './lib/admin/request-log.mjs'
 import {
@@ -305,8 +300,6 @@ groupsRepo = new GroupsRepo()
 const apiEndpointStore = new ApiEndpointStore({ dataDir: cfg.paths.data })
 const apiScheduler = new ApiScheduler()
 apiScheduler.reload(apiEndpointStore.listRaw())
-ensureApiKernelToken(apiKernelPaths(cfg).tokenPath)
-startApiKernelProcess(cfg)
 const panelUsers = new PanelUserStore({ dataDir: cfg.paths.data })
 try {
   panelUsers.bootstrapFromEnv(getPanelAdmin())
@@ -1278,6 +1271,8 @@ function shutdown(signal) {
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'))
 process.on('SIGINT', () => shutdown('SIGINT'))
+
+await bootApiKernel(cfg)
 
 server.listen(cfg.port, cfg.host, () => {
   try {
