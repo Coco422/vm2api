@@ -87,9 +87,7 @@ export async function bootApiKernel(cfg, { waitMs = 8000 } = {}) {
   ensureApiKernelToken(apiKernelPaths(cfg).tokenPath)
   const started = startApiKernelProcess(cfg)
   if (!started.ok) {
-    console.error(
-      `[api-kernel] boot failed: ${started.reason}${started.binPath ? ` (${started.binPath})` : ''}`,
-    )
+    console.error(`[api-kernel] boot failed: ${started.reason}${started.binPath ? ` (${started.binPath})` : ''}`)
     process.exit(1)
   }
   const deadline = Date.now() + Math.max(200, Number(waitMs) || 8000)
