@@ -583,7 +583,11 @@ async function ensureNodeSlotImage(session, nodeId, projectRoot, kernel, runtime
  * as a slot image on this node. Same bytes local slots bind-mount; a node only
  * sees them after the content-hashed image exists and the container is recreated.
  */
-export async function refreshNodeSlotPayload(vm, projectRoot, { routing, startFn = startRemoteSlot } = {}) {
+export async function refreshNodeSlotPayload(
+  vm,
+  projectRoot,
+  { routing, recreate = true, startFn = startRemoteSlot } = {},
+) {
   const id = vm?.id
   const nodeId = vmNodeId(vm)
   if (!id || !nodeId) return { id, ok: false, code: 'not_cluster_slot', error: '不是集群槽' }
@@ -597,7 +601,7 @@ export async function refreshNodeSlotPayload(vm, projectRoot, { routing, startFn
       const dockerSpec = await ensureNodeSlotImage(session, nodeId, projectRoot, kernel, 'docker')
       if (dockerSpec.fail) return { id, node_id: nodeId, ...dockerSpec.fail }
     }
-    const running = vm.status === 'running'
+    const running = recreate !== false && vm.status === 'running'
     if (!running) {
       return {
         id,
@@ -644,7 +648,7 @@ export async function refreshNodeSlotPayload(vm, projectRoot, { routing, startFn
 export async function refreshClusterSlotPayloads(
   projectRoot,
   vms,
-  { routing, refreshFn = refreshNodeSlotPayload } = {},
+  { routing, recreate = true, refreshFn = refreshNodeSlotPayload } = {},
 ) {
   const groups = new Map()
   const items = []
@@ -670,7 +674,7 @@ export async function refreshClusterSlotPayloads(
     groups.set(key, group)
   }
   for (const group of groups.values()) {
-    for (const vm of group) items.push(await refreshFn(vm, projectRoot, { routing }))
+    for (const vm of group) items.push(await refreshFn(vm, projectRoot, { routing, recreate }))
   }
   const failed = items.filter((item) => !item.ok)
   const changed = items.filter((item) => item.kernel_changed === true)

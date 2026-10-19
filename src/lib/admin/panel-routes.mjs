@@ -511,6 +511,36 @@ async function syncInstalledKernels({
       }
     }
   }
+  const traits = body.mode === 'traits' && !checkOnly
+  if (traits) {
+    for (const vm of localVms) {
+      if (isCodexVm(vm)) continue
+      const gone = await destroySlot(vm)
+      if (!gone.ok) {
+        const item = (local.items || []).find((row) => row.id === vm.id)
+        if (item) {
+          item.ok = false
+          item.code = gone.code || 'rebuild_failed'
+          item.error = gone.error || '重建新特征失败'
+        }
+        continue
+      }
+      const rebuilt = recreateVmFiles(project, vm, { mode: 'traits' })
+      const boot = await startSlotReady(rebuilt.vm, project, { recreate: true, routing: routingConfig })
+      const item = (local.items || []).find((row) => row.id === vm.id) || {
+        id: vm.id,
+        ok: true,
+        kernel_changed: true,
+      }
+      item.rebuild = boot.ok ? 'traits' : 'traits_failed'
+      if (!boot.ok) {
+        item.ok = false
+        item.code = boot.code || 'rebuild_failed'
+        item.error = boot.error || '重建新特征后启动失败'
+      }
+      if (!(local.items || []).includes(item)) local.items.push(item)
+    }
+  }
   const cluster = clusterVms.length
     ? checkOnly
       ? {
@@ -520,21 +550,25 @@ async function syncInstalledKernels({
           ok_count: clusterVms.length,
           failed_count: 0,
           changed_count: clusterVms.length,
-          items: clusterVms.map((vm) => ({
-            id: vm.id,
-            node_id: vm.node_id,
-            ok: true,
-            kernel_changed: true,
-            baked: true,
-          })),
+          items: clusterVms
+            .filter((vm) => !isCodexVm(vm))
+            .map((vm) => ({
+              id: vm.id,
+              node_id: vm.node_id,
+              ok: true,
+              kernel_changed: true,
+              baked: true,
+            })),
         }
-      : await refreshCluster(project, clusterVms, { routing: routingConfig })
+      : await refreshCluster(project, clusterVms, { routing: routingConfig, recreate: true })
     : null
   const failed = (local.items || []).filter((item) => !item.ok)
   local.ok = failed.length === 0
   local.ok_count = (local.items || []).length - failed.length
   local.failed_count = failed.length
-  return mergeKernelReports(local, cluster)
+  const report = mergeKernelReports(local, cluster)
+  report.mode = traits ? 'traits' : 'keep'
+  return report
 }
 
 /** Auth-link hint for the slot's proxy: `name · host:port`, or bare host:port when unnamed. */

@@ -351,3 +351,33 @@ test('wrap sync refreshes a cluster slot with the same kernel payload', async ()
     fs.rmSync(project, { recursive: true, force: true })
   }
 })
+
+test('kernel update keeps slot data unless traits mode is explicit', async () => {
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-panel-update-mode-'))
+  const cred = path.join(project, 'vms', 'local-slot', 'cli-home', '.claude', 'credentials.json')
+  try {
+    seedWrapTemplate(project)
+    fs.mkdirSync(path.dirname(cred), { recursive: true })
+    fs.writeFileSync(cred, '{"keep":true}')
+    fs.writeFileSync(
+      path.join(project, 'vms', 'local-slot.json'),
+      JSON.stringify({
+        id: 'local-slot',
+        name: 'local',
+        status: 'stopped',
+        claude: { email: 'keep@kin.test', has_access: true },
+        fingerprint: { hostname: 'kept-host', device_id: 'a'.repeat(64), guest_machine_id: 'b'.repeat(32) },
+      }),
+    )
+    const kept = panelFor(project, { readBody: async () => ({ restart: true, mode: 'keep' }) })
+    await kept.handlePanel({ method: 'POST' }, {}, new URL('http://localhost/api/panel/wrap-cli/sync'))
+    assert.equal(kept.response.status, 200, JSON.stringify(kept.response.body))
+    assert.equal(kept.response.body.data.mode, 'keep')
+    assert.equal(fs.readFileSync(cred, 'utf8'), '{"keep":true}')
+    const record = JSON.parse(fs.readFileSync(path.join(project, 'vms', 'local-slot.json'), 'utf8'))
+    assert.equal(record.claude.email, 'keep@kin.test')
+    assert.equal(record.fingerprint.hostname, 'kept-host')
+  } finally {
+    fs.rmSync(project, { recursive: true, force: true })
+  }
+})
