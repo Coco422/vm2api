@@ -39,6 +39,13 @@ import {
   SETUP_TOKEN_FLAVOR,
 } from '../oauth/claude-setup-token.mjs'
 import {
+  completeClaudeAuthLogin,
+  readAuthLoginSession,
+  startClaudeAuthLoginSession,
+  AUTH_LOGIN_FLAVOR,
+  AUTH_LOGIN_SOURCE,
+} from '../oauth/claude-auth-login.mjs'
+import {
   canOfficialCc,
   isApiKeyMode,
   isAnySetupTokenMode,
@@ -4493,6 +4500,22 @@ export function createPanelHandler(ctx) {
             )
           }
           const flavor = body.flavor || body.type || 'cai'
+          if (normalizeOauthFlavor(flavor) === 'claude_code') {
+            const generated = await startClaudeAuthLoginSession({
+              vm: existing,
+              projectRoot: cfg.paths.project,
+              force: body.force === true || body.force === 'true' || body.force === 1,
+            })
+            const px = existing.proxy || {}
+            return json(
+              res,
+              200,
+              panel.ok({
+                ...generated,
+                proxy_hint: slotProxyHint(px, proxyPool?.labelOf(px.id)),
+              }),
+            )
+          }
           const generated = generateAuthUrl({
             vmId: id,
             proxyUrl: slotProxy.proxyUrl,
@@ -4580,22 +4603,40 @@ export function createPanelHandler(ctx) {
           }
           const code = body.code || body.auth_code || ''
           const flavor = body.flavor || body.type || ''
+          const loginSession = readAuthLoginSession(cfg.paths.project, id)
+          const sessionKey = String(body.session_id || body.sessionId || '')
+          const officialLogin =
+            normalizeOauthFlavor(flavor) === 'claude_code' ||
+            (loginSession?.alive &&
+              !loginSession.expired &&
+              loginSession.session_id &&
+              loginSession.session_id === sessionKey)
           let oauth = looksLikeOfficialSetupToken(code)
             ? await completeClaudeSetupToken({
                 projectRoot: cfg.paths.project,
                 vmId: id,
-                sessionId: body.session_id || body.sessionId,
+                sessionId: sessionKey,
                 code,
               })
-            : await exchangeAuthCode({
-                sessionId: body.session_id || body.sessionId,
-                code,
-                proxyUrl: slotProxy.proxyUrl,
-                vmId: id,
-              })
+            : officialLogin
+              ? await completeClaudeAuthLogin({
+                  projectRoot: cfg.paths.project,
+                  vmId: id,
+                  sessionId: sessionKey,
+                  code,
+                })
+              : await exchangeAuthCode({
+                  sessionId: sessionKey,
+                  code,
+                  proxyUrl: slotProxy.proxyUrl,
+                  vmId: id,
+                })
           if (looksLikeOfficialSetupToken(code) || oauth.flavor === SETUP_TOKEN_FLAVOR) {
             oauth.type = 'official-setup-token'
             oauth.mode = 'official-setup-token'
+          } else if (oauth.flavor === AUTH_LOGIN_FLAVOR || oauth.source === AUTH_LOGIN_SOURCE) {
+            oauth.type = 'oauth'
+            oauth.mode = 'oauth'
           } else if (
             normalizeOauthFlavor(flavor) === 'setup_token' ||
             oauth.flavor === 'setup_token' ||
