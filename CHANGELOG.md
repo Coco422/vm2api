@@ -2,6 +2,12 @@
 
 ## 未发布
 
+## 1.3.196 — 2026-10-19
+
+- 面板 billingStats 10s 进程内缓存（按账号窗口签名）+ backfillMissingCosts 60s 限频，缓解大 usage_logs 库控制台卡顿（#574）
+
+已部署机升级：仅需更新 Node 控制面并重启；不必重建槽；不要更换 kernel/CLI；无迁移。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
 ## 1.3.195 — 2026-10-19
 
 - 修复控制面跨挂载时 slot-guest-bin 复制分支用 size+mtime 误判「已最新」：同大小新二进制改为 size+sha256 比较，复制只保留权限位、不再回写 mtime。（#572，续 #569）
