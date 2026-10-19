@@ -3,7 +3,14 @@ import {
   SESSION_IDLE_TTL_SECONDS_MAX,
   SESSION_IDLE_TTL_SECONDS_MIN,
 } from '@/types/panel-routing'
-import { Brain, Check, Clock3, Database, Scaling, ShieldCheck } from 'lucide-react'
+import {
+  Brain,
+  Check,
+  Clock3,
+  Database,
+  Scaling,
+  ShieldCheck,
+} from 'lucide-react'
 import {
   cacheTtlFromCompat,
   detectProxiedOfficialCcFromCompat,
@@ -34,7 +41,8 @@ const CLAUDE_CODE_FINGERPRINT: [string, string][] = [
 
 function autoCompactWindowValue(value: unknown) {
   const tokens = Number(value)
-  if (tokens === 200_000 || tokens === 500_000 || tokens === 1_000_000) return String(tokens)
+  if (tokens === 200_000 || tokens === 500_000 || tokens === 1_000_000)
+    return String(tokens)
   return 'model'
 }
 
