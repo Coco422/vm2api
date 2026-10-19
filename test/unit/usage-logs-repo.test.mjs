@@ -205,6 +205,32 @@ test('billingStats rate-limits maintenance backfill independently of cache keys'
   }
 })
 
+test('billingStats derives global totals from account aggregates without duplicate full scans', () => {
+  const { db, repo } = freshDb()
+  try {
+    seed(repo, [
+      { account_id: 'acc-1', vm_id: 'vm-a', input_tokens: 20, cache_read_tokens: 80, total_cost: 1 },
+      { account_id: 'acc-2', vm_id: null, input_tokens: 40, output_tokens: 5, total_cost: 2 },
+    ])
+    const costSelect = repo._costSelect.bind(repo)
+    let fullScans = 0
+    repo._costSelect = (cond, params) => {
+      if (!cond) fullScans++
+      return costSelect(cond, params)
+    }
+    const bill = repo.billingStats({ now: Date.now() })
+    assert.equal(fullScans, 0)
+    assert.equal(bill.total.requests, 2)
+    assert.equal(bill.total.input_tokens, 60)
+    assert.equal(bill.total.output_tokens, 5)
+    assert.equal(bill.total.cache_read_tokens, 80)
+    assert.ok(bill.total.total_cost > 0)
+    assert.equal(bill.total.total_cost, bill.accounts.reduce((sum, row) => sum + row.total_cost, 0))
+  } finally {
+    db.close()
+  }
+})
+
 test('aligned account windows re-sum per-row prompt tokens instead of mixed Anthropic formula', () => {
   const { db, repo } = freshDb()
   try {
