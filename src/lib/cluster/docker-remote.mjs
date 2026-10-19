@@ -328,6 +328,16 @@ export async function removeContainer(connect, id) {
   await dockerJson(connect, { method: 'DELETE', path: `${containerPath(id)}?force=1&v=1`, timeoutMs: 60_000 }, [204])
 }
 
+/** Preserve the container object for a rollback instead of deleting it. */
+export async function renameContainer(connect, id, name) {
+  if (!NAME_RE.test(String(name || ''))) throw new ClusterError(400, 'invalid_name', '容器名不合法')
+  await dockerJson(
+    connect,
+    { method: 'POST', path: `${containerPath(id)}/rename?name=${encodeURIComponent(name)}`, timeoutMs: 30_000 },
+    [204],
+  )
+}
+
 export async function containerLogs(connect, id, { tail = 200 } = {}) {
   const n = Math.min(5000, Math.max(1, Number.parseInt(tail, 10) || 200))
   const inspect = await dockerJson(connect, { path: `${containerPath(id)}/json` })

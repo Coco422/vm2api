@@ -32,6 +32,16 @@ reporting success. A failed service restart is reported per slot so the old VM
 identity remains intact and can be rolled back by republishing the previous
 binary.
 
+For a controlled rollout, run `scripts/migrate-legacy-cluster-slots.mjs` in
+the control-plane container. Pass VM IDs after the root and concurrency
+arguments to limit the rollout. It performs the same migration used by the
+one-click installer: legacy slot and egress containers are stopped, renamed to
+`*-legacy-<timestamp>`, and kept as stopped rollback copies; replacement
+containers use the persistent `/opt/kin-live` mount. Container IDs therefore
+change, but the VM, credentials, `vms/`, routing, and network identity do not.
+After this one-time migration, subsequent updates atomically replace only the
+Go binaries in `slot-bin` and restart the service processes.
+
 ## Upload audit log (debug)
 
 Each successful or failed `PostBatch` / GrowthBook eval append one line to
