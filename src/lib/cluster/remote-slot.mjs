@@ -85,17 +85,69 @@ function failure(err, fallbackCode = 'remote_slot_failed') {
 }
 
 const MIGRATION_CONFIG_KEYS = Object.freeze([
-  'Hostname', 'Domainname', 'User', 'AttachStdin', 'AttachStdout', 'AttachStderr', 'Tty', 'OpenStdin',
-  'StdinOnce', 'Env', 'Cmd', 'Image', 'Volumes', 'WorkingDir', 'Entrypoint', 'Labels', 'StopSignal',
-  'StopTimeout', 'Shell', 'ExposedPorts',
+  'Hostname',
+  'Domainname',
+  'User',
+  'AttachStdin',
+  'AttachStdout',
+  'AttachStderr',
+  'Tty',
+  'OpenStdin',
+  'StdinOnce',
+  'Env',
+  'Cmd',
+  'Image',
+  'Volumes',
+  'WorkingDir',
+  'Entrypoint',
+  'Labels',
+  'StopSignal',
+  'StopTimeout',
+  'Shell',
+  'ExposedPorts',
 ])
 const MIGRATION_HOST_CONFIG_KEYS = Object.freeze([
-  'Binds', 'LogConfig', 'NetworkMode', 'PortBindings', 'PublishAllPorts', 'Privileged', 'ReadonlyRootfs',
-  'Dns', 'DnsOptions', 'DnsSearch', 'ExtraHosts', 'GroupAdd', 'IpcMode', 'Links', 'Memory', 'MemorySwap',
-  'MemoryReservation', 'MemorySwappiness', 'NanoCpus', 'CpuShares', 'CpuQuota', 'CpuPeriod', 'CpusetCpus',
-  'CpusetMems', 'PidsLimit', 'RestartPolicy', 'SecurityOpt', 'ShmSize', 'UTSMode', 'UsernsMode', 'PidMode',
-  'Devices', 'DeviceCgroupRules', 'Init', 'OomKillDisable', 'OomScoreAdj', 'Runtime', 'Sysctls', 'Tmpfs',
-  'VolumesFrom', 'CgroupnsMode',
+  'Binds',
+  'LogConfig',
+  'NetworkMode',
+  'PortBindings',
+  'PublishAllPorts',
+  'Privileged',
+  'ReadonlyRootfs',
+  'Dns',
+  'DnsOptions',
+  'DnsSearch',
+  'ExtraHosts',
+  'GroupAdd',
+  'IpcMode',
+  'Links',
+  'Memory',
+  'MemorySwap',
+  'MemoryReservation',
+  'MemorySwappiness',
+  'NanoCpus',
+  'CpuShares',
+  'CpuQuota',
+  'CpuPeriod',
+  'CpusetCpus',
+  'CpusetMems',
+  'PidsLimit',
+  'RestartPolicy',
+  'SecurityOpt',
+  'ShmSize',
+  'UTSMode',
+  'UsernsMode',
+  'PidMode',
+  'Devices',
+  'DeviceCgroupRules',
+  'Init',
+  'OomKillDisable',
+  'OomScoreAdj',
+  'Runtime',
+  'Sysctls',
+  'Tmpfs',
+  'VolumesFrom',
+  'CgroupnsMode',
 ])
 
 function bindDestination(bind) {
@@ -1078,7 +1130,12 @@ export async function migrateRemoteServiceContainers(vm, projectRoot) {
         }),
       )
     }
-    return { ok: true, action: migrated.length ? 'migrated' : 'unchanged', migrated, binary_digest: binaries.digest || null }
+    return {
+      ok: true,
+      action: migrated.length ? 'migrated' : 'unchanged',
+      migrated,
+      binary_digest: binaries.digest || null,
+    }
   } catch (err) {
     return failure(err, 'legacy_service_migration_failed')
   }
@@ -1103,7 +1160,7 @@ export async function restartRemoteServices(vm, projectRoot, { telemetryEnabled 
     const image = slotImageSpec(projectRoot, vm.kernel || 'ubuntu-24.04')
     const egress = await ensureRemoteEgress(session, vm, {
       imageRef: image.ref,
-      binaryDigest: binaries.digest,
+      binaryDigest: migration.binary_digest,
     })
     if (!egress.ok) return { ok: false, error: egress.error, code: egress.code || 'egress_update_failed' }
     return {
