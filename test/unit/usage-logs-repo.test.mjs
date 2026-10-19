@@ -188,6 +188,31 @@ test('billingStats reuses identical panel snapshots but separates account window
   }
 })
 
+test('billingStats TTL starts after a slow aggregation finishes', () => {
+  const { db, repo } = freshDb()
+  const realNow = Date.now
+  try {
+    let clock = 1_000_000
+    Date.now = () => clock
+    let computes = 0
+    const compute = repo._computeBillingStats.bind(repo)
+    repo._computeBillingStats = (opts) => {
+      computes++
+      clock += 20_000 // Simulate a scan slower than the 10-second cache TTL.
+      return compute(opts)
+    }
+    const first = repo.billingStats()
+    assert.equal(repo.billingStats(), first)
+    assert.equal(computes, 1)
+    clock += 10_001
+    repo.billingStats()
+    assert.equal(computes, 2)
+  } finally {
+    Date.now = realNow
+    db.close()
+  }
+})
+
 test('billingStats rate-limits maintenance backfill independently of cache keys', () => {
   const { db, repo } = freshDb()
   try {

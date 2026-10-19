@@ -1059,7 +1059,11 @@ export class UsageLogsRepo {
         if (entry.expires_at <= cacheNow) this._billingStatsCache.delete(cacheKey)
       }
     }
-    if (cacheable) this._billingStatsCache.set(key, { value, expires_at: cacheNow + BILLING_STATS_CACHE_TTL_MS })
+    // Start the TTL after the expensive synchronous aggregation completes. On
+    // large databases the computation itself can exceed the TTL; anchoring the
+    // expiry at cache lookup time would make a freshly computed entry already
+    // stale and every refresh would scan the table again.
+    if (cacheable) this._billingStatsCache.set(key, { value, expires_at: Date.now() + BILLING_STATS_CACHE_TTL_MS })
     return value
   }
 
