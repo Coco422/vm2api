@@ -2,6 +2,8 @@
 
 ## 未发布
 
+- 一键更新和 `wrap-cli/sync` 同时更新集群槽：控制面拿到新的 kernel、cli-node、cc-node 与 Go `kin-worker` 遥测后，按节点和内核重建内容哈希镜像，再换容器。更新时可选保留原数据或重建新特征；不传时保留。Codex 槽不参与。本地槽仍只换挂载文件并重启进程。crag 数据面的集群槽仍拒绝。槽位页「重装 kernel」对集群槽走同一条路径。
+
 ## 1.3.197 — 2026-10-19
 
 - 修面板 billingStats：大 usage 库慢聚合时缓存 TTL 改为聚合完成后起算，避免刚写入即过期；复用 costByAccount 汇总全局 total/today 减少全表扫描（#576）
