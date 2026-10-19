@@ -19,6 +19,7 @@ import { slotExecCmd } from './slot-exec.mjs'
 import { getVm } from './vm-registry.mjs'
 import { OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
 import { ensureOfficialCredentialLink } from '../oauth/oauth-credentials.mjs'
+import { assertAuthLoginReady } from '../oauth/claude-auth-login.mjs'
 import path from 'node:path'
 import { officialCcUidGid } from './vm-runtime.mjs'
 
@@ -246,16 +247,24 @@ export function createSlotShell({ projectRoot, logger = console }) {
   let sessions = 0
   const wss = new WebSocketServer({ noServer: true, maxPayload: 1 << 20 })
 
-  function issueTicket(vmId) {
+  function issueTicket(vmId, { login = false } = {}) {
     const vm = getVm(projectRoot, vmId)
     if (!vm) return refuse(404, 'vm_not_found', 'vm not found')
     if (isCodexVm(vm)) return refuse(409, 'no_container', 'GPT 槽没有容器，无法打开终端')
+    if (login) {
+      try {
+        assertAuthLoginReady(projectRoot, vm)
+      } catch (err) {
+        const remote = err.code === 'remote_unsupported'
+        return refuse(remote ? 409 : 400, err.code || 'auth_login_not_ready', err.message)
+      }
+    }
     if (sessions >= MAX_SESSIONS) return refuse(429, 'shell_limit', `终端会话已达上限 ${MAX_SESSIONS}`)
     const now = Date.now()
     for (const [t, v] of tickets) if (v.exp <= now) tickets.delete(t)
     if (tickets.size >= MAX_TICKETS) return refuse(429, 'shell_limit', '终端 ticket 过多，请稍后再试')
     const ticket = crypto.randomBytes(24).toString('base64url')
-    tickets.set(ticket, { vmId: vm.id, exp: now + TICKET_TTL_MS })
+    tickets.set(ticket, { vmId: vm.id, exp: now + TICKET_TTL_MS, login })
     return { ok: true, ticket, expires_in: TICKET_TTL_MS / 1000 }
   }
 
@@ -277,7 +286,9 @@ export function createSlotShell({ projectRoot, logger = console }) {
     const sm = SHELL_RE.exec(url.pathname)
     if (!sm) return false
     const vmId = decodeURIComponent(sm[1])
-    if (!consumeTicket(url.searchParams.get('ticket') || '', vmId)) {
+    const ticket = url.searchParams.get('ticket') || ''
+    const entry = tickets.get(ticket)
+    if (!consumeTicket(ticket, vmId)) {
       rejectUpgrade(socket, 401, 'Unauthorized')
       return true
     }
@@ -285,6 +296,15 @@ export function createSlotShell({ projectRoot, logger = console }) {
     if (!vm || isCodexVm(vm)) {
       rejectUpgrade(socket, 404, 'Not Found')
       return true
+    }
+    const login = url.searchParams.get('login') === '1' || !!entry?.login
+    if (login) {
+      try {
+        assertAuthLoginReady(projectRoot, vm)
+      } catch {
+        rejectUpgrade(socket, 409, 'Conflict')
+        return true
+      }
     }
     if (sessions >= MAX_SESSIONS) {
       rejectUpgrade(socket, 429, 'Too Many Requests')
@@ -294,7 +314,7 @@ export function createSlotShell({ projectRoot, logger = console }) {
     const size = {
       cols: clampInt(url.searchParams.get('cols'), 10, 500, 80),
       rows: clampInt(url.searchParams.get('rows'), 5, 200, 24),
-      login: url.searchParams.get('login') === '1',
+      login,
     }
     wss.handleUpgrade(req, socket, head, (ws) => attach(ws, vm, size))
     return true
@@ -355,10 +375,11 @@ export function createSlotShell({ projectRoot, logger = console }) {
     try {
       connect = slotHost(vm).dockerApi()
       if (size.login) {
-        ensureOfficialCredentialLink(path.join(projectRoot, 'vms', vm.id, 'cli-home'), {
+        const linked = ensureOfficialCredentialLink(path.join(projectRoot, 'vms', vm.id, 'cli-home'), {
           ...officialCcUidGid(vm.id),
           create: true,
         })
+        if (!linked?.linked) throw new Error(linked?.error || '官方凭证链接失败')
       }
       const launch = panelShellLaunch(slotHost(vm).bins.cli)
       const env = ['TERM=xterm-256color', `${SESSION_ENV}=${token}`, `${RC_ENV}=${launch.rc}`]

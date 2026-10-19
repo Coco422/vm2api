@@ -4,7 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { panelShellLaunch } from '../../src/lib/vm/slot-shell.mjs'
+import { createSlotShell, panelShellLaunch } from '../../src/lib/vm/slot-shell.mjs'
 import { OFFICIAL_CLI_VERSION } from '../../src/lib/identity/vm-identity.mjs'
 import { ensureOfficialCredentialLink, readWorkerCredentialFile } from '../../src/lib/oauth/oauth-credentials.mjs'
 test('claude in the panel shell runs cli-node and points config at .claude', () => {
@@ -86,6 +86,26 @@ test('a fresh slot login links the official credential file onto the worker file
     )
     assert.equal(readWorkerCredentialFile(home).refresh_token, 'rt-fresh')
     assert.equal(ensureOfficialCredentialLink(home).linked, true)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('official login tickets refuse a cluster slot and a slot without cli-node', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-ticket-'))
+  fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
+  fs.writeFileSync(path.join(root, 'vms', 'vm-01.json'), JSON.stringify({ id: 'vm-01', node_id: 'node-a' }))
+  fs.writeFileSync(path.join(root, 'vms', 'vm-02.json'), JSON.stringify({ id: 'vm-02' }))
+  const shell = createSlotShell({ projectRoot: root, logger: { warn() {} } })
+  try {
+    const remote = shell.issueTicket('vm-01', { login: true })
+    assert.equal(remote.ok, false)
+    assert.equal(remote.error.code, 'remote_unsupported')
+    const missing = shell.issueTicket('vm-02', { login: true })
+    assert.equal(missing.ok, false)
+    assert.equal(missing.error.code, 'container_not_ready')
+    const ops = shell.issueTicket('vm-02')
+    assert.equal(ops.ok, true)
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }

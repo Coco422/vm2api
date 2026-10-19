@@ -2569,7 +2569,8 @@ export function createPanelHandler(ctx) {
       }
       // POST /api/panel/vms/:id/shell-ticket — single-use ticket for the slot terminal WebSocket
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/shell-ticket$/.test(p)) {
-        const issued = ctx.slotShell.issueTicket(p.split('/')[4])
+        const body = await readBody(req, 1024).catch(() => ({}))
+        const issued = ctx.slotShell.issueTicket(p.split('/')[4], { login: body.login === true })
         if (!issued.ok) return json(res, issued.status, { ok: false, error: issued.error })
         return json(res, 200, panel.ok({ ticket: issued.ticket, expires_in: issued.expires_in }))
       }

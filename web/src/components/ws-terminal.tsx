@@ -165,9 +165,10 @@ export function WsTerminal({
       send({ t: 'r', c: cols, r: rows })
     )
     const observer = new ResizeObserver(() => fit.fit())
-    observer.observe(host)
-
-    api<{ ticket: string }>(ticketPath, { method: 'POST' })
+    api<{ ticket: string }>(ticketPath, {
+      method: 'POST',
+      body: officialLogin ? JSON.stringify({ login: true }) : undefined,
+    })
       .then(({ ticket }) => {
         if (disposed) return
         const base = new URL(apiBase() || window.location.origin)
