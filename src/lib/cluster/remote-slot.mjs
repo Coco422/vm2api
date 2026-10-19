@@ -133,6 +133,8 @@ const MIGRATION_HOST_CONFIG_KEYS = Object.freeze([
   'CpusetMems',
   'PidsLimit',
   'RestartPolicy',
+  'CapAdd',
+  'CapDrop',
   'SecurityOpt',
   'ShmSize',
   'UTSMode',

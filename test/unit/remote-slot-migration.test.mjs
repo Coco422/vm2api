@@ -51,6 +51,27 @@ test('legacy egress command points at the persistent service mount', () => {
   assert.deepEqual(body.Cmd, ['/opt/kin-live/kin-egress', '-config', '/etc/kin-egress/egress.json'])
 })
 
+test('legacy container body preserves egress capability drops for canReuse', () => {
+  const egress = {
+    ...oldSlot,
+    HostConfig: {
+      ...oldSlot.HostConfig,
+      NetworkMode: 'host',
+      CapDrop: ['ALL'],
+      CapAdd: ['NET_ADMIN', 'NET_RAW'],
+      SecurityOpt: ['no-new-privileges'],
+    },
+  }
+  const body = legacyServiceContainerBody(egress, {
+    sourceDir: '/srv/vm-05/slot-bin',
+    removeDestinations: ['/usr/local/bin/kin-egress'],
+    command: ['/opt/kin-live/kin-egress', '-config', '/etc/kin-egress/egress.json'],
+  })
+  assert.deepEqual(body.HostConfig.CapDrop, ['ALL'])
+  assert.deepEqual(body.HostConfig.CapAdd, ['NET_ADMIN', 'NET_RAW'])
+  assert.deepEqual(body.HostConfig.SecurityOpt, ['no-new-privileges'])
+})
+
 test('migration keeps the old container as a stopped rollback copy', async () => {
   const state = new Map([['kin-05', structuredClone(oldSlot)]])
   let sequence = 0
