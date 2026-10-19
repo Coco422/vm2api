@@ -47,6 +47,28 @@ test('claude in the panel shell runs cli-node and points config at .claude', () 
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
+test('official login runs only when the panel login marker is set', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-login-'))
+  const bin = path.join(dir, 'cli-node')
+  fs.writeFileSync(bin, '#!/bin/sh\necho "cli-node $*"\n', { mode: 0o755 })
+  const { rc } = panelShellLaunch(bin)
+  const rcPath = path.join(dir, 'rc')
+  fs.writeFileSync(rcPath, `${rc}\n`)
+  const script = ['set +e', rc, 'exit 0'].join('\n')
+  const run = (env) =>
+    spawnSync('bash', ['-c', script], {
+      encoding: 'utf8',
+      env: { ...process.env, HOME: dir, PATH: `${dir}:${process.env.PATH}`, KIN_PANEL_RCFILE: rcPath, ...env },
+    })
+  const plain = run({})
+  const login = run({ KIN_PANEL_LOGIN: '1' })
+  assert.equal(plain.status, 0, plain.stderr)
+  assert.doesNotMatch(plain.stdout, /auth login/)
+  assert.equal(login.status, 0, login.stderr)
+  assert.match(login.stdout, /cli-node auth login/)
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
 test('panelShellLaunch rejects a non-absolute cli-node path', () => {
   assert.throws(() => panelShellLaunch('cli-node'), /invalid cli-node path/)
   assert.throws(() => panelShellLaunch('/tmp/a\nb'), /invalid cli-node path/)

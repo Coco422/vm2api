@@ -211,6 +211,7 @@ export function panelShellLaunch(cliBin) {
     'if [ ! -e "$HOME/.claude.json" ] && [ -f "$CLAUDE_CONFIG_DIR/.claude.json" ]; then ln -s .claude/.claude.json "$HOME/.claude.json" 2>/dev/null || true; fi',
     `claude() { export HOME="\${HOME:-/home/kincli}"; export CLAUDE_CONFIG_DIR="\${CLAUDE_CONFIG_DIR:-\$HOME/.claude}"; if [ -x ${q} ]; then ${q} "$@"; else echo "cli-node 不在 ${q}" >&2; return 127; fi; }`,
     SYSTEM_FACTS_RC,
+    'if [ -n "${KIN_PANEL_LOGIN:-}" ]; then printf "\\n"; claude auth login; fi',
     'rm -f "$KIN_PANEL_RCFILE"',
   ].join('\n')
   return {
@@ -290,6 +291,7 @@ export function createSlotShell({ projectRoot, logger = console }) {
     const size = {
       cols: clampInt(url.searchParams.get('cols'), 10, 500, 80),
       rows: clampInt(url.searchParams.get('rows'), 5, 200, 24),
+      login: url.searchParams.get('login') === '1',
     }
     wss.handleUpgrade(req, socket, head, (ws) => attach(ws, vm, size))
     return true
@@ -351,6 +353,7 @@ export function createSlotShell({ projectRoot, logger = console }) {
       connect = slotHost(vm).dockerApi()
       const launch = panelShellLaunch(slotHost(vm).bins.cli)
       const env = ['TERM=xterm-256color', `${SESSION_ENV}=${token}`, `${RC_ENV}=${launch.rc}`]
+      if (size.login) env.push('KIN_PANEL_LOGIN=1')
       const { Cmd } = slotExecCmd(vm, launch.cmd, {
         env: isKvmRuntime(vm) ? env : undefined,
         interactive: true,
