@@ -17,6 +17,7 @@ import {
 import { prepareCliHopBody } from '../../src/lib/protocol/outbound-attempt.mjs'
 import { callerAutoCompactWindow, defaultSeedPolicy, sanitizeInboundBody } from '../../src/lib/protocol/seed-policy.mjs'
 import { extractOpenaiUsage } from '../../src/lib/protocol/openai-usage.mjs'
+import { rememberThreadTurn, resetThreadBetasForTest } from '../../src/lib/protocol/thread-betas.mjs'
 import { callRustKernel, rustKernelHealth } from '../../src/lib/transport/rust-kernel-client.mjs'
 import { forwardApi, readApiJson } from '../../src/lib/transport/api-kernel-client.mjs'
 
@@ -164,6 +165,33 @@ test('cli-hop envelope keeps role=system turns that the VM betas do not declare'
     ['user', 'system', 'assistant', 'user'],
   )
   assert.deepEqual(out.body.system, body.system)
+})
+
+test('cli-hop continue reuses the beta list sent by its create turn', () => {
+  resetThreadBetasForTest()
+  const exec = { homeDir: '', vm: { claude: { mode: 'setup-token', scope: 'user:inference' } } }
+  const send = (body) => finalizeWorkerPayload({ body, reqHeaders: {}, exec, identity: null, cliHop: true })
+  const created = send({
+    model: 'claude-opus-5-5',
+    thread: { type: 'create' },
+    messages: [
+      { role: 'user', content: 'go' },
+      { role: 'system', content: 'reminder' },
+    ],
+  })
+  assert.ok(created.body.betas.includes('mid-conversation-system-2026-04-07'))
+  assert.equal(created.thread.type, 'create')
+  rememberThreadTurn('msg_create', created.thread)
+  const continued = send({
+    model: 'claude-opus-5-5',
+    thread: { type: 'continue', previous_message_id: 'msg_create' },
+    messages: [{ role: 'user', content: 'next' }],
+  })
+  assert.deepEqual(continued.body.betas, created.body.betas)
+  assert.equal(continued.headers['anthropic-beta'], created.headers['anthropic-beta'])
+  assert.equal(continued.thread.pin, 'pinned')
+  assert.deepEqual(continued.thread.added, ['mid-conversation-system-2026-04-07'])
+  assert.equal(send({ model: 'claude-opus-5-5', messages: [{ role: 'user', content: 'hi' }] }).thread, null)
 })
 
 test('cli-hop keeps the caller compact window outside settings', () => {
@@ -392,6 +420,70 @@ unixTest('callGoWorker marks null TTL as client-owned cache breakpoints', async 
   }
 })
 
+unixTest('callGoWorker records thread betas only after a successful JSON response', async () => {
+  resetThreadBetasForTest()
+  const sent = []
+  const fx = await fixture(async (req, res) => {
+    const chunks = []
+    for await (const chunk of req) chunks.push(chunk)
+    const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+    sent.push(payload.body.betas)
+    res.setHeader('content-type', 'application/json')
+    if (sent.length === 1) {
+      res.statusCode = 400
+      res.end(JSON.stringify({ type: 'error', id: 'msg_failed', error: { message: 'rejected' } }))
+      return
+    }
+    res.end(
+      JSON.stringify({
+        type: 'message',
+        id: `msg_turn${sent.length}`,
+        role: 'assistant',
+        content: [{ type: 'text', text: 'ok' }],
+      }),
+    )
+  })
+  try {
+    const exec = { ...fx.exec, vm: { ...fx.exec.vm, claude: { mode: 'setup-token', scope: 'user:inference' } } }
+    const create = {
+      model: 'claude-opus-5-5',
+      thread: { type: 'create' },
+      messages: [
+        { role: 'user', content: 'go' },
+        { role: 'system', content: 'reminder' },
+      ],
+    }
+    const failed = await callGoWorker({ exec, cliHop: true, body: create })
+    assert.equal(failed.ok, false)
+    const afterFailure = finalizeWorkerPayload({
+      body: {
+        model: 'claude-opus-5-5',
+        thread: { type: 'continue', previous_message_id: 'msg_failed' },
+        messages: [{ role: 'user', content: 'next' }],
+      },
+      exec,
+      cliHop: true,
+    })
+    assert.equal(afterFailure.thread.pin, 'miss')
+    const created = await callGoWorker({ exec, cliHop: true, body: create })
+    assert.equal(created.ok, true)
+    const resumed = await callGoWorker({
+      exec,
+      cliHop: true,
+      body: {
+        model: 'claude-opus-5-5',
+        thread: { type: 'continue', previous_message_id: 'msg_turn2' },
+        messages: [{ role: 'user', content: 'next' }],
+      },
+    })
+    assert.equal(resumed.ok, true)
+    assert.equal(resumed.threadBetas.pin, 'pinned')
+    assert.deepEqual(sent[2], sent[1])
+  } finally {
+    await fx.close()
+  }
+})
+
 unixTest('streamGoWorker accepts message_stop before delayed EOF', async () => {
   const fx = await fixture((req, res) => {
     res.setHeader('content-type', 'text/event-stream')
@@ -412,6 +504,55 @@ unixTest('streamGoWorker accepts message_stop before delayed EOF', async () => {
     assert.equal(result.terminalState, 'verified')
     assert.equal(result.committed, true)
     assert.ok(lines.some((line) => line.includes('message_stop')))
+  } finally {
+    await fx.close()
+  }
+})
+
+unixTest('streamGoWorker pins continue betas using the streamed response message id', async () => {
+  resetThreadBetasForTest()
+  const sent = []
+  const fx = await fixture(async (req, res) => {
+    const chunks = []
+    for await (const chunk of req) chunks.push(chunk)
+    sent.push(JSON.parse(Buffer.concat(chunks).toString('utf8')).body.betas)
+    res.setHeader('content-type', 'text/event-stream')
+    writeData(res, {
+      type: 'message_start',
+      message: {
+        type: 'message',
+        id: `msg_turn${sent.length}`,
+        role: 'assistant',
+        model: 'claude-opus-5-5',
+        content: [],
+      },
+    })
+    writeData(res, { type: 'content_block_start', index: 0, content_block: { type: 'text', text: 'ok' } })
+    writeData(res, { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 1 } })
+    writeData(res, { type: 'message_stop' })
+    res.end()
+  })
+  try {
+    const exec = { ...fx.exec, vm: { ...fx.exec.vm, claude: { mode: 'setup-token', scope: 'user:inference' } } }
+    const hop = (thread, messages) =>
+      streamGoWorker({
+        exec,
+        cliHop: true,
+        body: { model: 'claude-opus-5-5', stream: true, thread, messages },
+      })
+    const created = await hop({ type: 'create' }, [
+      { role: 'user', content: 'go' },
+      { role: 'system', content: 'reminder' },
+    ])
+    assert.equal(created.ok, true)
+    assert.equal(created.threadBetas.type, 'create')
+    const resumed = await hop({ type: 'continue', previous_message_id: 'msg_turn1' }, [
+      { role: 'user', content: 'next' },
+    ])
+    assert.equal(resumed.ok, true)
+    assert.equal(resumed.threadBetas.pin, 'pinned')
+    assert.deepEqual(resumed.threadBetas.added, ['mid-conversation-system-2026-04-07'])
+    assert.deepEqual(sent[1], sent[0])
   } finally {
     await fx.close()
   }
