@@ -4,6 +4,7 @@
 
 - 槽位种子页默认锁定：需确认解锁后才能改配置，播种前再次确认；时区/语言提供 en、cn、jp 基础选项。时区跟随当前 SOCKS5（空/非手动钉住）时展示出口时区，播种经 `timezone_follow_proxy` 写入；可改固定 IANA 时区或改回跟随。TZ/LANG/LC_ALL 仍不经 `extra_env` 覆盖契约键。
 - 槽位种子页：`settings.json` 的 env 行与 `theme` 可直接编辑并随播种写入；`autoUpdates`、`grove_enabled` 只读且播种时固定为 `false`；TZ/LANG/LC_ALL、遥测 kill-switch、Bedrock/Vertex、gateway hint 等同理只读（播种由契约重写）。缺 `CLAUDE_CODE_ATTRIBUTION_HEADER` 时默认 `0`。调试上传默认关，独立 query 拉最近 40 条上传，切换开关不重置未保存编辑；Go sidecar 写 `vms/<id>/run/telemetry-upload.log`，面板 `GET seed-settings?debug=1` 返回 `telemetry_log`。
+- 协议页可配置 `routing.compatibility.auto_compact_window`（100K–1M 或跟随模型）；入站在清理 settings 前提取调用方 `CLAUDE_CODE_AUTO_COMPACT_WINDOW`，经内部 `auto_compact_window` 字段进入当前 job，清理后的 body 不再携带该 env。
 - 槽位种子页按当前槽 `settings.json` 列出真实配置；`claude.setting` 可编辑播种；缺失文件返回 `null`、空文件返回空串，不用策略默认冒充槽内文件；遥测开关与 sidecar 进程状态分开展示，保存不因遥测进程刷新失败而 502。
 - fleet 遥测刷新在 kin-egress 二进制被替换（含 `(deleted)` 旧进程与脏 pidfile）时，会按 egress 配置扫停全部 helper、等待 `/proc/<pid>` 消失后再绑定新二进制；同一 SOCKS 出口的 stop/start 与 `ensureProxyEgress` 共用 per-proxy 锁，避免并发 telemetry 互相 SIGTERM。（#604）
 - 面板：侧栏「GitHub / 文档」两枚链接不再折行，字体偏宽时「文档」不会逐字竖排，空间不够先缩箭头再省略文字；VM 列表搜索框关闭浏览器自动填充，不再被回填成登录邮箱。
