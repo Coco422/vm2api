@@ -18,6 +18,9 @@ import { isKvmRuntime } from './runtime-kind.mjs'
 import { slotExecCmd } from './slot-exec.mjs'
 import { getVm } from './vm-registry.mjs'
 import { OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
+import { ensureOfficialCredentialLink } from '../oauth/oauth-credentials.mjs'
+import path from 'node:path'
+import { officialCcUidGid } from './vm-runtime.mjs'
 
 const SHELL_RE = /^\/api\/panel\/vms\/([^/]+)\/shell$/
 const TICKET_TTL_MS = 30_000
@@ -351,6 +354,12 @@ export function createSlotShell({ projectRoot, logger = console }) {
     })
     try {
       connect = slotHost(vm).dockerApi()
+      if (size.login) {
+        ensureOfficialCredentialLink(path.join(projectRoot, 'vms', vm.id, 'cli-home'), {
+          ...officialCcUidGid(vm.id),
+          create: true,
+        })
+      }
       const launch = panelShellLaunch(slotHost(vm).bins.cli)
       const env = ['TERM=xterm-256color', `${SESSION_ENV}=${token}`, `${RC_ENV}=${launch.rc}`]
       if (size.login) env.push('KIN_PANEL_LOGIN=1')

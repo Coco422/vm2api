@@ -6,6 +6,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { panelShellLaunch } from '../../src/lib/vm/slot-shell.mjs'
 import { OFFICIAL_CLI_VERSION } from '../../src/lib/identity/vm-identity.mjs'
+import { ensureOfficialCredentialLink, readWorkerCredentialFile } from '../../src/lib/oauth/oauth-credentials.mjs'
 test('claude in the panel shell runs cli-node and points config at .claude', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-rc-'))
   const bin = path.join(dir, 'cli-node')
@@ -67,6 +68,27 @@ test('official login runs only when the panel login marker is set', () => {
   assert.equal(login.status, 0, login.stderr)
   assert.match(login.stdout, /cli-node auth login/)
   fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('a fresh slot login links the official credential file onto the worker file', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-cred-'))
+  const home = path.join(root, 'cli-home')
+  try {
+    const linked = ensureOfficialCredentialLink(home, { create: true })
+    assert.equal(linked.linked, true)
+    const official = path.join(home, '.claude', '.credentials.json')
+    assert.equal(fs.readlinkSync(official), 'credentials.json')
+    fs.writeFileSync(
+      official,
+      JSON.stringify({
+        claudeAiOauth: { accessToken: 'at-fresh', refreshToken: 'rt-fresh', scopes: ['user:profile'] },
+      }),
+    )
+    assert.equal(readWorkerCredentialFile(home).refresh_token, 'rt-fresh')
+    assert.equal(ensureOfficialCredentialLink(home).linked, true)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })
 
 test('panelShellLaunch rejects a non-absolute cli-node path', () => {
