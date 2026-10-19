@@ -174,6 +174,7 @@ test('cli-hop keeps the caller compact window outside settings', () => {
   }
   const autoCompactWindow = callerAutoCompactWindow(inbound)
   const sanitized = sanitizeInboundBody(inbound, defaultSeedPolicy())
+  assert.equal(callerAutoCompactWindow(sanitized), null)
   const prepared = prepareCliHopBody(sanitized, { autoCompactWindow })
   const out = finalizeWorkerPayload({
     body: prepared,
