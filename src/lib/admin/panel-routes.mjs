@@ -3585,8 +3585,16 @@ export function createPanelHandler(ctx) {
       }
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/wrap-cli\/repair$/.test(p)) {
         const id = p.split('/')[4]
+        const body = await readBody(req, 8 * 1024).catch(() => ({}))
+        const mode = body.mode === 'traits' ? 'traits' : 'keep'
         const vm = getVm(cfg.paths.project, id)
         if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+        if (isCodexVm(vm)) {
+          return json(res, 409, {
+            ok: false,
+            error: { code: 'codex_kernel_only', message: 'Codex 槽只使用控制面 Codex kernel' },
+          })
+        }
         if (slotHost(vm).bakedKernel) {
           const refreshed = await refreshCluster(cfg.paths.project, [vm], { routing: ctx.routingConfig })
           const item = refreshed.items[0] || {
@@ -3595,7 +3603,27 @@ export function createPanelHandler(ctx) {
             error: '集群槽换镜像失败',
           }
           if (!item.ok) return json(res, 400, { ok: false, error: { code: item.code, message: item.error } })
-          return json(res, 200, panel.ok({ wrap: { ok: true, baked: true, image: item.image }, kernel: item.kernel }))
+          return json(
+            res,
+            200,
+            panel.ok({ mode, wrap: { ok: true, baked: true, image: item.image }, kernel: item.kernel }),
+          )
+        }
+        if (mode === 'traits') {
+          const gone = await destroySlot(vm)
+          if (!gone.ok)
+            return json(res, 500, { ok: false, error: { code: gone.code, message: gone.error || '重建新特征失败' } })
+          const rebuilt = recreateVmFiles(cfg.paths.project, vm, { mode: 'traits' })
+          const boot = await startSlotReady(rebuilt.vm, cfg.paths.project, {
+            recreate: true,
+            routing: ctx.routingConfig,
+          })
+          if (!boot.ok)
+            return json(res, 500, {
+              ok: false,
+              error: { code: boot.code, message: boot.error || '重建新特征后启动失败' },
+            })
+          return json(res, 200, panel.ok({ mode, rebuild: 'traits', boot: panel.publicSlotBoot(boot) }))
         }
         const wrap = materializeWrapCli(cfg.paths.project, vm)
         if (!wrap.ok) return json(res, 400, { ok: false, error: { code: wrap.code, message: wrap.error } })
@@ -3606,7 +3634,7 @@ export function createPanelHandler(ctx) {
           kernel = await restartRustKernel(slotExec(cfg.paths.project, vm))
         }
 
-        return json(res, 200, panel.ok({ wrap, kernel }))
+        return json(res, 200, panel.ok({ mode, wrap, kernel }))
       }
 
       if (req.method === 'GET' && /^\/api\/panel\/vms\/[^/]+\/official-cc-bootstrap$/.test(p)) {
