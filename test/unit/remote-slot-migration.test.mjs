@@ -96,16 +96,80 @@ test('migration keeps the old container as a stopped rollback copy', async () =>
     })
     return id
   }
+  const disconnect = async () => {}
   const result = await migrateRemoteContainer(
     {},
     'kin-05',
     legacyServiceContainerBody(oldSlot, { sourceDir: '/srv/vm-05/slot-bin', layout: true }),
-    { wasRunning: true, ops: { inspect, action, rename, create } },
+    { wasRunning: true, ops: { inspect, action, rename, create, disconnect } },
   )
   assert.equal(result.ok, true)
   assert.equal(result.action, 'migrated')
   assert.equal(state.get('kin-05').State.Running, true)
   assert.equal(state.get(result.backup).State.Running, false)
+})
+
+test('needsLegacyServiceMigration skips KVM slots already on the guest kin-live mount', () => {
+  const kvmSlot = {
+    ...oldSlot,
+    HostConfig: { ...oldSlot.HostConfig, Binds: [`/srv/vm-05/slot-bin:/opt/kin-guest/opt/kin-live:ro`] },
+    Mounts: [{ Destination: '/opt/kin-guest/opt/kin-live', Source: '/srv/vm-05/slot-bin', RW: false }],
+  }
+  assert.equal(needsLegacyServiceMigration(kvmSlot, { sourceDir: '/srv/vm-05/slot-bin' }), false)
+  const legacyWorker = {
+    ...oldSlot,
+    Mounts: [{ Destination: '/usr/local/bin/kin-worker', Source: '/srv/vm-05/old-worker', RW: false }],
+  }
+  assert.equal(needsLegacyServiceMigration(legacyWorker, { sourceDir: '/srv/vm-05/slot-bin' }), true)
+})
+
+test('migration disconnects the legacy container before pinning the same network IP', async () => {
+  const net = 'kin-05-net'
+  const ip = '172.20.0.2'
+  const occupancy = new Map([[net, { containerId: 'old-slot-id', ip }]])
+  const events = []
+  const slot = structuredClone(oldSlot)
+  const state = new Map([[ 'kin-05', slot ]])
+  let sequence = 0
+  const inspect = async (_docker, name) => state.get(name) || null
+  const action = async (_docker, name, operation) => {
+    const value = [...state.values()].find((item) => item.Id === name) || state.get(name)
+    if (!value) return
+    if (operation === 'stop') value.State.Running = false
+    if (operation === 'start') value.State.Running = true
+  }
+  const rename = async (_docker, from, to) => {
+    const value = state.get(from)
+    state.delete(from)
+    state.set(to, value)
+  }
+  const disconnect = async (_docker, network, containerId) => {
+    events.push(['disconnect', network, containerId])
+    const held = occupancy.get(network)
+    if (held?.containerId === containerId) occupancy.delete(network)
+  }
+  const create = async (_docker, name, body) => {
+    events.push(['create', name])
+    const pinned = body.NetworkingConfig?.EndpointsConfig?.[net]?.IPAMConfig?.IPv4Address
+    const held = occupancy.get(net)
+    if (held && held.ip === pinned) throw new Error('address already in use')
+    const id = `new-${++sequence}`
+    if (pinned) occupancy.set(net, { containerId: id, ip: pinned })
+    state.set(name, { Id: id, State: { Running: false }, Config: body })
+    return id
+  }
+  const body = legacyServiceContainerBody(slot, { sourceDir: '/srv/vm-05/slot-bin', layout: true })
+  const result = await migrateRemoteContainer({}, 'kin-05', body, {
+    wasRunning: true,
+    ops: { inspect, action, rename, create, disconnect },
+  })
+  assert.equal(result.ok, true)
+  assert.deepEqual(events, [
+    ['disconnect', net, 'old-slot-id'],
+    ['create', 'kin-05'],
+  ])
+  assert.equal(occupancy.get(net)?.containerId, 'new-1')
+  assert.equal(occupancy.get(net)?.ip, ip)
 })
 
 test('remote service refresh forwards the migrated binary digest to egress', async () => {

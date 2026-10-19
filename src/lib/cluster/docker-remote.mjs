@@ -512,6 +512,34 @@ export async function removeNetwork(connect, name) {
   throw new ClusterError(502, 'docker_network_failed', dockerMessage(res))
 }
 
+/** Detach a container so its static IP / aliases are free for a replacement join. */
+export async function disconnectContainerFromNetwork(connect, network, container) {
+  await dockerJson(
+    connect,
+    {
+      method: 'POST',
+      path: `/networks/${encodeURIComponent(network)}/disconnect`,
+      body: { Container: container },
+      timeoutMs: 30_000,
+    },
+    [200, 204, 404],
+  )
+}
+
+/** Re-attach a container with the endpoint it had before a failed migration rollback. */
+export async function connectContainerToNetwork(connect, network, container, endpointConfig = {}) {
+  await dockerJson(
+    connect,
+    {
+      method: 'POST',
+      path: `/networks/${encodeURIComponent(network)}/connect`,
+      body: { Container: container, EndpointConfig: endpointConfig },
+      timeoutMs: 30_000,
+    },
+    [200, 204],
+  )
+}
+
 /**
  * POST /build with a (gzip) tar context stream. Progress is NDJSON; a failure
  * after the 200 header only shows up as an `error` line.
