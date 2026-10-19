@@ -2,6 +2,12 @@
 
 ## 未发布
 
+## 1.3.195 — 2026-10-19
+
+- 修复控制面跨挂载时 slot-guest-bin 复制分支用 size+mtime 误判「已最新」：同大小新二进制改为 size+sha256 比较，复制只保留权限位、不再回写 mtime。（#572，续 #569）
+
+已部署机升级：仅需更新 Node 控制面并重启；不必重建槽；不要更换 kernel / CLI；无迁移。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
 ## 1.3.194 — 2026-10-19
 
 - 修复 #514 的槽位 bin 目录：移到 `data/run/slot-guest-bin/`（原 `run/` 不在控制面 compose 挂载内，只存在于控制面容器里，宿主侧是空目录，槽内挂进来是空的）；条目改为硬链接（跨挂载时复制）并以 rename 原子替换，不再是指向宿主绝对路径的符号链接（槽内只挂载该目录，符号链接悬空导致 `kin-worker`/`kin-kernel` not found）；控制面启动时刷新目录；不传 kernel 的槽不再删除共享目录里的 `kin-kernel`；`containerHasKernelMount` 识别目录挂载。（#569）
