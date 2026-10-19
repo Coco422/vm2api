@@ -166,14 +166,19 @@ function VmDetailBody({
   const proxy = ((data.proxy as VmProxySnap | undefined) ||
     vm.proxy ||
     {}) as VmProxySnap
-  const seedSlot = useMemo(
-    () => ({
+  const seedSlot = useMemo(() => {
+    const locale =
+      typeof vm.locale === 'string'
+        ? vm.locale
+        : vm.locale === null
+          ? null
+          : undefined
+    return {
       timezone: vm.timezone,
       timezone_source: vm.timezone_source,
-      locale: vm.locale,
-    }),
-    [vm.timezone, vm.timezone_source, vm.locale]
-  )
+      locale,
+    }
+  }, [vm.timezone, vm.timezone_source, vm.locale])
   const test = useVmTestChat(vm)
   const refreshAll = async () => {
     await Promise.all([
