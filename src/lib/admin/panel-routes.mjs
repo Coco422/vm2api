@@ -3580,8 +3580,7 @@ export function createPanelHandler(ctx) {
         const hasLocale = body && Object.prototype.hasOwnProperty.call(body, 'locale')
         let nextLocale = null
         if (hasLocale) {
-          const requestedLocale =
-            body.locale == null || body.locale === '' ? STANDARD_LOCALE : String(body.locale)
+          const requestedLocale = body.locale == null || body.locale === '' ? STANDARD_LOCALE : String(body.locale)
           if (!SLOT_LOCALES.includes(requestedLocale)) {
             return json(res, 400, {
               ok: false,

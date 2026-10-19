@@ -107,9 +107,7 @@ function LocaleField(props: {
   disabled: boolean
   onChange: (value: string) => void
 }) {
-  return (
-    <ChoiceField label='语言' table={SEED_LOCALE_OPTIONS} {...props} />
-  )
+  return <ChoiceField label='语言' table={SEED_LOCALE_OPTIONS} {...props} />
 }
 
 function ZoneField({
@@ -150,7 +148,9 @@ function ZoneField({
             : '跟随当前 SOCKS5 · 还没有时区'
           : '改回跟随当前 SOCKS5'}
       </Button>
-      <p className='text-[11px] text-muted-foreground'>播种时由槽位写入，不经 extra_env</p>
+      <p className='text-[11px] text-muted-foreground'>
+        播种时由槽位写入，不经 extra_env
+      </p>
     </div>
   )
 }

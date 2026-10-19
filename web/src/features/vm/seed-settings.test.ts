@@ -128,7 +128,11 @@ describe('seed draft', () => {
 
     const fixed = seedDraftOf(
       { settings_json: { env: { TZ: 'UTC' } }, claude_setting: '' },
-      { timezone_source: 'manual', timezone: 'Europe/Berlin', locale: 'en_US.UTF-8' }
+      {
+        timezone_source: 'manual',
+        timezone: 'Europe/Berlin',
+        locale: 'en_US.UTF-8',
+      }
     )
     fixed.timezoneFixed = 'America/New_York'
     fixed.timezoneFollow = false
