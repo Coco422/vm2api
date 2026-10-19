@@ -69,6 +69,7 @@ import { probeOutcome, type ProbeCheck } from '@/features/vm/probe-status'
 import {
   vmQueryOptions,
   vmSeedQueryOptions,
+  vmSeedUploadLogQueryOptions,
   vmsListQueryOptions,
 } from '@/features/vm/queries'
 import { RuntimeChip } from '@/features/vm/runtime-chip'
@@ -135,9 +136,14 @@ function VmDetailBody({
     refetchInterval: wantedTab === 'seed' ? 2000 : false,
   })
   const seed = useQuery({
-    ...vmSeedQueryOptions(id, seedDebug),
+    ...vmSeedQueryOptions(id),
     enabled: perms.admin && wantedTab === 'seed',
     refetchInterval: wantedTab === 'seed' ? 2000 : false,
+  })
+  const seedUploadLog = useQuery({
+    ...vmSeedUploadLogQueryOptions(id),
+    enabled: perms.admin && wantedTab === 'seed' && seedDebug,
+    refetchInterval: seedDebug && wantedTab === 'seed' ? 2000 : false,
   })
   const routing = useQuery({ ...routingQueryOptions(), enabled: perms.admin })
   usePoolSeatStream()
@@ -237,6 +243,9 @@ function VmDetailBody({
       toast.success('已播种')
       await qc.invalidateQueries({
         queryKey: ['panel', 'vm', id, 'seed'],
+      })
+      await qc.invalidateQueries({
+        queryKey: ['panel', 'vm', id, 'seed-upload-log'],
       })
     },
     onError: (error: Error) => toast.error(error.message),
@@ -579,6 +588,7 @@ function VmDetailBody({
                     syncTelemetry={syncTelemetry}
                     debug={seedDebug}
                     onDebug={setSeedDebug}
+                    uploadLog={seedUploadLog.data}
                     onSave={(next) => saveSeed.mutate(next)}
                   />
                 ) : (

@@ -14,6 +14,48 @@ export const REJECT_FLAGS = [
 
 const TOP_KEYS = ['theme', 'autoUpdates', 'grove_enabled'] as const
 
+/** Env keys rewritten by buildSlotSettingsEnv — editable UI would mislead. */
+const READONLY_SEED_ENV_KEYS = new Set([
+  'TZ',
+  'LANG',
+  'LC_ALL',
+  'DISABLE_TELEMETRY',
+  'DO_NOT_TRACK',
+  'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC',
+  'CLAUDE_CODE_USE_BEDROCK',
+  'CLAUDE_CODE_USE_VERTEX',
+  'CLAUDE_CODE_GATEWAY_HINT_HEADERS',
+])
+
+export function isReadonlySeedEnvKey(key: string): boolean {
+  if (READONLY_SEED_ENV_KEYS.has(key)) return true
+  return /GATEWAY_HINT/i.test(key)
+}
+
+export function editableSeedEnv(
+  env: Record<string, string>
+): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const [key, value] of Object.entries(env)) {
+    if (!isReadonlySeedEnvKey(key)) out[key] = value
+  }
+  return out
+}
+
+export function partitionSeedEnvKeys(env: Record<string, string>): {
+  editable: string[]
+  readonly: string[]
+} {
+  const editable: string[] = []
+  const readonly: string[] = []
+  for (const key of Object.keys(env)) {
+    ;(isReadonlySeedEnvKey(key) ? readonly : editable).push(key)
+  }
+  editable.sort()
+  readonly.sort()
+  return { editable, readonly }
+}
+
 export type SettingRow = {
   key: string
   value: string
@@ -142,7 +184,7 @@ export function seedSaveBody(draft: SeedDraft): Record<string, unknown> {
     claude_setting: draft.claude_setting.replace(/\n+$/g, ''),
     reject_client_settings: draft.reject_client_settings,
     reject_client_metadata_identity: draft.reject_client_metadata_identity,
-    extra_env: draft.env,
+    extra_env: editableSeedEnv(draft.env),
     theme: draft.theme,
   }
 }

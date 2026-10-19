@@ -2,7 +2,7 @@
 
 ## 未发布
 
-- 槽位种子页：`settings.json` 的 env 行与 `theme` 可直接编辑并随播种写入；`autoUpdates`、`grove_enabled` 只读且播种时固定为 `false`；缺 `CLAUDE_CODE_ATTRIBUTION_HEADER` 时默认 `0`。调试上传默认关，打开后拉本槽最近 40 条实际上传（PostBatch/eval 的 events 包装，落盘前脱敏邮箱/账号/组织/设备标识）；Go sidecar 写 `vms/<id>/run/telemetry-upload.log`，面板 `GET seed-settings?debug=1` 返回 `telemetry_log`。
+- 槽位种子页：`settings.json` 的 env 行与 `theme` 可直接编辑并随播种写入；`autoUpdates`、`grove_enabled` 只读且播种时固定为 `false`；TZ/LANG/LC_ALL、遥测 kill-switch、Bedrock/Vertex、gateway hint 等同理只读（播种由契约重写）。缺 `CLAUDE_CODE_ATTRIBUTION_HEADER` 时默认 `0`。调试上传默认关，独立 query 拉最近 40 条上传，切换开关不重置未保存编辑；Go sidecar 写 `vms/<id>/run/telemetry-upload.log`，面板 `GET seed-settings?debug=1` 返回 `telemetry_log`。
 - 槽位种子页按当前槽 `settings.json` 列出真实配置；`claude.setting` 可编辑播种；缺失文件返回 `null`、空文件返回空串，不用策略默认冒充槽内文件；遥测开关与 sidecar 进程状态分开展示，保存不因遥测进程刷新失败而 502。
 - fleet 遥测刷新在 kin-egress 二进制被替换（含 `(deleted)` 旧进程与脏 pidfile）时，会按 egress 配置扫停全部 helper、等待 `/proc/<pid>` 消失后再绑定新二进制；同一 SOCKS 出口的 stop/start 与 `ensureProxyEgress` 共用 per-proxy 锁，避免并发 telemetry 互相 SIGTERM。（#604）
 - 面板：侧栏「GitHub / 文档」两枚链接不再折行，字体偏宽时「文档」不会逐字竖排，空间不够先缩箭头再省略文字；VM 列表搜索框关闭浏览器自动填充，不再被回填成登录邮箱。

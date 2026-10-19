@@ -9,6 +9,7 @@ import { Textarea } from '@/components/ui/textarea'
 import {
   REJECT_FLAGS,
   claudeSettingKeys,
+  partitionSeedEnvKeys,
   seedDraftOf,
   seedSaveBody,
   settingsRows,
@@ -108,6 +109,7 @@ export function SeedPolicyCard({
   syncTelemetry = false,
   debug,
   onDebug,
+  uploadLog,
 }: {
   seed: VmSeedSettings
   telemetry?: ObservedTelemetry | null
@@ -116,6 +118,7 @@ export function SeedPolicyCard({
   syncTelemetry?: boolean
   debug: boolean
   onDebug: (next: boolean) => void
+  uploadLog?: string[] | null
 }) {
   const saved = seedDraftOf(seed)
   const [draft, setDraft] = useState<SeedDraft>(saved)
@@ -131,6 +134,8 @@ export function SeedPolicyCard({
   const rows = settingsRows(seed.settings_json, fileSetting)
   const claudeNamed = claudeSettingKeys(fileSetting)
   const fileMissing = seed.settings_json == null
+  const { editable: editableEnvKeys, readonly: readonlyEnvKeys } =
+    partitionSeedEnvKeys(draft.env)
 
   const patch = (next: Partial<SeedDraft>) =>
     setDraft((current) => ({ ...current, ...next }))
@@ -154,7 +159,7 @@ export function SeedPolicyCard({
           </p>
         ) : (
           <div className='divide-y'>
-            {Object.keys(draft.env).map((key) => (
+            {editableEnvKeys.map((key) => (
               <label
                 key={key}
                 className='grid items-center gap-2 px-4 py-2 sm:grid-cols-[minmax(0,1fr)_minmax(8rem,16rem)]'
@@ -193,6 +198,27 @@ export function SeedPolicyCard({
                 className='h-8 font-mono text-xs'
               />
             </label>
+            {readonlyEnvKeys.map((key) => (
+              <div
+                key={key}
+                className='grid items-center gap-2 px-4 py-2 sm:grid-cols-[minmax(0,1fr)_minmax(8rem,16rem)]'
+              >
+                <span className='inline-flex min-w-0 items-center gap-2 font-mono text-xs font-medium break-all'>
+                  {claudeNamed.has(key) ? (
+                    <span
+                      className='size-1.5 shrink-0 rounded-full bg-primary'
+                      title='也写在 claude.setting'
+                    />
+                  ) : (
+                    <span className='size-1.5 shrink-0' />
+                  )}
+                  {key}
+                </span>
+                <span className='font-mono text-xs text-muted-foreground'>
+                  {draft.env[key] === '' ? '空' : draft.env[key]} · 播种时固定
+                </span>
+              </div>
+            ))}
             {rows
               .filter(
                 (row) =>
@@ -320,7 +346,7 @@ export function SeedPolicyCard({
             disabled={saving}
             onCheckedChange={onDebug}
           />
-          {debug ? <TelemetryUploadLog lines={seed.telemetry_log} /> : null}
+          {debug ? <TelemetryUploadLog lines={uploadLog} /> : null}
         </div>
       </aside>
     </div>
