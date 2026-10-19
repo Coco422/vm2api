@@ -250,7 +250,10 @@ test('billingStats derives global totals from account aggregates without duplica
     assert.equal(bill.total.output_tokens, 5)
     assert.equal(bill.total.cache_read_tokens, 80)
     assert.ok(bill.total.total_cost > 0)
-    assert.equal(bill.total.total_cost, bill.accounts.reduce((sum, row) => sum + row.total_cost, 0))
+    assert.equal(
+      bill.total.total_cost,
+      bill.accounts.reduce((sum, row) => sum + row.total_cost, 0),
+    )
   } finally {
     db.close()
   }
