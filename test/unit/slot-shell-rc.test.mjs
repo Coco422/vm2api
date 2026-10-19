@@ -4,7 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { createSlotShell, panelShellLaunch } from '../../src/lib/vm/slot-shell.mjs'
+import { adoptShellLogin, createSlotShell, panelShellLaunch } from '../../src/lib/vm/slot-shell.mjs'
 import { OFFICIAL_CLI_VERSION } from '../../src/lib/identity/vm-identity.mjs'
 import { ensureOfficialCredentialLink, readWorkerCredentialFile } from '../../src/lib/oauth/oauth-credentials.mjs'
 test('claude in the panel shell runs cli-node and points config at .claude', () => {
@@ -86,6 +86,34 @@ test('a fresh slot login links the official credential file onto the worker file
     )
     assert.equal(readWorkerCredentialFile(home).refresh_token, 'rt-fresh')
     assert.equal(ensureOfficialCredentialLink(home).linked, true)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('shell login is imported into the worker credential and the shell copy is removed', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-adopt-'))
+  const home = path.join(root, 'vms', 'vm-02', 'cli-home')
+  const official = path.join(home, '.claude', '.credentials.json')
+  try {
+    fs.mkdirSync(path.dirname(official), { recursive: true })
+    fs.writeFileSync(
+      official,
+      JSON.stringify({
+        claudeAiOauth: {
+          accessToken: 'at-shell',
+          refreshToken: 'rt-shell',
+          expiresAt: Date.now() + 3600_000,
+          scopes: ['user:profile', 'user:inference'],
+          email: 'shell@example.com',
+        },
+      }),
+    )
+    const adopted = adoptShellLogin(root, { id: 'vm-02' })
+    assert.equal(adopted.imported, true)
+    assert.equal(readWorkerCredentialFile(home).refresh_token, 'rt-shell')
+    assert.equal(fs.existsSync(official), false)
+    assert.equal(fs.existsSync(path.join(home, '.claude', 'credentials.json')), true)
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }

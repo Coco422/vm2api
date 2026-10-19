@@ -18,8 +18,9 @@ import { isKvmRuntime } from './runtime-kind.mjs'
 import { slotExecCmd } from './slot-exec.mjs'
 import { getVm } from './vm-registry.mjs'
 import { OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
-import { ensureOfficialCredentialLink } from '../oauth/oauth-credentials.mjs'
-import { assertAuthLoginReady } from '../oauth/claude-auth-login.mjs'
+import { ensureOfficialCredentialLink, writeWorkerCredentialFile } from '../oauth/oauth-credentials.mjs'
+import { assertAuthLoginReady, officialLoginCredentialToOauth } from '../oauth/claude-auth-login.mjs'
+import fs from 'node:fs'
 import path from 'node:path'
 import { officialCcUidGid } from './vm-runtime.mjs'
 
@@ -29,6 +30,32 @@ const MAX_TICKETS = 64
 const MAX_SESSIONS = 8
 const SESSION_ENV = 'KIN_PANEL_SHELL'
 const RC_ENV = 'KIN_PANEL_RC'
+
+function readJsonFile(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'))
+  } catch {
+    return null
+  }
+}
+
+/** The shell only obtains the grant. Persist it in the worker credential store, then drop the shell copy. */
+export function adoptShellLogin(projectRoot, vm) {
+  const home = path.join(projectRoot, 'vms', vm.id, 'cli-home')
+  const official = path.join(home, '.claude', '.credentials.json')
+  const oauth = officialLoginCredentialToOauth(readJsonFile(official) || {})
+  const written = writeWorkerCredentialFile(home, oauth)
+  if (!written) {
+    const err = new Error('官方登录凭证未能写入槽凭证')
+    err.code = 'credential_import_failed'
+    throw err
+  }
+  try {
+    if (fs.lstatSync(official).isSymbolicLink()) fs.unlinkSync(official)
+    else fs.rmSync(official, { force: true })
+  } catch {}
+  return { imported: true, path: written }
+}
 
 /** Live guest MOTD. Optional probes must not fail startup or print secrets. */
 const SYSTEM_FACTS_RC = [
@@ -381,7 +408,8 @@ export function createSlotShell({ projectRoot, logger = console }) {
     try {
       connect = slotHost(vm).dockerApi()
       if (size.login) {
-        const linked = ensureOfficialCredentialLink(path.join(projectRoot, 'vms', vm.id, 'cli-home'), {
+        const home = path.join(projectRoot, 'vms', vm.id, 'cli-home')
+        const linked = ensureOfficialCredentialLink(home, {
           ...officialCcUidGid(vm.id),
           create: true,
         })
@@ -419,6 +447,14 @@ export function createSlotShell({ projectRoot, logger = console }) {
     const onEnd = async () => {
       if (ended) return
       ended = true
+      if (size.login) {
+        try {
+          adoptShellLogin(projectRoot, vm)
+        } catch (err) {
+          logger.warn?.(`[slot-shell] ${vm.id} login import failed: ${err.message}`)
+          send(JSON.stringify({ t: 'error', message: '官方登录凭证未能导入槽凭证' }))
+        }
+      }
       const info = await inspectExec(connect, session.execId).catch(() => null)
       send(JSON.stringify({ t: 'exit', code: info?.ExitCode ?? null }))
       ws.close(1000)
