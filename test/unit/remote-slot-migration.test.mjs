@@ -129,7 +129,7 @@ test('migration disconnects the legacy container before pinning the same network
   const occupancy = new Map([[net, { containerId: 'old-slot-id', ip }]])
   const events = []
   const slot = structuredClone(oldSlot)
-  const state = new Map([[ 'kin-05', slot ]])
+  const state = new Map([['kin-05', slot]])
   let sequence = 0
   const inspect = async (_docker, name) => state.get(name) || null
   const action = async (_docker, name, operation) => {
