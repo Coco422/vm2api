@@ -272,7 +272,8 @@ export function createSlotShell({ projectRoot, logger = console }) {
   function consumeTicket(ticket, vmId) {
     const entry = tickets.get(ticket)
     tickets.delete(ticket)
-    return !!entry && entry.vmId === vmId && entry.exp > Date.now()
+    if (!entry || entry.vmId !== vmId || entry.exp <= Date.now()) return null
+    return entry
   }
 
   function rejectUpgrade(socket, status, text) {
@@ -287,8 +288,8 @@ export function createSlotShell({ projectRoot, logger = console }) {
     if (!sm) return false
     const vmId = decodeURIComponent(sm[1])
     const ticket = url.searchParams.get('ticket') || ''
-    const entry = tickets.get(ticket)
-    if (!consumeTicket(ticket, vmId)) {
+    const entry = consumeTicket(ticket, vmId)
+    if (!entry) {
       rejectUpgrade(socket, 401, 'Unauthorized')
       return true
     }
@@ -297,7 +298,12 @@ export function createSlotShell({ projectRoot, logger = console }) {
       rejectUpgrade(socket, 404, 'Not Found')
       return true
     }
-    const login = url.searchParams.get('login') === '1' || !!entry?.login
+    const requestedLogin = url.searchParams.get('login') === '1'
+    if (requestedLogin !== !!entry.login) {
+      rejectUpgrade(socket, 409, 'Conflict')
+      return true
+    }
+    const login = !!entry.login
     if (login) {
       try {
         assertAuthLoginReady(projectRoot, vm)

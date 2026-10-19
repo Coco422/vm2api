@@ -111,6 +111,34 @@ test('official login tickets refuse a cluster slot and a slot without cli-node',
   }
 })
 
+test('an ops shell ticket cannot be upgraded into an official login', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-upgrade-'))
+  fs.mkdirSync(path.join(root, 'vms', 'vm-02', 'cli-home', '.kin'), { recursive: true })
+  fs.writeFileSync(path.join(root, 'vms', 'vm-02.json'), JSON.stringify({ id: 'vm-02' }))
+  fs.writeFileSync(path.join(root, 'vms', 'vm-02', 'cli-home', '.kin', 'cli-node'), '')
+  const shell = createSlotShell({ projectRoot: root, logger: { warn() {} } })
+  const ops = shell.issueTicket('vm-02')
+  const seen = []
+  const socket = {
+    write(data) {
+      seen.push(String(data))
+    },
+    destroy() {},
+  }
+  try {
+    const handled = shell.handleUpgrade(
+      { url: `/api/panel/vms/vm-02/shell?ticket=${ops.ticket}&login=1` },
+      socket,
+      Buffer.alloc(0),
+    )
+    assert.equal(handled, true)
+    assert.match(seen[0], /^HTTP\/1\.1 409 /)
+    assert.equal(fs.existsSync(path.join(root, 'vms', 'vm-02', 'cli-home', '.claude', 'credentials.json')), false)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('panelShellLaunch rejects a non-absolute cli-node path', () => {
   assert.throws(() => panelShellLaunch('cli-node'), /invalid cli-node path/)
   assert.throws(() => panelShellLaunch('/tmp/a\nb'), /invalid cli-node path/)
