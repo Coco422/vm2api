@@ -14,6 +14,7 @@ import {
   restoreUncommittedHop,
   semanticStatusForStreamError,
 } from '../../src/lib/transport/go-worker-client.mjs'
+import { prepareCliHopBody } from '../../src/lib/protocol/outbound-attempt.mjs'
 import { extractOpenaiUsage } from '../../src/lib/protocol/openai-usage.mjs'
 import { callRustKernel, rustKernelHealth } from '../../src/lib/transport/rust-kernel-client.mjs'
 import { forwardApi, readApiJson } from '../../src/lib/transport/api-kernel-client.mjs'
@@ -162,6 +163,25 @@ test('cli-hop envelope keeps role=system turns that the VM betas do not declare'
     ['user', 'system', 'assistant', 'user'],
   )
   assert.deepEqual(out.body.system, body.system)
+})
+
+test('cli-hop keeps the caller compact window outside settings', () => {
+  const prepared = prepareCliHopBody({
+    model: 'claude-opus-5-5',
+    messages: [{ role: 'user', content: 'hi' }],
+    settings: { theme: 'light', env: { CLAUDE_CODE_AUTO_COMPACT_WINDOW: '1000000', TZ: 'UTC' } },
+  })
+  const out = finalizeWorkerPayload({
+    body: prepared,
+    reqHeaders: {},
+    exec: { homeDir: '', vm: { claude: { mode: 'setup-token', scope: 'user:inference' } } },
+    identity: null,
+    cliHop: true,
+  })
+  assert.equal(prepared.settings, undefined)
+  assert.equal(out.body.settings, undefined)
+  assert.equal(out.body.env, undefined)
+  assert.equal(out.body.auto_compact_window, 1000000)
 })
 
 test('setup-token cli-hop summarizes hidden thinking by default and keeps updates when passthrough', () => {

@@ -3,6 +3,7 @@
  * Tests compare envelopes from this module so admin paths cannot drift.
  */
 import { officialMessagesBody } from './anthropic-messages.mjs'
+import { callerAutoCompactWindow } from './seed-policy.mjs'
 import {
   prepareAnthropicRequest,
   rewriteToolNames,
@@ -195,6 +196,8 @@ export function prepareCliHopBody(
   if (requestContext?.purpose === 'auto_mode_classifier') return prepareClassifierBody(canonicalBody, { stream })
   if (preserveSystem) validateCacheBreakpoints(canonicalBody)
   let body = officialMessagesBody(canonicalBody, { stream })
+  const autoCompactWindow = callerAutoCompactWindow(canonicalBody)
+  if (autoCompactWindow != null) body.auto_compact_window = autoCompactWindow
   delete body.metadata
   if (!preserveSystem) {
     const leftover = stripCliOwnedSystem(body.system, { preserveCallerEnvironment })

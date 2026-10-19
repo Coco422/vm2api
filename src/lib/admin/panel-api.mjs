@@ -475,6 +475,12 @@ export function validatePersonaRoutingPatch(body = {}) {
   if (Object.prototype.hasOwnProperty.call(compat, 'cch_enabled') && typeof compat.cch_enabled !== 'boolean') {
     problems.push('cch_enabled 必须是布尔')
   }
+  if (Object.prototype.hasOwnProperty.call(compat, 'auto_compact_window') && compat.auto_compact_window != null) {
+    const windowTokens = Number(compat.auto_compact_window)
+    if (!Number.isInteger(windowTokens) || windowTokens < 100_000 || windowTokens > 1_000_000) {
+      problems.push('auto_compact_window 必须是 100000–1000000 的整数')
+    }
+  }
   if (
     compat.thinking_display != null &&
     compat.thinking_display !== '' &&
@@ -1406,6 +1412,9 @@ function presentCompatibility(compat) {
     .trim()
     .toLowerCase()
   out.thinking_display = display === 'passthrough' ? 'passthrough' : 'summarized'
+  const windowTokens = Number(out.auto_compact_window)
+  out.auto_compact_window =
+    Number.isInteger(windowTokens) && windowTokens >= 100_000 && windowTokens <= 1_000_000 ? windowTokens : null
   return out
 }
 

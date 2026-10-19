@@ -118,6 +118,16 @@ export function buildSlotSettingsEnv(pol = {}, { timezone, locale, extra } = {})
   return out
 }
 
+export function callerAutoCompactWindow(body = {}) {
+  const sources = [body?.settings?.env, body?.claude_settings?.env, body?.env]
+  for (const source of sources) {
+    if (!source || typeof source !== 'object' || Array.isArray(source)) continue
+    const value = Number(source.CLAUDE_CODE_AUTO_COMPACT_WINDOW)
+    if (Number.isInteger(value) && value >= 100_000 && value <= 1_000_000) return value
+  }
+  return null
+}
+
 export function buildSeedSettingsEnv(pol = {}, extra = {}) {
   return buildSlotSettingsEnv(pol, { extra })
 }
