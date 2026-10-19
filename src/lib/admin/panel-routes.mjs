@@ -3575,6 +3575,58 @@ export function createPanelHandler(ctx) {
         const next = defaultSeedPolicy(merged)
         if (body.settings_json_override !== undefined) next.settings_json_override = body.settings_json_override
         if (body.extra_env !== undefined) next.extra_env = body.extra_env || {}
+        const followProxyTz = body?.timezone_follow_proxy === true || body?.timezoneFollowProxy === true
+        const hasTimezone = body && Object.prototype.hasOwnProperty.call(body, 'timezone')
+        const hasLocale = body && Object.prototype.hasOwnProperty.call(body, 'locale')
+        let nextLocale = null
+        if (hasLocale) {
+          const requestedLocale =
+            body.locale == null || body.locale === '' ? STANDARD_LOCALE : String(body.locale)
+          if (!SLOT_LOCALES.includes(requestedLocale)) {
+            return json(res, 400, {
+              ok: false,
+              error: { code: 'invalid_locale', message: `语言必须是 ${SLOT_LOCALES.join('、')}` },
+            })
+          }
+          nextLocale = requestedLocale
+        }
+        if (hasTimezone) {
+          const zone = validTimezone(body.timezone)
+          if (!zone) {
+            return json(res, 400, {
+              ok: false,
+              error: {
+                type: 'invalid_request_error',
+                code: 'invalid_timezone',
+                message: '时区必须是有效的 IANA 名称，如 Asia/Tokyo',
+                param: 'timezone',
+              },
+            })
+          }
+          const pinned = persistVmTimezone(cfg.paths.project, id, zone, { source: 'manual' })
+          if (!pinned) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          Object.assign(vm, pinned)
+        } else if (followProxyTz) {
+          const synced = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, id, { force: true })
+          if (!synced.ok) {
+            return json(res, 400, {
+              ok: false,
+              error: {
+                type: 'invalid_request_error',
+                code: synced.reason || 'proxy_timezone_unknown',
+                message: '未能从代理节点取到时区，请先检测代理地理位置',
+              },
+            })
+          }
+          if (synced.applied) {
+            const fresh = getVm(cfg.paths.project, id)
+            if (fresh) Object.assign(vm, fresh)
+          } else if (synced.timezone) {
+            vm.timezone = synced.timezone
+            vm.timezone_source = 'proxy_geo'
+          }
+        }
+        if (nextLocale) vm.locale = nextLocale
         vm.seed_policy = next
         vm.updated_at = new Date().toISOString()
         atomicWriteJson(vmPath, vm, { mode: 0o600 })

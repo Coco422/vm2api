@@ -113,6 +113,32 @@ describe('seed draft', () => {
     })
   })
 
+  it('sends slot timezone follow or fixed locale without extra_env TZ/LANG', () => {
+    const follow = seedDraftOf(
+      { settings_json: { env: { TZ: 'UTC' } }, claude_setting: '' },
+      { timezone_source: 'auto', timezone: 'Asia/Tokyo', locale: 'ja_JP.UTF-8' }
+    )
+    expect(follow.timezoneFollow).toBe(true)
+    expect(seedSaveBody(follow)).toMatchObject({
+      timezone_follow_proxy: true,
+      locale: 'ja_JP.UTF-8',
+      extra_env: { CLAUDE_CODE_ATTRIBUTION_HEADER: '0' },
+    })
+    expect(seedSaveBody(follow).extra_env).not.toHaveProperty('TZ')
+
+    const fixed = seedDraftOf(
+      { settings_json: { env: { TZ: 'UTC' } }, claude_setting: '' },
+      { timezone_source: 'manual', timezone: 'Europe/Berlin', locale: 'en_US.UTF-8' }
+    )
+    fixed.timezoneFixed = 'America/New_York'
+    fixed.timezoneFollow = false
+    expect(seedSaveBody(fixed)).toMatchObject({
+      timezone: 'America/New_York',
+      locale: 'en_US.UTF-8',
+    })
+    expect(seedSaveBody(fixed).timezone_follow_proxy).toBeUndefined()
+  })
+
   it('omits contract-locked env keys from extra_env on save', () => {
     const draft = seedDraftOf({
       settings_json: {

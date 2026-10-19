@@ -20,7 +20,7 @@ function seed(root, id) {
   )
 }
 
-function handler(project) {
+function handler(project, { readBody = async () => ({}) } = {}) {
   const response = {}
   const handlePanel = createPanelHandler({
     cfg: { paths: { project }, vm: { id: null } },
@@ -34,8 +34,19 @@ function handler(project) {
       response.body = payload
       return true
     },
-    readBody: async () => ({}),
-    proxyPool: { unbindVm() {} },
+    readBody,
+    proxyPool: {
+      unbindVm() {},
+      followProxyTimezoneEnabled() {
+        return true
+      },
+      proxyTimezone() {
+        return 'Asia/Shanghai'
+      },
+      timezoneForVm() {
+        return 'Asia/Shanghai'
+      },
+    },
   })
   return { handlePanel, response }
 }
@@ -69,6 +80,45 @@ test('GET seed-settings returns an empty claude.setting file as empty', async ()
     assert.equal(response.body.data.claude_setting, '')
     assert.equal(response.body.data.seed_policy.claude_setting, '')
     assert.equal(response.body.data.settings_json.env.TZ, 'UTC')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('PUT seed-settings can follow proxy timezone and locale before writing files', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-seed-put-tz-'))
+  try {
+    seed(root, 'vm-01')
+    const vmPath = path.join(root, 'vms', 'vm-01.json')
+    const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+    vm.timezone = 'UTC'
+    vm.timezone_source = 'manual'
+    vm.locale = 'en_US.UTF-8'
+    vm.proxy = { id: 'px-1' }
+    fs.writeFileSync(vmPath, JSON.stringify(vm))
+    const body = {
+      telemetry_disabled: true,
+      claude_setting: 'X=1',
+      extra_env: { CUSTOM: 'yes' },
+      theme: 'dark',
+      timezone_follow_proxy: true,
+      locale: 'zh_CN.UTF-8',
+    }
+    const { handlePanel, response } = handler(root, {
+      readBody: async () => body,
+    })
+    await handlePanel(
+      { method: 'PUT', url: '/api/panel/vms/vm-01/seed-settings' },
+      {},
+      new URL('http://localhost/api/panel/vms/vm-01/seed-settings'),
+    )
+    assert.equal(response.status, 200, JSON.stringify(response.body).slice(0, 400))
+    const saved = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+    assert.equal(saved.locale, 'zh_CN.UTF-8')
+    assert.equal(saved.timezone, 'Asia/Shanghai')
+    assert.equal(response.body.data.settings_json.env.TZ, 'Asia/Shanghai')
+    assert.equal(response.body.data.settings_json.env.LANG, 'zh_CN.UTF-8')
+    assert.equal(response.body.data.settings_json.env.CUSTOM, 'yes')
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
