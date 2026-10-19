@@ -15,6 +15,7 @@ import {
   semanticStatusForStreamError,
 } from '../../src/lib/transport/go-worker-client.mjs'
 import { prepareCliHopBody } from '../../src/lib/protocol/outbound-attempt.mjs'
+import { callerAutoCompactWindow, defaultSeedPolicy, sanitizeInboundBody } from '../../src/lib/protocol/seed-policy.mjs'
 import { extractOpenaiUsage } from '../../src/lib/protocol/openai-usage.mjs'
 import { callRustKernel, rustKernelHealth } from '../../src/lib/transport/rust-kernel-client.mjs'
 import { forwardApi, readApiJson } from '../../src/lib/transport/api-kernel-client.mjs'
@@ -166,11 +167,14 @@ test('cli-hop envelope keeps role=system turns that the VM betas do not declare'
 })
 
 test('cli-hop keeps the caller compact window outside settings', () => {
-  const prepared = prepareCliHopBody({
+  const inbound = {
     model: 'claude-opus-5-5',
     messages: [{ role: 'user', content: 'hi' }],
     settings: { theme: 'light', env: { CLAUDE_CODE_AUTO_COMPACT_WINDOW: '1000000', TZ: 'UTC' } },
-  })
+  }
+  const autoCompactWindow = callerAutoCompactWindow(inbound)
+  const sanitized = sanitizeInboundBody(inbound, defaultSeedPolicy())
+  const prepared = prepareCliHopBody(sanitized, { autoCompactWindow })
   const out = finalizeWorkerPayload({
     body: prepared,
     reqHeaders: {},
@@ -178,7 +182,7 @@ test('cli-hop keeps the caller compact window outside settings', () => {
     identity: null,
     cliHop: true,
   })
-  assert.equal(prepared.settings, undefined)
+  assert.equal(sanitized.settings, undefined)
   assert.equal(out.body.settings, undefined)
   assert.equal(out.body.env, undefined)
   assert.equal(out.body.auto_compact_window, 1000000)
