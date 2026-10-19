@@ -3,7 +3,7 @@ import {
   SESSION_IDLE_TTL_SECONDS_MAX,
   SESSION_IDLE_TTL_SECONDS_MIN,
 } from '@/types/panel-routing'
-import { Brain, Check, Clock3, Database, Hash, Scaling, ShieldCheck } from 'lucide-react'
+import { Brain, Check, Clock3, Database, Scaling, ShieldCheck } from 'lucide-react'
 import {
   cacheTtlFromCompat,
   detectProxiedOfficialCcFromCompat,
