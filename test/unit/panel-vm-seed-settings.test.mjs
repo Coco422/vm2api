@@ -73,3 +73,35 @@ test('GET seed-settings returns an empty claude.setting file as empty', async ()
     fs.rmSync(root, { recursive: true, force: true })
   }
 })
+
+test('GET seed-settings returns the upload log only when debug is on', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-seed-log-'))
+  try {
+    seed(root, 'vm-01')
+    const run = path.join(root, 'vms', 'vm-01', 'run')
+    fs.mkdirSync(run, { recursive: true })
+    fs.writeFileSync(
+      path.join(run, 'telemetry-upload.log'),
+      'old\n2026-10-19T00:00:00Z batch tengu_init ok {"event_type":"x"}\n',
+    )
+    const hidden = handler(root)
+    await hidden.handlePanel(
+      { method: 'GET', url: '/api/panel/vms/vm-01/seed-settings' },
+      {},
+      new URL('http://localhost/api/panel/vms/vm-01/seed-settings'),
+    )
+    assert.equal(hidden.response.body.data.telemetry_log, undefined)
+    const shown = handler(root)
+    await shown.handlePanel(
+      { method: 'GET', url: '/api/panel/vms/vm-01/seed-settings?debug=1' },
+      {},
+      new URL('http://localhost/api/panel/vms/vm-01/seed-settings?debug=1'),
+    )
+    assert.deepEqual(shown.response.body.data.telemetry_log, [
+      'old',
+      '2026-10-19T00:00:00Z batch tengu_init ok {"event_type":"x"}',
+    ])
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})

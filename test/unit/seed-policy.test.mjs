@@ -69,6 +69,7 @@ test('buildSlotSettingsEnv is TZ/LANG plus contract, leftover extra cannot win',
   assert.equal(env.LC_ALL, 'en_US.UTF-8')
   assert.equal(env.CUSTOM, 'ok')
   assert.equal(env.CLAUDE_CODE_GATEWAY_HINT_HEADERS, '1')
+  assert.equal(env.CLAUDE_CODE_ATTRIBUTION_HEADER, '0')
 })
 
 test('buildSeedSettingsEnv delegates to slot env', () => {

@@ -25,6 +25,8 @@ export type SeedDraft = TelemetrySeedFlags & {
   claude_setting: string
   reject_client_settings: boolean
   reject_client_metadata_identity: boolean
+  env: Record<string, string>
+  theme: string
 }
 
 type ObservedTelemetry = NonNullable<VmKernelSnapshot['telemetry']>
@@ -51,6 +53,20 @@ export function claudeSettingKeys(text: string): Set<string> {
   return keys
 }
 
+export function settingsEnv(
+  settings: Record<string, unknown> | null | undefined
+): Record<string, string> {
+  const env = asRecord(asRecord(settings)?.env) || {}
+  const out: Record<string, string> = {}
+  for (const [key, value] of Object.entries(env)) {
+    out[key] = value == null ? '' : String(value)
+  }
+  if (!('CLAUDE_CODE_ATTRIBUTION_HEADER' in out)) {
+    out.CLAUDE_CODE_ATTRIBUTION_HEADER = '0'
+  }
+  return out
+}
+
 /**
  * Rows from the slot file `settings.json`. Missing file yields no rows —
  * the policy default string is not a substitute for the file.
@@ -61,12 +77,11 @@ export function settingsRows(
 ): SettingRow[] {
   const root = asRecord(settings)
   if (!root) return []
-  const env = asRecord(root.env) || {}
+  const env = settingsEnv(root)
   const named = claudeSettingKeys(claudeSetting)
-  const keys = Object.keys(env)
-  const rows: SettingRow[] = keys.map((key) => ({
+  const rows: SettingRow[] = Object.keys(env).map((key) => ({
     key,
-    value: env[key] == null ? '' : String(env[key]),
+    value: env[key],
     inClaudeSetting: named.has(key),
   }))
   for (const key of TOP_KEYS) {
@@ -96,11 +111,23 @@ export function seedDraftOf(
       'reject_client_metadata_identity' in policy
         ? policy.reject_client_metadata_identity !== false
         : true,
+    env: settingsEnv(seed?.settings_json),
+    theme:
+      typeof asRecord(seed?.settings_json)?.theme === 'string'
+        ? String(asRecord(seed?.settings_json)?.theme)
+        : typeof policy.theme === 'string'
+          ? policy.theme
+          : 'dark',
   }
 }
 
 export function sameDraft(a: SeedDraft, b: SeedDraft): boolean {
+  const keys = new Set([...Object.keys(a.env), ...Object.keys(b.env)])
+  for (const key of keys) {
+    if ((a.env[key] ?? '') !== (b.env[key] ?? '')) return false
+  }
   return (
+    a.theme === b.theme &&
     telemetryEnabled(a) === telemetryEnabled(b) &&
     a.claude_setting === b.claude_setting &&
     a.reject_client_settings === b.reject_client_settings &&
@@ -109,14 +136,14 @@ export function sameDraft(a: SeedDraft, b: SeedDraft): boolean {
 }
 
 /** Body for PUT /seed-settings. Mirrors follow the telemetry bit. */
-export function seedSaveBody(
-  draft: SeedDraft
-): Record<string, boolean | string> {
+export function seedSaveBody(draft: SeedDraft): Record<string, unknown> {
   return {
     ...telemetrySeedFlags(telemetryEnabled(draft)),
     claude_setting: draft.claude_setting.replace(/\n+$/g, ''),
     reject_client_settings: draft.reject_client_settings,
     reject_client_metadata_identity: draft.reject_client_metadata_identity,
+    extra_env: draft.env,
+    theme: draft.theme,
   }
 }
 

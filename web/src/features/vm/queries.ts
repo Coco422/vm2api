@@ -43,12 +43,13 @@ export function vmQueryOptions(id: string) {
   })
 }
 
-export function vmSeedQueryOptions(id: string) {
+export function vmSeedQueryOptions(id: string, debug = false) {
+  const q = debug ? '?debug=1' : ''
   return queryOptions({
-    queryKey: ['panel', 'vm', id, 'seed'] as const,
+    queryKey: ['panel', 'vm', id, 'seed', debug] as const,
     queryFn: () =>
       api<VmSeedSettings>(
-        `/api/panel/vms/${encodeURIComponent(id)}/seed-settings`
+        `/api/panel/vms/${encodeURIComponent(id)}/seed-settings${q}`
       ),
     refetchInterval: false,
   })

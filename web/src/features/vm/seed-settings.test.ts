@@ -37,6 +37,7 @@ describe('current slot settings', () => {
       ['DISABLE_TELEMETRY', '1', false],
       ['DO_NOT_TRACK', '1', false],
       ['CUSTOM_FLAG', 'kept', false],
+      ['CLAUDE_CODE_ATTRIBUTION_HEADER', '0', false],
       ['theme', 'dark', false],
       ['autoUpdates', 'false', false],
     ])
@@ -93,6 +94,44 @@ describe('seed draft', () => {
       seedDraftOf({ seed_policy: { claude_setting: 'FROM_POLICY=1' } })
         .claude_setting
     ).toBe('')
+  })
+
+  it('saves edited settings env, including the attribution default', () => {
+    const draft = seedDraftOf({
+      settings_json: { env: { TZ: 'UTC' } },
+      claude_setting: '',
+    })
+    expect(draft.env.CLAUDE_CODE_ATTRIBUTION_HEADER).toBe('0')
+    draft.env.TZ = 'Asia/Shanghai'
+    expect(seedSaveBody(draft).extra_env).toMatchObject({
+      TZ: 'Asia/Shanghai',
+      CLAUDE_CODE_ATTRIBUTION_HEADER: '0',
+    })
+  })
+
+  it('keeps theme editable and leaves fixed settings visible', () => {
+    const draft = seedDraftOf({
+      settings_json: {
+        env: {},
+        theme: 'light',
+        autoUpdates: false,
+        grove_enabled: false,
+      },
+      claude_setting: '',
+    })
+    expect(draft.theme).toBe('light')
+    expect(
+      settingsRows(
+        draft.env && {
+          env: draft.env,
+          theme: 'light',
+          autoUpdates: false,
+          grove_enabled: false,
+        },
+        ''
+      ).map((row) => row.key)
+    ).toContain('autoUpdates')
+    expect(seedSaveBody({ ...draft, theme: 'dark' }).theme).toBe('dark')
   })
 })
 

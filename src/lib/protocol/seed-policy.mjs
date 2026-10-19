@@ -114,6 +114,7 @@ export function buildSlotSettingsEnv(pol = {}, { timezone, locale, extra } = {})
   const out = applyRequiredSeedEnv(env, pol)
   // 2.1.283+ sends x-claude-code-prompt-id only when this is set. Default on.
   out.CLAUDE_CODE_GATEWAY_HINT_HEADERS = '1'
+  if (out.CLAUDE_CODE_ATTRIBUTION_HEADER == null) out.CLAUDE_CODE_ATTRIBUTION_HEADER = '0'
   return out
 }
 

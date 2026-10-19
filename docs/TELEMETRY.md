@@ -31,3 +31,13 @@ An update must verify the new binary hash and the replacement process before
 reporting success. A failed service restart is reported per slot so the old VM
 identity remains intact and can be rolled back by republishing the previous
 binary.
+
+## Upload audit log (debug)
+
+Each successful or failed `PostBatch` / GrowthBook eval append one line to
+`vms/<id>/run/telemetry-upload.log` (next to `worker.json`). The file keeps at
+most 40 lines. Payload JSON is the request shape (`events` wrapper for batch
+uploads) with identity fields stripped (email, account/org UUIDs, device and
+session ids). The panel seed tab exposes this only when **调试上传** is on,
+via `GET /api/panel/vms/:id/seed-settings?debug=1` → `telemetry_log` (string
+array, last 40 lines).

@@ -2,11 +2,13 @@ import { useEffect, useState } from 'react'
 import type { VmKernelSnapshot, VmSeedSettings } from '@/types/panel-vm'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import {
   REJECT_FLAGS,
+  claudeSettingKeys,
   seedDraftOf,
   seedSaveBody,
   settingsRows,
@@ -38,6 +40,20 @@ function Lamp({ tone }: { tone: 'on' | 'off' | 'unknown' }) {
         />
       ) : null}
     </span>
+  )
+}
+function TelemetryUploadLog({ lines }: { lines: unknown }) {
+  const rows = Array.isArray(lines)
+    ? lines.filter(
+        (line): line is string => typeof line === 'string' && line !== ''
+      )
+    : []
+  return (
+    <pre className='mt-2 max-h-72 overflow-auto rounded-md bg-muted px-3 py-2 font-mono text-[11px] leading-5 text-foreground'>
+      {rows.length
+        ? rows.join('\n')
+        : '还没有上传记录。遥测开着并完成一次上传后会出现。'}
+    </pre>
   )
 }
 
@@ -90,13 +106,16 @@ export function SeedPolicyCard({
   onSave,
   saving,
   syncTelemetry = false,
+  debug,
+  onDebug,
 }: {
   seed: VmSeedSettings
   telemetry?: ObservedTelemetry | null
-  onSave: (next: Record<string, boolean | string>) => void
+  onSave: (next: Record<string, unknown>) => void
   saving: boolean
-  /** External official_cc.sync_telemetry. True means the next init turns telemetry back on. */
   syncTelemetry?: boolean
+  debug: boolean
+  onDebug: (next: boolean) => void
 }) {
   const saved = seedDraftOf(seed)
   const [draft, setDraft] = useState<SeedDraft>(saved)
@@ -110,6 +129,7 @@ export function SeedPolicyCard({
   const fileSetting =
     typeof seed.claude_setting === 'string' ? seed.claude_setting : ''
   const rows = settingsRows(seed.settings_json, fileSetting)
+  const claudeNamed = claudeSettingKeys(fileSetting)
   const fileMissing = seed.settings_json == null
 
   const patch = (next: Partial<SeedDraft>) =>
@@ -133,34 +153,64 @@ export function SeedPolicyCard({
             文件在，但没有 env 项。
           </p>
         ) : (
-          <div className='overflow-x-auto'>
-            <table className='w-full border-collapse text-left'>
-              <tbody>
-                {rows.map((row) => (
-                  <tr key={row.key} className='border-b last:border-b-0'>
-                    <th
-                      scope='row'
-                      className='px-4 py-2 align-top font-mono text-xs font-medium text-foreground'
-                    >
-                      <span className='inline-flex items-center gap-2'>
-                        {row.inClaudeSetting ? (
-                          <span
-                            className='size-1.5 shrink-0 rounded-full bg-primary'
-                            title='也写在 claude.setting'
-                          />
-                        ) : (
-                          <span className='size-1.5 shrink-0' />
-                        )}
-                        {row.key}
-                      </span>
-                    </th>
-                    <td className='px-4 py-2 text-end font-mono text-xs break-all text-muted-foreground'>
-                      {row.value === '' ? '空' : row.value}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+          <div className='divide-y'>
+            {Object.keys(draft.env).map((key) => (
+              <label
+                key={key}
+                className='grid items-center gap-2 px-4 py-2 sm:grid-cols-[minmax(0,1fr)_minmax(8rem,16rem)]'
+              >
+                <span className='inline-flex min-w-0 items-center gap-2 font-mono text-xs font-medium break-all'>
+                  {claudeNamed.has(key) ? (
+                    <span
+                      className='size-1.5 shrink-0 rounded-full bg-primary'
+                      title='也写在 claude.setting'
+                    />
+                  ) : (
+                    <span className='size-1.5 shrink-0' />
+                  )}
+                  {key}
+                </span>
+                <Input
+                  aria-label={key}
+                  value={draft.env[key] ?? ''}
+                  disabled={saving}
+                  spellCheck={false}
+                  onChange={(event) =>
+                    patch({ env: { ...draft.env, [key]: event.target.value } })
+                  }
+                  className='h-8 font-mono text-xs'
+                />
+              </label>
+            ))}
+            <label className='grid items-center gap-2 px-4 py-2 sm:grid-cols-[minmax(0,1fr)_minmax(8rem,16rem)]'>
+              <span className='font-mono text-xs font-medium'>theme</span>
+              <Input
+                aria-label='theme'
+                value={draft.theme}
+                disabled={saving}
+                spellCheck={false}
+                onChange={(event) => patch({ theme: event.target.value })}
+                className='h-8 font-mono text-xs'
+              />
+            </label>
+            {rows
+              .filter(
+                (row) =>
+                  row.key === 'autoUpdates' || row.key === 'grove_enabled'
+              )
+              .map((row) => (
+                <div
+                  key={row.key}
+                  className='grid items-center gap-2 px-4 py-2 sm:grid-cols-[minmax(0,1fr)_minmax(8rem,16rem)]'
+                >
+                  <span className='font-mono text-xs font-medium'>
+                    {row.key}
+                  </span>
+                  <span className='font-mono text-xs text-muted-foreground'>
+                    {row.value} · 播种时固定
+                  </span>
+                </div>
+              ))}
           </div>
         )}
       </section>
@@ -258,6 +308,19 @@ export function SeedPolicyCard({
           >
             重置
           </Button>
+        </div>
+        <div className='border-t px-4 py-3'>
+          <ToggleRow
+            id='seed-telemetry-debug'
+            label='调试上传'
+            detail={
+              debug ? '显示这槽实际上传的遥测。' : '默认关闭，不拉上传记录。'
+            }
+            checked={debug}
+            disabled={saving}
+            onCheckedChange={onDebug}
+          />
+          {debug ? <TelemetryUploadLog lines={seed.telemetry_log} /> : null}
         </div>
       </aside>
     </div>

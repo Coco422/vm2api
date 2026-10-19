@@ -3542,19 +3542,18 @@ export function createPanelHandler(ctx) {
         } catch {}
         const seed_policy = defaultSeedPolicy(vm.seed_policy || {})
         if (claude_setting !== null) seed_policy.claude_setting = claude_setting
-        return json(
-          res,
-          200,
-          panel.ok({
-            vm_id: id,
-            seed_policy,
-            ...seedTelemetryContract(seed_policy),
-            settings_json,
-            claude_setting,
-            kin_seed,
-            cli_home: homeDir,
-          }),
-        )
+        const debug = new URL(req.url || '/', 'http://localhost').searchParams.get('debug') === '1'
+        const payload = {
+          vm_id: id,
+          seed_policy,
+          ...seedTelemetryContract(seed_policy),
+          settings_json,
+          claude_setting,
+          kin_seed,
+          cli_home: homeDir,
+        }
+        if (debug) payload.telemetry_log = readTelemetryUploadLog(cfg.paths.project, id)
+        return json(res, 200, panel.ok(payload))
       }
       // PUT /api/panel/vms/:id/seed-settings
       if (req.method === 'PUT' && /^\/api\/panel\/vms\/[^/]+\/seed-settings$/.test(p)) {
@@ -5776,5 +5775,15 @@ export function createPanelHandler(ctx) {
     }
 
     return false
+  }
+}
+
+function readTelemetryUploadLog(projectRoot, id) {
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,80}$/.test(String(id || ''))) return []
+  try {
+    const text = fs.readFileSync(path.join(projectRoot, 'vms', id, 'run', 'telemetry-upload.log'), 'utf8')
+    return text.split(/\r?\n/).filter(Boolean).slice(-40)
+  } catch {
+    return []
   }
 }
