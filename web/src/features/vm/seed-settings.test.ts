@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { vmSeedQueryOptions, vmSeedUploadLogQueryOptions } from './queries'
 import {
   claudeSettingKeys,
   editableSeedEnv,
@@ -9,10 +10,6 @@ import {
   settingsRows,
   telemetryLive,
 } from './seed-settings'
-import {
-  vmSeedQueryOptions,
-  vmSeedUploadLogQueryOptions,
-} from './queries'
 
 const settings = {
   env: {
