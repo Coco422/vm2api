@@ -2,6 +2,7 @@
 
 ## 未发布
 
+- 官方 OAuth（claude_code）：在已运行槽终端里执行 `claude auth login`，面板弹出槽终端、授权链接在终端复制、授权码由用户粘贴；宿主机不再自造 authorize URL。Cookie 导入与 Setup Token 路径不变。（#615）
 - 槽位种子页默认锁定：需确认解锁后才能改配置，播种前再次确认；时区/语言提供 en、cn、jp 基础选项。时区跟随当前 SOCKS5（空/非手动钉住）时展示出口时区，播种经 `timezone_follow_proxy` 写入；可改固定 IANA 时区或改回跟随。TZ/LANG/LC_ALL 仍不经 `extra_env` 覆盖契约键。
 - 槽位种子页：`settings.json` 的 env 行与 `theme` 可直接编辑并随播种写入；`autoUpdates`、`grove_enabled` 只读且播种时固定为 `false`；TZ/LANG/LC_ALL、遥测 kill-switch、Bedrock/Vertex、gateway hint 等同理只读（播种由契约重写）。缺 `CLAUDE_CODE_ATTRIBUTION_HEADER` 时默认 `0`。调试上传默认关，独立 query 拉最近 40 条上传，切换开关不重置未保存编辑；Go sidecar 写 `vms/<id>/run/telemetry-upload.log`，面板 `GET seed-settings?debug=1` 返回 `telemetry_log`。
 - 槽位种子页按当前槽 `settings.json` 列出真实配置；`claude.setting` 可编辑播种；缺失文件返回 `null`、空文件返回空串，不用策略默认冒充槽内文件；遥测开关与 sidecar 进程状态分开展示，保存不因遥测进程刷新失败而 502。

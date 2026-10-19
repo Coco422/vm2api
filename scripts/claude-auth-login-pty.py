@@ -337,7 +337,6 @@ def main() -> int:
             now = time.time()
             if now - last_beat > 5:
                 write_status(auth_url=url or "")
-                deadline = max(deadline, now + 32 * 60)
                 last_beat = now
             if not pid_alive:
                 write_transcript(buf)

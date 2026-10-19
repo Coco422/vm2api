@@ -51,6 +51,7 @@ export function WsTerminal({
   socketPath,
   commands,
   startupCommand,
+  officialLogin,
 }: {
   ticketPath: string
   socketPath: string
