@@ -6,7 +6,11 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { adoptShellLogin, createSlotShell, panelShellLaunch } from '../../src/lib/vm/slot-shell.mjs'
 import { OFFICIAL_CLI_VERSION } from '../../src/lib/identity/vm-identity.mjs'
-import { ensureOfficialCredentialLink, readWorkerCredentialFile } from '../../src/lib/oauth/oauth-credentials.mjs'
+import {
+  ensureOfficialCredentialLink,
+  readWorkerCredentialFile,
+  writeWorkerCredentialFile,
+} from '../../src/lib/oauth/oauth-credentials.mjs'
 test('claude in the panel shell runs cli-node and points config at .claude', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-rc-'))
   const bin = path.join(dir, 'cli-node')
@@ -91,7 +95,7 @@ test('a fresh slot login links the official credential file onto the worker file
   }
 })
 
-test('shell login is imported into the worker credential and the shell copy is removed', () => {
+test('shell login is synced into the worker credential and the terminal keeps the link', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-adopt-'))
   const home = path.join(root, 'vms', 'vm-02', 'cli-home')
   const official = path.join(home, '.claude', '.credentials.json')
@@ -109,11 +113,24 @@ test('shell login is imported into the worker credential and the shell copy is r
         },
       }),
     )
-    const adopted = adoptShellLogin(root, { id: 'vm-02' })
+    const calls = []
+    const adopted = await adoptShellLogin(
+      root,
+      { id: 'vm-02' },
+      {
+        importOauth: async (input) => {
+          calls.push(input)
+          writeWorkerCredentialFile(home, input.oauth)
+          return { ok: true }
+        },
+      },
+    )
     assert.equal(adopted.imported, true)
+    assert.equal(adopted.linked, true)
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0].source, 'claude-auth-login')
     assert.equal(readWorkerCredentialFile(home).refresh_token, 'rt-shell')
-    assert.equal(fs.existsSync(official), false)
-    assert.equal(fs.existsSync(path.join(home, '.claude', 'credentials.json')), true)
+    assert.equal(fs.readlinkSync(official), 'credentials.json')
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }

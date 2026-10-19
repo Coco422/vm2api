@@ -39,22 +39,45 @@ function readJsonFile(file) {
   }
 }
 
-/** The shell only obtains the grant. Persist it in the worker credential store, then drop the shell copy. */
-export function adoptShellLogin(projectRoot, vm) {
+/**
+ * The shell obtains the grant. The existing importer owns the worker file,
+ * worker notification, and vm.json metadata. The terminal keeps reading that
+ * same file through .credentials.json.
+ */
+export async function adoptShellLogin(projectRoot, vm, { importOauth = null } = {}) {
   const home = path.join(projectRoot, 'vms', vm.id, 'cli-home')
   const official = path.join(home, '.claude', '.credentials.json')
   const oauth = officialLoginCredentialToOauth(readJsonFile(official) || {})
-  const written = writeWorkerCredentialFile(home, oauth)
-  if (!written) {
-    const err = new Error('官方登录凭证未能写入槽凭证')
-    err.code = 'credential_import_failed'
+  const vmPath = path.join(projectRoot, 'vms', `${vm.id}.json`)
+  const existing = getVm(projectRoot, vm.id) || { ...vm, id: vm.id }
+  if (typeof importOauth === 'function') {
+    const committed = await importOauth({
+      vmId: vm.id,
+      vmPath,
+      existing,
+      oauth,
+      source: oauth.source,
+    })
+    if (!committed?.ok) {
+      const err = new Error(committed?.error?.message || '官方登录凭证未能导入槽凭证')
+      err.code = committed?.error?.code || 'credential_import_failed'
+      throw err
+    }
+  } else {
+    const written = writeWorkerCredentialFile(home, oauth)
+    if (!written) {
+      const err = new Error('官方登录凭证未能写入槽凭证')
+      err.code = 'credential_import_failed'
+      throw err
+    }
+  }
+  const linked = ensureOfficialCredentialLink(home, officialCcUidGid(vm.id))
+  if (!linked?.linked) {
+    const err = new Error(linked?.error || '终端凭证链接失败')
+    err.code = 'credential_link_failed'
     throw err
   }
-  try {
-    if (fs.lstatSync(official).isSymbolicLink()) fs.unlinkSync(official)
-    else fs.rmSync(official, { force: true })
-  } catch {}
-  return { imported: true, path: written }
+  return { imported: true, linked: true }
 }
 
 /** Live guest MOTD. Optional probes must not fail startup or print secrets. */
@@ -268,7 +291,7 @@ function refuse(status, code, message) {
   return { ok: false, status, error: { code, message } }
 }
 
-export function createSlotShell({ projectRoot, logger = console }) {
+export function createSlotShell({ projectRoot, logger = console, importOauth = null } = {}) {
   const tickets = new Map()
   const liveTokens = new Set()
   let sessions = 0
@@ -449,7 +472,7 @@ export function createSlotShell({ projectRoot, logger = console }) {
       ended = true
       if (size.login) {
         try {
-          adoptShellLogin(projectRoot, vm)
+          await adoptShellLogin(projectRoot, vm, { importOauth })
         } catch (err) {
           logger.warn?.(`[slot-shell] ${vm.id} login import failed: ${err.message}`)
           send(JSON.stringify({ t: 'error', message: '官方登录凭证未能导入槽凭证' }))

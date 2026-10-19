@@ -931,7 +931,7 @@ if (proxyPool.snapshot().config.ipv6_enabled !== true) {
   }
 }
 const clusterRoutes = createClusterRoutes({ manager: clusterManager, json, readBody, ok: panel.ok })
-const slotShell = createSlotShell({ projectRoot: cfg.paths.project })
+const slotShell = createSlotShell({ projectRoot: cfg.paths.project, importOauth: commitImportedOauth })
 for (const vm of listVms(cfg.paths.project)) {
   if (isCodexVm(vm)) continue
   try {
