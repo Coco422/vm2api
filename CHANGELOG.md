@@ -2,12 +2,9 @@
 
 ## 未发布
 
-<<<<<<< HEAD
+- Responses WebSocket：入站 `response.interrupt`（Codex steer）本地中止在飞 hop 并回 `response.interrupt.accepted`；取消走既有 handleProtocol 终态记账，不再报 `unsupported Responses WebSocket message type` 或网关 `incomplete_response`。上游 interrupt 转发对齐 CPR 后置。（#616）
 - Fable `7d_oi`：reset 已过（含秒级时间戳）不再永久判 rejected；`fableWindowResetAt` / weekly split 用 `parseResetMs`；过期清理纳入 `unified['7d_oi']`，且 `elapsedExtraResetMs` 纳入 `7d_oi` 后会在窗口过期时触发 usage probe；无 reset 时仍按 rejected 处理。（#601）
 - OpenAI 槽：从 OAuth `id_token` 读取 `chatgpt_subscription_active_until`（含 epoch 秒/毫秒归一化为 ISO），刷新时新 token 带 claim 则覆盖到期日、不带则保留旧值；账号页只读展示「订阅到期（以凭证为准）」，缺失显示「—」。`plan_type` 缺失时用 id_token 的 `chatgpt_plan_type` 兜底展示；wham 写入的套餐类型优先。（#609）
-=======
-- Responses WebSocket：入站 `response.interrupt`（Codex steer）本地中止在飞 hop 并回 `response.interrupt.accepted`；取消走既有 handleProtocol 终态记账，不再报 `unsupported Responses WebSocket message type` 或网关 `incomplete_response`。上游 interrupt 转发对齐 CPR 后置。（#616）
->>>>>>> 0dd2828c (fix(responses-ws): handle response.interrupt for Codex steer)
 
 ## 1.3.200 — 2026-10-20
 
