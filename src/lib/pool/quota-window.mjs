@@ -257,7 +257,7 @@ export function listQuotaFromHeaders(unified = {}, { now = Date.now() } = {}) {
   const view = { ...unified, headers: wiped }
   const w5 = headerWindowOrEmpty(view, '5h', { now })
   const w7 = headerWindowOrEmpty(view, '7d', { now })
-  const oi = wipedResult.oi ?? unified?.['7d_oi'] ?? {}
+  const oi = wipedResult.oi ?? unified?.['7d_oi'] ?? wiped['7d_oi'] ?? {}
   return {
     utilization_5h: w5.utilization != null ? Number(w5.utilization) : null,
     utilization_7d: w7.utilization != null ? Number(w7.utilization) : null,

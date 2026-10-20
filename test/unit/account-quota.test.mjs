@@ -710,6 +710,15 @@ test('7d_oi rejected with elapsed second-level reset is not Fable-limited', () =
   assert.equal(q.fableWindowResetAt('acc-oi-elapsed'), parseResetMs(resetSec))
 })
 
+test('7d_oi rejected without reset stays Fable-limited', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  const acc = q.ensure({ account_id: 'acc-oi-no-reset' })
+  acc.unified['7d_oi'] = { utilization: 1, status: 'rejected' }
+  q.repo.save(acc)
+  assert.equal(q.fableWindowLimited('acc-oi-no-reset'), true)
+  assert.equal(q.fableWindowResetAt('acc-oi-no-reset'), null)
+})
+
 test('7d_oi rejected with future second-level reset stays Fable-limited', () => {
   const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
   const now = Date.parse('2026-10-19T09:00:00Z')
