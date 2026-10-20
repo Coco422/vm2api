@@ -7,7 +7,9 @@ import { createPanelHandler } from '../../src/lib/admin/panel-routes.mjs'
 import {
   createResponsesWsHandler,
   createSseJsonBridge,
+  decodeResponseInterrupt,
   isProtocolWarmup,
+  responseInterruptAcceptedFrame,
 } from '../../src/lib/protocol/responses-ws.mjs'
 
 function json(res, status, body) {
@@ -433,7 +435,7 @@ test('unknown control events are protocol errors, not a fake completed', async (
   })
   try {
     const opened = await openWs(live.url, { authorization: 'Bearer sk-test' })
-    opened.ws.send(JSON.stringify({ type: 'response.interrupt', response_id: 'resp_x' }))
+    opened.ws.send(JSON.stringify({ type: 'response.steer', previous_response_id: 'resp_x', input: 'stop' }))
     const frame = await nextFrame(opened.ws, (event) => event.type === 'error')
     assert.equal(frame.error.code, 'invalid_value')
     assert.equal(hops.length, 0)
@@ -441,6 +443,141 @@ test('unknown control events are protocol errors, not a fake completed', async (
   } finally {
     await live.close()
   }
+})
+
+test('response.interrupt aborts the in-flight hop and returns accepted', async () => {
+  let hops = 0
+  let aborted = false
+  let started
+  const startedP = new Promise((resolve) => {
+    started = resolve
+  })
+  const live = await listen({
+    routing: ENABLED,
+    requireAuth: allowAuth,
+    async handleProtocol(req, res) {
+      hops += 1
+      started()
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.write(
+        'data: {"type":"response.created","response":{"id":"resp_live","status":"in_progress","output":[]}}\n\n',
+      )
+      await new Promise((resolve) => req.once('aborted', resolve))
+      aborted = true
+      if (!res.writableEnded) res.end()
+    },
+  })
+  try {
+    const opened = await openWs(live.url, { authorization: 'Bearer sk-test' })
+    opened.ws.send(JSON.stringify({ type: 'response.create', model: 'gpt-5.4', input: 'hang' }))
+    await startedP
+    const accepted = nextFrame(opened.ws, (frame) => frame.type === 'response.interrupt.accepted')
+    opened.ws.send(
+      JSON.stringify({
+        type: 'response.interrupt',
+        previous_response_id: 'resp_live',
+        mode: 'discard_partial_items',
+      }),
+    )
+    const frame = await accepted
+    assert.equal(frame.type, 'response.interrupt.accepted')
+    assert.equal(frame.previous_response_id, 'resp_live')
+    assert.equal(frame.mode, 'discard_partial_items')
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    assert.equal(hops, 1)
+    assert.equal(aborted, true)
+    opened.ws.close()
+  } finally {
+    await live.close()
+  }
+})
+
+test('response.interrupt without an in-flight hop returns accepted and starts zero hops', async () => {
+  let hops = 0
+  const live = await listen({
+    routing: ENABLED,
+    requireAuth: allowAuth,
+    async handleProtocol() {
+      hops += 1
+    },
+  })
+  try {
+    const opened = await openWs(live.url, { authorization: 'Bearer sk-test' })
+    opened.ws.send(JSON.stringify({ type: 'response.interrupt', response_id: 'resp_idle' }))
+    const frame = await nextFrame(opened.ws, (event) => event.type === 'response.interrupt.accepted')
+    assert.equal(frame.response_id, 'resp_idle')
+    assert.equal(hops, 0)
+    opened.ws.close()
+  } finally {
+    await live.close()
+  }
+})
+
+test('response.interrupt records a single cancelled terminal for billing, not incomplete_response', async () => {
+  const billingEvents = []
+  let hops = 0
+  let started
+  const startedP = new Promise((resolve) => {
+    started = resolve
+  })
+  const live = await listen({
+    routing: ENABLED,
+    requireAuth: allowAuth,
+    async handleProtocol(req, res) {
+      hops += 1
+      started()
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      let finalized = false
+      const finalize = (state) => {
+        if (finalized) return
+        finalized = true
+        billingEvents.push(state)
+      }
+      await new Promise((resolve) => {
+        req.once('aborted', () => {
+          finalize('cancelled')
+          resolve()
+        })
+      })
+      finalize('completed')
+      if (!res.writableEnded) res.end()
+    },
+  })
+  try {
+    const opened = await openWs(live.url, { authorization: 'Bearer sk-test' })
+    const frames = []
+    opened.ws.on('message', (data) => frames.push(JSON.parse(String(data))))
+    opened.ws.send(JSON.stringify({ type: 'response.create', model: 'gpt-5.4', input: 'bill' }))
+    await startedP
+    opened.ws.send(JSON.stringify({ type: 'response.interrupt', previous_response_id: 'resp_bill' }))
+    await nextFrame(opened.ws, (frame) => frame.type === 'response.interrupt.accepted')
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    assert.equal(hops, 1)
+    assert.deepEqual(billingEvents, ['cancelled'])
+    assert.equal(
+      frames.some((frame) => frame.type === 'error' && frame.error?.code === 'incomplete_response'),
+      false,
+    )
+    opened.ws.close()
+  } finally {
+    await live.close()
+  }
+})
+
+test('decodeResponseInterrupt and accepted frame helpers mirror CPR envelope fields', () => {
+  const decoded = decodeResponseInterrupt(
+    JSON.stringify({
+      type: 'response.interrupt',
+      previous_response_id: 'resp_1',
+      mode: 'discard_partial_items',
+    }),
+  )
+  assert.equal(decoded.ok, true)
+  assert.deepEqual(responseInterruptAcceptedFrame(decoded.value), {
+    type: 'response.interrupt.accepted',
+    previous_response_id: 'resp_1',
+    mode: 'discard_partial_items',
+  })
 })
 
 test('PUT /api/panel/routing rejects illegal websocket fields before persist', async () => {

@@ -90,6 +90,52 @@ export function decodeResponseCreate(payload) {
   return { ok: true, body }
 }
 
+export function decodeResponseInterrupt(payload) {
+  let value
+  try {
+    value = JSON.parse(payload)
+  } catch {
+    return {
+      ok: false,
+      error: responsesWsErrorFrame({
+        code: 'invalid_json',
+        message: 'response.interrupt frame must be valid JSON',
+      }),
+    }
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {
+      ok: false,
+      error: responsesWsErrorFrame({
+        code: 'invalid_value',
+        message: 'response.interrupt frame must be a JSON object',
+        param: 'type',
+      }),
+    }
+  }
+  if (value.type !== 'response.interrupt') {
+    return {
+      ok: false,
+      error: responsesWsErrorFrame({
+        code: 'invalid_value',
+        message: 'unsupported Responses WebSocket message type',
+        param: 'type',
+      }),
+    }
+  }
+  return { ok: true, value }
+}
+
+export function responseInterruptAcceptedFrame(value = {}) {
+  const frame = { type: 'response.interrupt.accepted' }
+  const previousId = typeof value.previous_response_id === 'string' ? value.previous_response_id.trim() : ''
+  const responseId = typeof value.response_id === 'string' ? value.response_id.trim() : ''
+  if (previousId) frame.previous_response_id = previousId
+  else if (responseId) frame.response_id = responseId
+  if (typeof value.mode === 'string' && value.mode) frame.mode = value.mode
+  return frame
+}
+
 function cloneJson(value) {
   if (value == null) return value
   return JSON.parse(JSON.stringify(value))
@@ -490,6 +536,10 @@ export function createResponsesWsHandler({
           }
           const req = createProtocolReq(upgradeReq, hopBody)
           currentReq = req
+          let hopClientAborted = false
+          req.once('aborted', () => {
+            hopClientAborted = true
+          })
           const res = createProtocolRes()
           const bridge = createSseJsonBridge()
           let jsonBody = ''
@@ -524,6 +574,7 @@ export function createResponsesWsHandler({
             currentReq = null
           }
           if (closed) return
+          if (hopClientAborted) continue
           bridge.finish()
           flushBridge()
           if (contentTypeOf(res._headers).includes('application/json')) {
@@ -564,8 +615,34 @@ export function createResponsesWsHandler({
         abortCurrent()
         return
       }
-      const bytes = Buffer.byteLength(data)
+      const raw = String(data)
+      let interruptEnvelope = null
+      try {
+        const parsed = JSON.parse(raw)
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && parsed.type === 'response.interrupt') {
+          interruptEnvelope = parsed
+        }
+      } catch {}
+      if (interruptEnvelope) {
+        const routing = typeof getRouting === 'function' ? getRouting() || {} : {}
+        if (!inferenceWebsocketEnabled(routing)) {
+          sendFrame(
+            ws,
+            responsesWsErrorFrame({
+              status: 403,
+              type: 'permission_error',
+              code: 'websocket_disabled',
+              message: 'Responses WebSocket is disabled',
+            }),
+          )
+          return
+        }
+        abortCurrent()
+        sendFrame(ws, responseInterruptAcceptedFrame(interruptEnvelope))
+        return
+      }
       const routing = typeof getRouting === 'function' ? getRouting() || {} : {}
+      const bytes = Buffer.byteLength(raw)
       if (bytes + queuedBytes > inboundBodyLimit(routing, maxBodyBytes)) {
         closed = true
         ws.close(1009, 'Responses WebSocket receive buffer exceeds request body limit')
@@ -587,7 +664,7 @@ export function createResponsesWsHandler({
         abortCurrent()
         return
       }
-      queue.push(String(data))
+      queue.push(raw)
       queuedBytes += bytes
       pump().catch((error) => {
         console.warn('[responses-ws] connection failed', error?.code || error?.name || 'unknown_error')
