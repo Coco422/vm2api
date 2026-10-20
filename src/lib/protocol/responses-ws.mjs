@@ -90,18 +90,28 @@ export function decodeResponseCreate(payload) {
   return { ok: true, body }
 }
 
+export function interruptTargetResponseId(value = {}) {
+  const previousId = typeof value.previous_response_id === 'string' ? value.previous_response_id.trim() : ''
+  const responseId = typeof value.response_id === 'string' ? value.response_id.trim() : ''
+  return previousId || responseId || ''
+}
+
 export function decodeResponseInterrupt(payload) {
   let value
-  try {
-    value = JSON.parse(payload)
-  } catch {
-    return {
-      ok: false,
-      error: responsesWsErrorFrame({
-        code: 'invalid_json',
-        message: 'response.interrupt frame must be valid JSON',
-      }),
+  if (typeof payload === 'string') {
+    try {
+      value = JSON.parse(payload)
+    } catch {
+      return {
+        ok: false,
+        error: responsesWsErrorFrame({
+          code: 'invalid_json',
+          message: 'response.interrupt frame must be valid JSON',
+        }),
+      }
     }
+  } else {
+    value = payload
   }
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return {
@@ -124,6 +134,20 @@ export function decodeResponseInterrupt(payload) {
     }
   }
   return { ok: true, value }
+}
+
+export function parseResponsesWsClientMessage(raw) {
+  let value
+  try {
+    value = JSON.parse(raw)
+  } catch {
+    return { kind: 'queue' }
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return { kind: 'queue' }
+  if (value.type !== 'response.interrupt') return { kind: 'queue' }
+  const decoded = decodeResponseInterrupt(value)
+  if (!decoded.ok) return { kind: 'interrupt_error', error: decoded.error }
+  return { kind: 'interrupt', value: decoded.value }
 }
 
 export function responseInterruptAcceptedFrame(value = {}) {
@@ -480,6 +504,8 @@ export function createResponsesWsHandler({
     let busy = false
     let closed = false
     let currentReq = null
+    let activeResponseId = null
+    let activeHopCompleted = false
 
     const abortCurrent = () => {
       try {
@@ -534,19 +560,25 @@ export function createResponsesWsHandler({
             }
             hopBody = expandPreviousResponse(hopBody, resolved.snapshot)
           }
+          activeResponseId = null
+          activeHopCompleted = false
           const req = createProtocolReq(upgradeReq, hopBody)
           currentReq = req
           let hopClientAborted = false
-          req.once('aborted', () => {
-            hopClientAborted = true
-          })
           const res = createProtocolRes()
           const bridge = createSseJsonBridge()
           let jsonBody = ''
           const flushBridge = () => {
             for (const frame of bridge.frames) sendFrame(ws, frame)
             bridge.frames.length = 0
+            const snap = bridge.snapshot()
+            if (snap?.id) activeResponseId = snap.id
+            if (bridge.terminal === 'completed') activeHopCompleted = true
           }
+          req.once('aborted', () => {
+            if (bridge.terminal === 'completed' || activeHopCompleted) return
+            hopClientAborted = true
+          })
           res.on('chunk', (text) => {
             if (contentTypeOf(res._headers).includes('application/json')) {
               jsonBody += text
@@ -574,9 +606,9 @@ export function createResponsesWsHandler({
             currentReq = null
           }
           if (closed) return
-          if (hopClientAborted) continue
           bridge.finish()
           flushBridge()
+          if (hopClientAborted && bridge.terminal !== 'completed') continue
           if (contentTypeOf(res._headers).includes('application/json')) {
             sendFrame(ws, httpErrorToFrame(res.statusCode, jsonBody))
             continue
@@ -616,14 +648,12 @@ export function createResponsesWsHandler({
         return
       }
       const raw = String(data)
-      let interruptEnvelope = null
-      try {
-        const parsed = JSON.parse(raw)
-        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && parsed.type === 'response.interrupt') {
-          interruptEnvelope = parsed
-        }
-      } catch {}
-      if (interruptEnvelope) {
+      const clientMessage = parseResponsesWsClientMessage(raw)
+      if (clientMessage.kind === 'interrupt_error') {
+        sendFrame(ws, clientMessage.error)
+        return
+      }
+      if (clientMessage.kind === 'interrupt') {
         const routing = typeof getRouting === 'function' ? getRouting() || {} : {}
         if (!inferenceWebsocketEnabled(routing)) {
           sendFrame(
@@ -637,8 +667,11 @@ export function createResponsesWsHandler({
           )
           return
         }
-        abortCurrent()
-        sendFrame(ws, responseInterruptAcceptedFrame(interruptEnvelope))
+        const targetId = interruptTargetResponseId(clientMessage.value)
+        const shouldAbort =
+          currentReq && !activeHopCompleted && (!targetId || (activeResponseId && targetId === activeResponseId))
+        if (shouldAbort) abortCurrent()
+        sendFrame(ws, responseInterruptAcceptedFrame(clientMessage.value))
         return
       }
       const routing = typeof getRouting === 'function' ? getRouting() || {} : {}

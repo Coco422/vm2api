@@ -771,6 +771,7 @@ export function createHandleProtocol(deps) {
           projectRoot: cfg.paths.project,
           captureOutbound: logCtx.capture_outbound === true,
           accountGate,
+          ops: deps.codexOps || {},
           ...codexSticky,
         })
       }
@@ -788,6 +789,7 @@ export function createHandleProtocol(deps) {
         projectRoot: cfg.paths.project,
         captureOutbound: logCtx.capture_outbound === true,
         accountGate,
+        ops: deps.codexOps || {},
         ...codexSticky,
       })
     }
