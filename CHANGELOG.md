@@ -6,6 +6,7 @@
 - Docker 在线扩容只在容器运行中、且 `HostConfig.Memory`、`HostConfig.MemorySwap` 与容器内 cgroup `memory.max` 三者都等于请求字节时写入 `vm.machine.memory`。停着的容器在 `docker update` 前拒绝；不一致返回 502 且不改配置。校验失败不回滚已经执行的 `docker update`，容器限额可能已经是新值。cgroup v2 读到 `max` 视为不一致。（#621）
 - 官方 Claude Code 登录（`cc`）在已有授权链接之前打开槽终端，避免链接面板盖住「打开官方登录终端」。（#621）
 - 面板凭据：选择 Claude Code 官方登录时直接打开槽终端，已有 OAuth 授权链接不再挡住 CC 登录路径。（#622）
+- Docker 槽在线扩容：面板成功须 HostConfig 内存与 swap 一致；可读 cgroup 时核对 v2 `memory.max` 或 v1 `memory.limit_in_bytes`（`max`/无上限哨兵在 HostConfig 已匹配时跳过）。扩容后校验失败会 docker update 回滚至扩容前限额且不写 vm 配置。（#623，REQ-0441）
 - Responses WebSocket：入站 `response.interrupt`（Codex steer）本地中止在飞 hop 并回 `response.interrupt.accepted`；取消走既有 handleProtocol 终态记账，不再报 `unsupported Responses WebSocket message type` 或网关 `incomplete_response`。上游 interrupt 转发对齐 CPR 后置。（#616）
 - Fable `7d_oi`：reset 已过（含秒级时间戳）不再永久判 rejected；`fableWindowResetAt` / weekly split 用 `parseResetMs`；过期清理纳入 `unified['7d_oi']`，且 `elapsedExtraResetMs` 纳入 `7d_oi` 后会在窗口过期时触发 usage probe；无 reset 时仍按 rejected 处理。（#601）
 - OpenAI 槽：从 OAuth `id_token` 读取 `chatgpt_subscription_active_until`（含 epoch 秒/毫秒归一化为 ISO），刷新时新 token 带 claim 则覆盖到期日、不带则保留旧值；账号页只读展示「订阅到期（以凭证为准）」，缺失显示「—」。`plan_type` 缺失时用 id_token 的 `chatgpt_plan_type` 兜底展示；wham 写入的套餐类型优先。（#609）
