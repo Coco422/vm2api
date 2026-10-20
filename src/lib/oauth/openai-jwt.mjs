@@ -25,9 +25,17 @@ export function decodeJwtPayload(token) {
   }
 }
 
+function chatgptSubscriptionActiveUntilFromPayload(payload) {
+  if (!payload || typeof payload !== 'object') return null
+  const auth = payload['https://api.openai.com/auth']
+  const authObj = auth && typeof auth === 'object' ? auth : {}
+  const raw = firstString(payload.chatgpt_subscription_active_until, authObj.chatgpt_subscription_active_until)
+  return raw || null
+}
+
 export function openaiIdentityFromJwt(token) {
   const payload = decodeJwtPayload(token)
-  if (!payload) return { email: null, chatgpt_account_id: null }
+  if (!payload) return { email: null, chatgpt_account_id: null, chatgpt_subscription_active_until: null }
   const auth = payload['https://api.openai.com/auth']
   const authObj = auth && typeof auth === 'object' ? auth : {}
   const profile = payload['https://api.openai.com/profile']
@@ -45,6 +53,7 @@ export function openaiIdentityFromJwt(token) {
   return {
     email: email || null,
     chatgpt_account_id: chatgpt_account_id || null,
+    chatgpt_subscription_active_until: chatgptSubscriptionActiveUntilFromPayload(payload),
   }
 }
 
@@ -55,5 +64,6 @@ export function openaiIdentityFromOauthTokens({ id_token, access_token, idToken,
   return {
     email: firstString(fromId.email, fromAccess.email) || null,
     chatgpt_account_id: firstString(fromId.chatgpt_account_id, fromAccess.chatgpt_account_id) || null,
+    chatgpt_subscription_active_until: fromId.chatgpt_subscription_active_until || null,
   }
 }

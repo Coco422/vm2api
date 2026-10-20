@@ -321,6 +321,22 @@ test('upsertCodexAccount persists identity for panel summarizeCodexSlot', () => 
   })
   assert.equal(summary.email, 'panel@example.com')
   assert.equal(summary.chatgpt_account_id, 'acc-panel')
+  assert.equal(summary.chatgpt_subscription_active_until, null)
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('summarizeCodexSlot exposes chatgpt_subscription_active_until from id_token', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-sub-until-'))
+  const vmId = 'vm-codex-sub'
+  fs.mkdirSync(path.join(root, 'vms', vmId), { recursive: true })
+  const until = '2028-03-15T08:00:00Z'
+  upsertCodexAccount(root, vmId, {
+    access_token: 'at',
+    refresh_token: 'rt',
+    id_token: jwt({ chatgpt_subscription_active_until: until }),
+  })
+  const summary = summarizeCodexSlot(root, { id: vmId, platform: 'openai', codex: {} })
+  assert.equal(summary.chatgpt_subscription_active_until, until)
   fs.rmSync(root, { recursive: true, force: true })
 })
 

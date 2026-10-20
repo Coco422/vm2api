@@ -255,6 +255,9 @@ export function enrichCodexAccountIdentity(account = {}) {
   if (!firstString(next.chatgpt_account_id)) {
     next.chatgpt_account_id = fromTokens.chatgpt_account_id || null
   }
+  if (!firstString(next.chatgpt_subscription_active_until)) {
+    next.chatgpt_subscription_active_until = fromTokens.chatgpt_subscription_active_until || null
+  }
   return next
 }
 
@@ -268,6 +271,7 @@ export function upsertCodexAccount(projectRoot, vmId, patch = {}, { replaceCrede
       'id',
       'email',
       'chatgpt_account_id',
+      'chatgpt_subscription_active_until',
       'access_token',
       'refresh_token',
       'id_token',
@@ -341,6 +345,7 @@ export function summarizeCodexSlot(projectRoot, vm = {}) {
     email: first.email || vm.codex?.email || vm.email || null,
     expires_at: first.expires_at || vm.codex?.expires_at || null,
     chatgpt_account_id: first.chatgpt_account_id || vm.codex?.chatgpt_account_id || null,
+    chatgpt_subscription_active_until: first.chatgpt_subscription_active_until || null,
     account_count: accounts.length,
     usage,
     reset_credits: vm.codex?.reset_credits || null,

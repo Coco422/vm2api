@@ -25,6 +25,7 @@ test('openaiIdentityFromJwt reads email and chatgpt_account_id', () => {
   assert.deepEqual(openaiIdentityFromJwt(token), {
     email: 'user@example.com',
     chatgpt_account_id: 'acc-jwt-1',
+    chatgpt_subscription_active_until: null,
   })
 })
 
@@ -36,9 +37,36 @@ test('openaiIdentityFromOauthTokens prefers id_token email and merges account id
   assert.deepEqual(openaiIdentityFromOauthTokens({ id_token: idToken, access_token: accessToken }), {
     email: 'from-id@example.com',
     chatgpt_account_id: 'acc-from-at',
+    chatgpt_subscription_active_until: null,
   })
 })
 
 test('openaiIdentityFromOauthTokens tolerates missing tokens', () => {
-  assert.deepEqual(openaiIdentityFromOauthTokens({}), { email: null, chatgpt_account_id: null })
+  assert.deepEqual(openaiIdentityFromOauthTokens({}), {
+    email: null,
+    chatgpt_account_id: null,
+    chatgpt_subscription_active_until: null,
+  })
+})
+
+test('openaiIdentityFromJwt reads chatgpt_subscription_active_until from id_token payload', () => {
+  const until = '2026-12-31T23:59:59Z'
+  const idToken = jwt({ chatgpt_subscription_active_until: until })
+  const accessToken = jwt({
+    chatgpt_subscription_active_until: '2099-01-01T00:00:00Z',
+  })
+  assert.equal(openaiIdentityFromJwt(idToken).chatgpt_subscription_active_until, until)
+  assert.deepEqual(openaiIdentityFromOauthTokens({ id_token: idToken, access_token: accessToken }), {
+    email: null,
+    chatgpt_account_id: null,
+    chatgpt_subscription_active_until: until,
+  })
+})
+
+test('openaiIdentityFromJwt reads chatgpt_subscription_active_until from auth claim', () => {
+  const until = '2027-06-01T12:00:00Z'
+  const token = jwt({
+    'https://api.openai.com/auth': { chatgpt_subscription_active_until: until },
+  })
+  assert.equal(openaiIdentityFromJwt(token).chatgpt_subscription_active_until, until)
 })
