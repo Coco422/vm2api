@@ -1,5 +1,9 @@
 # Changelog
 
+## 未发布
+
+- 自动/手动备份流水线改到 worker 线程执行（VACUUM INTO + tar），避免主线程长时间阻塞网关导致 Cloudflare 524。（#638，#639）
+
 ## 1.3.202 — 2026-10-20
 
 - 官方凭证只保留一份 refresh token：`.credentials.json` 里较新的授权先并入宿主 `credentials.json`，再把官方文件名链回去。进行中的槽内 `claude auth login` 不再拿旧 refresh token 去换票，避免新授权被判 revoked。
