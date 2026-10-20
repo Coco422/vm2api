@@ -77,12 +77,7 @@ export function parseCgroupMemoryLimit(raw) {
 }
 
 export function readContainerCgroupMemoryLimit(vm, containerId, execImpl) {
-  const v2 = dockerExec(
-    vm,
-    ['docker', 'exec', containerId, 'cat', '/sys/fs/cgroup/memory.max'],
-    execImpl,
-    10_000,
-  )
+  const v2 = dockerExec(vm, ['docker', 'exec', containerId, 'cat', '/sys/fs/cgroup/memory.max'], execImpl, 10_000)
   if (v2.ok) {
     const parsed = parseCgroupMemoryLimit(v2.stdout)
     if (parsed.kind !== 'unreadable') return parsed
@@ -103,9 +98,7 @@ export function readContainerCgroupMemoryLimit(vm, containerId, execImpl) {
 function rollbackDockerMemory(vm, before, execImpl) {
   const mem = before.memory
   const swap =
-    before.swapBytes > 0 && before.swapBytes !== before.bytes
-      ? formatDockerMemoryBytes(before.swapBytes) || mem
-      : mem
+    before.swapBytes > 0 && before.swapBytes !== before.bytes ? formatDockerMemoryBytes(before.swapBytes) || mem : mem
   const name = containerName(vm.id)
   const r = dockerExec(vm, ['docker', 'update', '--memory', mem, '--memory-swap', swap, name], execImpl, 15_000)
   return r.ok
