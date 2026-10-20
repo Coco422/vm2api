@@ -136,33 +136,33 @@ test('shell login is synced into the worker credential and the terminal keeps th
   }
 })
 
-test('official login tickets refuse a cluster slot and a slot without cli-node', () => {
+test('official login tickets check a cluster slot for its container cli-node', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-ticket-'))
   fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
   fs.writeFileSync(path.join(root, 'vms', 'vm-01.json'), JSON.stringify({ id: 'vm-01', node_id: 'node-a' }))
   fs.writeFileSync(path.join(root, 'vms', 'vm-02.json'), JSON.stringify({ id: 'vm-02' }))
   const shell = createSlotShell({ projectRoot: root, logger: { warn() {} } })
   try {
-    const remote = shell.issueTicket('vm-01', { login: true })
+    const remote = await shell.issueTicket('vm-01', { login: true })
     assert.equal(remote.ok, false)
-    assert.equal(remote.error.code, 'remote_unsupported')
-    const missing = shell.issueTicket('vm-02', { login: true })
+    assert.notEqual(remote.error.code, 'remote_unsupported')
+    const missing = await shell.issueTicket('vm-02', { login: true })
     assert.equal(missing.ok, false)
     assert.equal(missing.error.code, 'container_not_ready')
-    const ops = shell.issueTicket('vm-02')
+    const ops = await shell.issueTicket('vm-02')
     assert.equal(ops.ok, true)
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
 })
 
-test('an ops shell ticket cannot be upgraded into an official login', () => {
+test('an ops shell ticket cannot be upgraded into an official login', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-upgrade-'))
   fs.mkdirSync(path.join(root, 'vms', 'vm-02', 'cli-home', '.kin'), { recursive: true })
   fs.writeFileSync(path.join(root, 'vms', 'vm-02.json'), JSON.stringify({ id: 'vm-02' }))
   fs.writeFileSync(path.join(root, 'vms', 'vm-02', 'cli-home', '.kin', 'cli-node'), '')
   const shell = createSlotShell({ projectRoot: root, logger: { warn() {} } })
-  const ops = shell.issueTicket('vm-02')
+  const ops = await shell.issueTicket('vm-02')
   const seen = []
   const socket = {
     write(data) {
@@ -179,6 +179,42 @@ test('an ops shell ticket cannot be upgraded into an official login', () => {
     assert.equal(handled, true)
     assert.match(seen[0], /^HTTP\/1\.1 409 /)
     assert.equal(fs.existsSync(path.join(root, 'vms', 'vm-02', 'cli-home', '.claude', 'credentials.json')), false)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('a stopped container rejects the official login upgrade', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-stopped-'))
+  fs.mkdirSync(path.join(root, 'vms', 'vm-02', 'cli-home', '.kin'), { recursive: true })
+  fs.writeFileSync(path.join(root, 'vms', 'vm-02.json'), JSON.stringify({ id: 'vm-02' }))
+  fs.writeFileSync(path.join(root, 'vms', 'vm-02', 'cli-home', '.kin', 'cli-node'), '')
+  const shell = createSlotShell({
+    projectRoot: root,
+    logger: { warn() {} },
+    authLoginReady: async () => ({ container: 'kin-02', cli: '/opt/kin/cli-node' }),
+    upgradeLoginReady: async () => {
+      throw Object.assign(new Error('容器尚未创建或未运行'), { code: 'container_not_ready' })
+    },
+  })
+  const login = await shell.issueTicket('vm-02', { login: true })
+  const seen = []
+  const socket = {
+    write(data) {
+      seen.push(String(data))
+    },
+    destroy() {},
+  }
+  try {
+    assert.equal(login.ok, true)
+    const handled = shell.handleUpgrade(
+      { url: `/api/panel/vms/vm-02/shell?ticket=${login.ticket}&login=1` },
+      socket,
+      Buffer.alloc(0),
+    )
+    assert.equal(handled, true)
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.match(seen[0], /^HTTP\/1\.1 409 /)
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }

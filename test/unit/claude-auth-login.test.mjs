@@ -77,33 +77,34 @@ test('auth login session stays reusable until force regenerate or login_ready', 
   assert.equal(isPersistentAuthLoginSession({ ...session, alive: false }), false)
 })
 
-test('assertAuthLoginReady refuses a missing container and a missing cli-node', () => {
+test('assertAuthLoginReady refuses a missing container and a missing cli-node', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-auth-login-ready-'))
   const stopped = () => ({ running: false })
   const running = () => ({ running: true })
   try {
     fs.mkdirSync(path.join(root, 'vms', 'vm-01'), { recursive: true })
     fs.writeFileSync(path.join(root, 'vms', 'vm-01.json'), JSON.stringify({ id: 'vm-01' }))
-    assert.throws(
-      () => assertAuthLoginReady(root, { id: 'vm-01' }, { inspect: stopped }),
+    await assert.rejects(
+      assertAuthLoginReady(root, { id: 'vm-01' }, { inspect: stopped }),
       (err) => err.code === 'container_not_ready',
     )
     const home = path.join(root, 'vms', 'vm-01', 'cli-home', '.kin')
     fs.mkdirSync(home, { recursive: true })
     fs.writeFileSync(path.join(home, 'cli-node'), '')
-    assert.throws(
-      () => assertAuthLoginReady(root, { id: 'vm-01' }, { inspect: stopped }),
+    await assert.rejects(
+      assertAuthLoginReady(root, { id: 'vm-01' }, { inspect: stopped }),
       (err) => err.code === 'container_not_ready',
     )
-    assert.throws(
-      () => assertAuthLoginReady(root, { id: 'vm-missing' }, { inspect: running }),
+    await assert.rejects(
+      assertAuthLoginReady(root, { id: 'vm-missing' }, { inspect: running }),
       (err) => err.code === 'cli_node_missing',
     )
-    assert.throws(
-      () => assertAuthLoginReady(root, { id: 'vm-01', node_id: 'node-a' }, { inspect: running }),
-      (err) => err.code === 'remote_unsupported',
+    const remote = { id: 'vm-01', node_id: 'node-a' }
+    await assert.rejects(
+      assertAuthLoginReady(root, remote, { inspect: running }),
+      (err) => err.code === 'container_unreadable',
     )
-    assert.equal(assertAuthLoginReady(root, { id: 'vm-01' }, { inspect: running }).container, 'kin-01')
+    assert.equal((await assertAuthLoginReady(root, { id: 'vm-01' }, { inspect: running })).container, 'kin-01')
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }

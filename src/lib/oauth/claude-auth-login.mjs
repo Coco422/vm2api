@@ -12,8 +12,9 @@ import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { fileURLToPath } from 'node:url'
-import { containerName, inspectContainer } from '../vm/vm-runtime.mjs'
-import { officialCcUidGid, officialCcHome, officialCcHostCli } from './official-cc-bootstrap.mjs'
+import { containerName, inspectContainer, officialCcUidGid } from '../vm/vm-runtime.mjs'
+import { officialCcHome, officialCcHostCli } from './official-cc-bootstrap.mjs'
+import { inspectContainerOrNull } from '../cluster/docker-remote.mjs'
 import { CONTAINER_CLI_NODE_BIN } from '../vm/slot-engine.mjs'
 import { OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
 import { slotExecArgv } from '../vm/slot-exec.mjs'
@@ -125,22 +126,35 @@ async function waitFor(fn, timeoutMs, intervalMs = 200) {
 }
 
 /**
- * Official login may run only after the slot container exists and cli-node
- * is installed in that slot. A seed file or a stopped container is not enough.
+ * Official login may run only after the slot container is running and cli-node
+ * is executable inside it. A local slot keeps that binary on the host home;
+ * a cluster slot bakes it into the image, so the host file is not the check.
+ * A seed file or a stopped container is not enough.
  */
-export function assertAuthLoginReady(projectRoot, vm, { inspect = inspectContainer } = {}) {
+
+export async function assertAuthLoginReady(projectRoot, vm, { inspect = inspectContainer, cliExists = null } = {}) {
   const vmId = vm?.id
   if (!vmId || !projectRoot) throw fail('vm_required', 'vm_id required')
-  if (!slotHost(vm).supports('official_cc')) {
-    throw fail('remote_unsupported', '集群节点上的虚拟机暂不支持槽内官方登录')
-  }
+  const host = slotHost(vm)
   const name = containerName(vmId)
-  const inspected = inspect(name)
+  let inspected
+  if (host.bakedKernel) {
+    try {
+      const info = await inspectContainerOrNull(host.dockerApi(), name)
+      const state = info?.State || {}
+      inspected = info ? { running: state.Running === true && state.Restarting !== true } : null
+    } catch (err) {
+      throw fail('container_unreadable', err.message || '无法检查槽位容器')
+    }
+  } else {
+    inspected = inspect(name)
+  }
   if (!inspected?.running) {
     throw fail('container_not_ready', '容器尚未创建或未运行，请先完成容器创建再登录')
   }
-  const cli = officialCcHostCli(officialCcHome(projectRoot, vmId))
-  if (!fs.existsSync(cli)) {
+  const cli = host.bakedKernel ? host.bins.cli : officialCcHostCli(officialCcHome(projectRoot, vmId))
+  const present = cliExists ? await cliExists(cli, vm) : host.bakedKernel ? true : fs.existsSync(cli)
+  if (!present) {
     throw fail('cli_node_missing', 'cli-node 尚未安装，请先同步 wrap-cli')
   }
   return { container: name, cli }
@@ -226,7 +240,7 @@ function loginEnv(vm) {
 export async function startClaudeAuthLoginSession({ vm, projectRoot, force = false, inspect = inspectContainer } = {}) {
   const vmId = vm?.id
   if (!vmId || !projectRoot) throw fail('vm_required', 'vm_id required')
-  assertAuthLoginReady(projectRoot, vm, { inspect })
+  await assertAuthLoginReady(projectRoot, vm, { inspect })
   const fake = process.env.KIN_FAKE_SESSION_OAUTH === '1' || process.env.KIN_FAKE_SESSION_OAUTH === 'true'
   if (fake) {
     return {

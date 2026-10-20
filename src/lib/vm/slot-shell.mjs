@@ -291,19 +291,25 @@ function refuse(status, code, message) {
   return { ok: false, status, error: { code, message } }
 }
 
-export function createSlotShell({ projectRoot, logger = console, importOauth = null } = {}) {
+export function createSlotShell({
+  projectRoot,
+  logger = console,
+  importOauth = null,
+  authLoginReady = null,
+  upgradeLoginReady = null,
+} = {}) {
   const tickets = new Map()
   const liveTokens = new Set()
   let sessions = 0
   const wss = new WebSocketServer({ noServer: true, maxPayload: 1 << 20 })
 
-  function issueTicket(vmId, { login = false } = {}) {
+  async function issueTicket(vmId, { login = false } = {}) {
     const vm = getVm(projectRoot, vmId)
     if (!vm) return refuse(404, 'vm_not_found', 'vm not found')
     if (isCodexVm(vm)) return refuse(409, 'no_container', 'GPT 槽没有容器，无法打开终端')
     if (login) {
       try {
-        assertAuthLoginReady(projectRoot, vm)
+        await (authLoginReady || assertAuthLoginReady)(projectRoot, vm)
       } catch (err) {
         const remote = err.code === 'remote_unsupported'
         return refuse(remote ? 409 : 400, err.code || 'auth_login_not_ready', err.message)
@@ -354,25 +360,26 @@ export function createSlotShell({ projectRoot, logger = console, importOauth = n
       return true
     }
     const login = !!entry.login
-    if (login) {
-      try {
-        assertAuthLoginReady(projectRoot, vm)
-      } catch {
-        rejectUpgrade(socket, 409, 'Conflict')
-        return true
+    const accept = () => {
+      if (sessions >= MAX_SESSIONS) {
+        rejectUpgrade(socket, 429, 'Too Many Requests')
+        return
       }
+      sessions += 1
+      const size = {
+        cols: clampInt(url.searchParams.get('cols'), 10, 500, 80),
+        rows: clampInt(url.searchParams.get('rows'), 5, 200, 24),
+        login,
+      }
+      wss.handleUpgrade(req, socket, head, (ws) => attach(ws, vm, size))
     }
-    if (sessions >= MAX_SESSIONS) {
-      rejectUpgrade(socket, 429, 'Too Many Requests')
+    if (!login) {
+      accept()
       return true
     }
-    sessions += 1
-    const size = {
-      cols: clampInt(url.searchParams.get('cols'), 10, 500, 80),
-      rows: clampInt(url.searchParams.get('rows'), 5, 200, 24),
-      login,
-    }
-    wss.handleUpgrade(req, socket, head, (ws) => attach(ws, vm, size))
+    ;(upgradeLoginReady || authLoginReady || assertAuthLoginReady)(projectRoot, vm).then(accept, () =>
+      rejectUpgrade(socket, 409, 'Conflict'),
+    )
     return true
   }
 
