@@ -22,6 +22,7 @@ import { ensureOfficialCredentialLink, writeWorkerCredentialFile } from '../oaut
 import { assertAuthLoginReady, officialLoginCredentialToOauth } from '../oauth/claude-auth-login.mjs'
 import fs from 'node:fs'
 import path from 'node:path'
+import { ensureRemoteOfficialCredentialLink, reconcileSlotCredentials } from '../cluster/remote-slot-files.mjs'
 import { officialCcUidGid } from './vm-runtime.mjs'
 
 const SHELL_RE = /^\/api\/panel\/vms\/([^/]+)\/shell$/
@@ -45,10 +46,23 @@ function readJsonFile(file) {
  * same file through .credentials.json.
  */
 /** Cluster slots write OAuth on the node claude/ mount; mirror it before adopt. */
-export async function syncShellLoginCredentials(projectRoot, vm, { phase, host = slotHost(vm) } = {}) {
+export async function syncShellLoginCredentials(
+  projectRoot,
+  vm,
+  {
+    phase,
+    host = slotHost(vm),
+    reconcile = reconcileSlotCredentials,
+    ensureRemoteLink = ensureRemoteOfficialCredentialLink,
+  } = {},
+) {
   if (host.kind !== 'node') return { synced: false }
   const slotDir = path.join(projectRoot, 'vms', vm.id)
-  if (phase === 'prepare') return host.onImport(vm, slotDir)
+  if (phase === 'prepare') {
+    const reconciled = await reconcile(vm, slotDir)
+    await ensureRemoteLink(vm, slotDir)
+    return reconciled
+  }
   if (phase === 'adopt') return host.afterRefresh(vm, slotDir)
   return { synced: false }
 }

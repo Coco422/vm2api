@@ -101,6 +101,31 @@ test('a fresh slot login links the official credential file onto the worker file
   }
 })
 
+test('cluster login prepare reconciles remote credentials instead of import push', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-cluster-prepare-'))
+  try {
+    const calls = []
+    await syncShellLoginCredentials(
+      root,
+      { id: 'vm-07', node_id: 'node-a' },
+      {
+        phase: 'prepare',
+        host: { kind: 'node' },
+        reconcile: async () => {
+          calls.push('reconcile')
+          return { pulled: true }
+        },
+        ensureRemoteLink: async () => {
+          calls.push('remote_link')
+        },
+      },
+    )
+    assert.deepEqual(calls, ['reconcile', 'remote_link'])
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('cluster shell login pulls remote OAuth before adopt imports it', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-cluster-adopt-'))
   const home = path.join(root, 'vms', 'vm-07', 'cli-home')
@@ -120,15 +145,26 @@ test('cluster shell login pulls remote OAuth before adopt imports it', async () 
     const calls = []
     const host = {
       kind: 'node',
-      onImport: async () => {
-        calls.push('prepare')
-      },
       afterRefresh: async () => {
         calls.push('adopt')
         fs.writeFileSync(worker, JSON.stringify(grant))
       },
     }
-    await syncShellLoginCredentials(root, { id: 'vm-07', node_id: 'node-a' }, { phase: 'prepare', host })
+    await syncShellLoginCredentials(
+      root,
+      { id: 'vm-07', node_id: 'node-a' },
+      {
+        phase: 'prepare',
+        host,
+        reconcile: async () => {
+          calls.push('reconcile')
+          return { pulled: false, reason: 'same' }
+        },
+        ensureRemoteLink: async () => {
+          calls.push('remote_link')
+        },
+      },
+    )
     const adopted = await adoptShellLogin(
       root,
       { id: 'vm-07', node_id: 'node-a' },
@@ -142,7 +178,7 @@ test('cluster shell login pulls remote OAuth before adopt imports it', async () 
       },
     )
     assert.equal(adopted.imported, true)
-    assert.deepEqual(calls, ['prepare', 'adopt', 'import'])
+    assert.deepEqual(calls, ['reconcile', 'remote_link', 'adopt', 'import'])
     assert.equal(readWorkerCredentialFile(home).refresh_token, 'rt-node')
   } finally {
     fs.rmSync(root, { recursive: true, force: true })

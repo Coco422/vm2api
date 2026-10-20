@@ -201,6 +201,18 @@ export async function reconcileSlotCredentials(vm, slotDir, session) {
   return pushSlotCredentials(vm, slotDir, session)
 }
 
+/** Point the node official CLI at worker credentials.json without rewriting its bytes. */
+export async function ensureRemoteOfficialCredentialLink(vm, slotDir, session = null) {
+  const s = session || (await nodeSession(vmNodeId(vm)))
+  const remoteCred = `${remoteSlotDir(s.host, vm.id)}/${remoteSlotPath(CREDENTIALS)}`
+  const remote = await readRemoteFileNoFollow(s.client, remoteCred)
+  if (!remote) return { linked: false, reason: 'remote_missing' }
+  await prepareRemoteDir(s, vm)
+  const sftp = await openSftp(s.client)
+  await remoteSymlink(sftp, 'credentials.json', `${remoteSlotDir(s.host, vm.id)}/claude/.credentials.json`)
+  return { linked: true }
+}
+
 const queues = new Map()
 
 /** Fire-and-forget push, serialized per VM so a slow push never races the next one. */
