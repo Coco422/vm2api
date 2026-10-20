@@ -2,6 +2,8 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
   decodeJwtPayload,
+  firstStringOrEpoch,
+  openaiClaimsFromIdToken,
   openaiIdentityFromJwt,
   openaiIdentityFromOauthTokens,
 } from '../../src/lib/oauth/openai-jwt.mjs'
@@ -69,4 +71,34 @@ test('openaiIdentityFromJwt reads chatgpt_subscription_active_until from auth cl
     'https://api.openai.com/auth': { chatgpt_subscription_active_until: until },
   })
   assert.equal(openaiIdentityFromJwt(token).chatgpt_subscription_active_until, until)
+})
+
+test('firstStringOrEpoch normalizes second and millisecond epochs', () => {
+  assert.equal(firstStringOrEpoch(1_700_000_000), '2023-11-14T22:13:20.000Z')
+  assert.equal(firstStringOrEpoch('1700000000000'), '2023-11-14T22:13:20.000Z')
+  assert.equal(firstStringOrEpoch('2026-01-02T03:04:05Z'), '2026-01-02T03:04:05Z')
+})
+
+test('openaiClaimsFromIdToken detects absent vs present subscription claim', () => {
+  const bare = jwt({ email: 'a@b.com' })
+  assert.deepEqual(openaiClaimsFromIdToken(bare), {
+    has_chatgpt_subscription_active_until: false,
+    chatgpt_subscription_active_until: null,
+    has_chatgpt_plan_type: false,
+    chatgpt_plan_type: null,
+  })
+  const withUntil = jwt({ chatgpt_subscription_active_until: 1_800_000_000 })
+  const claims = openaiClaimsFromIdToken(withUntil)
+  assert.equal(claims.has_chatgpt_subscription_active_until, true)
+  assert.equal(claims.chatgpt_subscription_active_until, '2027-01-15T08:00:00.000Z')
+})
+
+test('openaiClaimsFromIdToken reads chatgpt_plan_type from auth claim', () => {
+  const token = jwt({ 'https://api.openai.com/auth': { chatgpt_plan_type: 'plus' } })
+  assert.deepEqual(openaiClaimsFromIdToken(token), {
+    has_chatgpt_subscription_active_until: false,
+    chatgpt_subscription_active_until: null,
+    has_chatgpt_plan_type: true,
+    chatgpt_plan_type: 'plus',
+  })
 })

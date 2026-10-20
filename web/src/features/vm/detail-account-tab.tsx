@@ -158,7 +158,7 @@ export function VmAccountTab(props: VmAccountTabProps) {
                 </Field>
               ) : null}
               {gpt ? (
-                <Field label='订阅到期' compact>
+                <Field label='订阅到期（以凭证为准）' compact>
                   {fmtExpiresAt(vm.chatgpt_subscription_active_until)}
                 </Field>
               ) : null}

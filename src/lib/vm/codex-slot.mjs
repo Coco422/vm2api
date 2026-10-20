@@ -6,7 +6,7 @@ import path from 'node:path'
 import { atomicWriteJson, readJsonCached } from './vm-file.mjs'
 import { isCodexVm } from '../protocol/codex-route.mjs'
 import { buildCodexUsageView, extraToCodexSnapshot, hasSpendableCodexCredits } from '../protocol/codex-usage.mjs'
-import { openaiIdentityFromOauthTokens } from '../oauth/openai-jwt.mjs'
+import { openaiClaimsFromIdToken, openaiIdentityFromOauthTokens } from '../oauth/openai-jwt.mjs'
 
 export { isCodexVm }
 
@@ -250,12 +250,22 @@ export function parseCodexImportPayload(body = {}) {
 
 export function enrichCodexAccountIdentity(account = {}) {
   const next = { ...account }
+  const idToken = firstString(next.id_token, next.idToken)
+  if (idToken) {
+    const idClaims = openaiClaimsFromIdToken(idToken)
+    if (idClaims.has_chatgpt_subscription_active_until) {
+      next.chatgpt_subscription_active_until = idClaims.chatgpt_subscription_active_until
+    }
+    if (idClaims.has_chatgpt_plan_type) {
+      next.chatgpt_plan_type = idClaims.chatgpt_plan_type
+    }
+  }
   const fromTokens = openaiIdentityFromOauthTokens(next)
   if (!firstString(next.email)) next.email = fromTokens.email || null
   if (!firstString(next.chatgpt_account_id)) {
     next.chatgpt_account_id = fromTokens.chatgpt_account_id || null
   }
-  if (!firstString(next.chatgpt_subscription_active_until)) {
+  if (!idToken && !firstString(next.chatgpt_subscription_active_until)) {
     next.chatgpt_subscription_active_until = fromTokens.chatgpt_subscription_active_until || null
   }
   return next
@@ -272,6 +282,7 @@ export function upsertCodexAccount(projectRoot, vmId, patch = {}, { replaceCrede
       'email',
       'chatgpt_account_id',
       'chatgpt_subscription_active_until',
+      'chatgpt_plan_type',
       'access_token',
       'refresh_token',
       'id_token',
@@ -346,6 +357,7 @@ export function summarizeCodexSlot(projectRoot, vm = {}) {
     expires_at: first.expires_at || vm.codex?.expires_at || null,
     chatgpt_account_id: first.chatgpt_account_id || vm.codex?.chatgpt_account_id || null,
     chatgpt_subscription_active_until: first.chatgpt_subscription_active_until || null,
+    chatgpt_plan_type: first.chatgpt_plan_type || null,
     account_count: accounts.length,
     usage,
     reset_credits: vm.codex?.reset_credits || null,

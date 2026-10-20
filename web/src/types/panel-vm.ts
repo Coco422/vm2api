@@ -264,6 +264,8 @@ export type Vm = {
   plan_type?: string | null
   /** ChatGPT subscription end from OAuth `id_token` (`chatgpt_subscription_active_until`). */
   chatgpt_subscription_active_until?: string | null
+  /** Plan label fallback from OAuth `id_token` when `plan_type` from usage is absent. */
+  chatgpt_plan_type?: string | null
   reset_credits?: {
     available_count?: number
     credits?: Array<{ expires_at?: string }>
