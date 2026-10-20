@@ -403,7 +403,13 @@ export function createSlotShell({
       return true
     }
     ;(upgradeLoginReady || authLoginReady || assertAuthLoginReady)(projectRoot, vm).then(accept, (err) =>
-      rejectUpgrade(socket, 409, String(err?.message || 'Conflict').replace(/[\r\n]+/g, ' ').slice(0, 120) || 'Conflict'),
+      rejectUpgrade(
+        socket,
+        409,
+        String(err?.message || 'Conflict')
+          .replace(/[\r\n]+/g, ' ')
+          .slice(0, 120) || 'Conflict',
+      ),
     )
     return true
   }

@@ -174,7 +174,11 @@ export async function stopClaudeAuthLoginSession(projectRoot, vmId, { execDetach
   const vm = { ...(getVm(projectRoot, vmId) || {}), id: vmId }
   try {
     const connect = slotHost(vm).dockerApi()
-    const { Cmd, User } = slotExecCmd(vm, ['sh', '-lc', `pkill -f '${CONTAINER_CLI_NODE_BIN} auth login' >/dev/null 2>&1 || true`])
+    const { Cmd, User } = slotExecCmd(vm, [
+      'sh',
+      '-lc',
+      `pkill -f '${CONTAINER_CLI_NODE_BIN} auth login' >/dev/null 2>&1 || true`,
+    ])
     await execDetach(connect, containerName(vmId), Cmd, User ? { user: User } : {})
   } catch {}
 
