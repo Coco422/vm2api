@@ -2,6 +2,8 @@
 
 ## 未发布
 
+- Fable `7d_oi`：reset 已过（含秒级时间戳）不再永久判 rejected；`fableWindowResetAt` / weekly split 用 `parseResetMs`；过期清理纳入 `unified['7d_oi']`，且 `elapsedExtraResetMs` 纳入 `7d_oi` 后会在窗口过期时触发 usage probe；无 reset 时仍按 rejected 处理。（#601）
+
 ## 1.3.200 — 2026-10-20
 
 - 官方 OAuth（claude_code）：在已运行槽终端里执行 `claude auth login`，面板弹出槽终端、授权链接在终端复制、授权码由用户粘贴；宿主机不再自造 authorize URL。Cookie 导入与 Setup Token 路径不变。（#615）

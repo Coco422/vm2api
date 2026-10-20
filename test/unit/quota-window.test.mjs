@@ -16,7 +16,35 @@ import {
   hasOfficialUsageSample,
   hasLiveExtraSample,
   extraWindowSince,
+  wipeElapsedHeaderWindows,
+  parseResetMs,
 } from '../../src/lib/pool/quota-window.mjs'
+
+test('wipeElapsedHeaderWindows clears unified 7d_oi when reset elapsed', () => {
+  const now = Date.parse('2026-10-19T09:00:00Z')
+  const resetSec = '1792206000'
+  assert.ok(parseResetMs(resetSec) <= now)
+  const { oi, changed } = wipeElapsedHeaderWindows(
+    { '7d_oi': { utilization: 1, reset: resetSec, status: 'rejected' } },
+    { now },
+  )
+  assert.equal(changed, true)
+  assert.equal(oi.utilization, 0)
+  assert.equal(oi.status, 'active')
+  assert.equal(oi.stale_reason, 'reset_elapsed')
+})
+
+test('wipeElapsedHeaderWindows keeps unified 7d_oi when reset is still future', () => {
+  const now = Date.parse('2026-10-19T09:00:00Z')
+  const resetSec = '1792810800'
+  assert.ok(parseResetMs(resetSec) > now)
+  const { oi, changed } = wipeElapsedHeaderWindows(
+    { '7d_oi': { utilization: 1, reset: resetSec, status: 'rejected' } },
+    { now },
+  )
+  assert.equal(changed, false)
+  assert.equal(oi, null)
+})
 
 test('officialWindow prefers official over headers and leftover flat percent', () => {
   const u = {
