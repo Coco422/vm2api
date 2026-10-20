@@ -187,25 +187,23 @@ test('stopClaudeAuthLoginSession pkills auth login, not setup-token', async () =
     fs.writeFileSync(path.join(root, 'vms', 'vm-02.json'), JSON.stringify({ id: 'vm-02', runtime: { type: 'docker' } }))
     const seen = []
     await stopClaudeAuthLoginSession(root, 'vm-02', {
-      spawn: (bin, argv) => {
-        seen.push({ bin, argv })
-        return { status: 0 }
+      execDetach: async (_connect, id, cmd) => {
+        seen.push({ id, cmd })
       },
     })
-    assert.equal(seen[0].bin, 'docker')
-    assert.deepEqual(seen[0].argv.slice(0, 4), ['exec', 'kin-02', 'sh', '-lc'])
-    assert.match(seen[0].argv.at(-1), /auth login/)
-    assert.doesNotMatch(seen[0].argv.at(-1), /setup-token/)
+    assert.equal(seen[0].id, 'kin-02')
+    assert.deepEqual(seen[0].cmd.slice(0, 2), ['sh', '-lc'])
+    assert.match(seen[0].cmd.at(-1), /auth login/)
+    assert.doesNotMatch(seen[0].cmd.at(-1), /setup-token/)
 
     fs.writeFileSync(path.join(root, 'vms', 'vm-01.json'), JSON.stringify({ id: 'vm-01', runtime: { type: 'kvm' } }))
     const kvm = []
     await stopClaudeAuthLoginSession(root, 'vm-01', {
-      spawn: (_bin, argv) => {
-        kvm.push(argv)
-        return { status: 0 }
+      execDetach: async (_connect, _id, cmd) => {
+        kvm.push(cmd)
       },
     })
-    assert.equal(kvm[0][2], KVM_GUEST_EXEC)
+    assert.equal(kvm[0][0], KVM_GUEST_EXEC)
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }

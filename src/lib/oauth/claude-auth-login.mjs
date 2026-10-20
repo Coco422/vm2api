@@ -7,17 +7,17 @@
  * This is not `claude setup-token` and not the host-side kin-oauth-auth
  * exchange. Cookie import and setup-token stay on their own paths.
  */
-import { spawn, spawnSync } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { containerName, inspectContainer, officialCcUidGid } from '../vm/vm-runtime.mjs'
 import { officialCcHome, officialCcHostCli } from './official-cc-bootstrap.mjs'
-import { inspectContainerOrNull } from '../cluster/docker-remote.mjs'
+import { execDetached, inspectContainerOrNull } from '../cluster/docker-remote.mjs'
 import { CONTAINER_CLI_NODE_BIN } from '../vm/slot-engine.mjs'
 import { OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
-import { slotExecArgv } from '../vm/slot-exec.mjs'
+import { slotExecArgv, slotExecCmd } from '../vm/slot-exec.mjs'
 import { getVm } from '../vm/vm-registry.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
 import { FULL_OAUTH_SCOPE } from './oauth-contract.mjs'
@@ -160,7 +160,7 @@ export async function assertAuthLoginReady(projectRoot, vm, { inspect = inspectC
   return { container: name, cli }
 }
 
-export async function stopClaudeAuthLoginSession(projectRoot, vmId, { spawn = spawnSync } = {}) {
+export async function stopClaudeAuthLoginSession(projectRoot, vmId, { execDetach = execDetached } = {}) {
   const dir = authLoginSessionDir(projectRoot, vmId)
   const ptyPid = readPidFile(path.join(dir, 'pty.pid'))
   const childPid = readPidFile(path.join(dir, 'child.pid'))
@@ -173,16 +173,9 @@ export async function stopClaudeAuthLoginSession(projectRoot, vmId, { spawn = sp
   }
   const vm = { ...(getVm(projectRoot, vmId) || {}), id: vmId }
   try {
-    const env = slotHost(vm).dockerEnv()
-    spawn(
-      'docker',
-      slotExecArgv(vm, ['sh', '-lc', `pkill -f '${CONTAINER_CLI_NODE_BIN} auth login' >/dev/null 2>&1 || true`]),
-      {
-        stdio: 'ignore',
-        timeout: 5000,
-        ...(env ? { env } : {}),
-      },
-    )
+    const connect = slotHost(vm).dockerApi()
+    const { Cmd, User } = slotExecCmd(vm, ['sh', '-lc', `pkill -f '${CONTAINER_CLI_NODE_BIN} auth login' >/dev/null 2>&1 || true`])
+    await execDetach(connect, containerName(vmId), Cmd, User ? { user: User } : {})
   } catch {}
 
   const deadline = Date.now() + 3000

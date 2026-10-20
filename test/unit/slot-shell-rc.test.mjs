@@ -4,7 +4,13 @@ import os from 'node:os'
 import path from 'node:path'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { adoptShellLogin, createSlotShell, panelShellLaunch } from '../../src/lib/vm/slot-shell.mjs'
+import {
+  adoptShellLogin,
+  createSlotShell,
+  panelShellLaunch,
+  syncShellLoginCredentials,
+} from '../../src/lib/vm/slot-shell.mjs'
+import { FULL_OAUTH_SCOPE } from '../../src/lib/oauth/oauth-contract.mjs'
 import { OFFICIAL_CLI_VERSION } from '../../src/lib/identity/vm-identity.mjs'
 import {
   ensureOfficialCredentialLink,
@@ -90,6 +96,54 @@ test('a fresh slot login links the official credential file onto the worker file
     )
     assert.equal(readWorkerCredentialFile(home).refresh_token, 'rt-fresh')
     assert.equal(ensureOfficialCredentialLink(home).linked, true)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('cluster shell login pulls remote OAuth before adopt imports it', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-cluster-adopt-'))
+  const home = path.join(root, 'vms', 'vm-07', 'cli-home')
+  const worker = path.join(home, '.claude', 'credentials.json')
+  const grant = {
+    claudeAiOauth: {
+      accessToken: 'at-node',
+      refreshToken: 'rt-node',
+      expiresAt: Date.now() + 3600_000,
+      scopes: FULL_OAUTH_SCOPE.split(' '),
+      email: 'node@example.com',
+    },
+  }
+  try {
+    fs.mkdirSync(path.dirname(worker), { recursive: true })
+    fs.writeFileSync(worker, '{}\n')
+    const calls = []
+    const host = {
+      kind: 'node',
+      onImport: async () => {
+        calls.push('prepare')
+      },
+      afterRefresh: async () => {
+        calls.push('adopt')
+        fs.writeFileSync(worker, JSON.stringify(grant))
+      },
+    }
+    await syncShellLoginCredentials(root, { id: 'vm-07', node_id: 'node-a' }, { phase: 'prepare', host })
+    const adopted = await adoptShellLogin(
+      root,
+      { id: 'vm-07', node_id: 'node-a' },
+      {
+        loginHost: host,
+        importOauth: async (input) => {
+          calls.push('import')
+          writeWorkerCredentialFile(home, input.oauth)
+          return { ok: true }
+        },
+      },
+    )
+    assert.equal(adopted.imported, true)
+    assert.deepEqual(calls, ['prepare', 'adopt', 'import'])
+    assert.equal(readWorkerCredentialFile(home).refresh_token, 'rt-node')
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }

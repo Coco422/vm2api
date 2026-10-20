@@ -2,6 +2,7 @@
 
 ## 未发布
 
+- 集群槽官方登录：票据与 WebSocket 升级走 Engine API 异步检查容器与 cli-node；登录终端开前把控制面空凭证与 `.credentials.json` 链接推到节点 `claude/` 挂载，粘贴完成后从节点拉回 OAuth 再 `adoptShellLogin` 入账，避免只读本地空文件。（#630）
 - 面板租户（role=user）权限收紧：导入凭证、导入代理时绑定槽位、API Key 的 `allowed_vms` 只认本人的槽（他人的与不存在的同样回 404）；租户改 Key 时忽略 `user_id`、`group_id`，`vm_pool_id` 仅管理员可设（非管理员带值回 403 `key_pool_forbidden`，前端隐藏账号池）；改角色或停用用户时撤销其全部面板会话；`GET /api/panel/test-models` 对租户与 super 只读放行，带他人 `vm_id` 回 404，`refresh=1` 仅管理员生效。
 - Docker 槽在线扩容：面板成功须 HostConfig 内存与 swap 一致；可读 cgroup 时核对 v2 `memory.max` 或 v1 `memory.limit_in_bytes`（`max`/无上限哨兵在 HostConfig 已匹配时跳过）。扩容后校验失败会 docker update 回滚至扩容前限额且不写 vm 配置。（#623，REQ-0441）
 
