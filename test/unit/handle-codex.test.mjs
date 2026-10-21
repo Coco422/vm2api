@@ -94,6 +94,145 @@ function writeGptVm(root, id) {
   )
 }
 
+test('runCodexKernelHop recovers tool-free search history once on the same session', async () => {
+  const body = {
+    model: 'gpt-6.1-sol',
+    tools: [],
+    input: [{ type: 'web_search_call', action: { type: 'search', query: 'docs' } }],
+  }
+  const args = { body, envelope: { body, session: { session_id: 'same-session' } } }
+  const failure = { ok: false, status: 400, body: { error: { message: 'response protection is unavailable' } } }
+  const calls = []
+  const events = []
+  const recoveredBodies = []
+  const result = await runCodexKernelHop({
+    args,
+    hop: async (call) => {
+      calls.push(call)
+      if (calls.length === 1) return failure
+      await call.onEvent('data: {"type":"response.completed"}\n')
+      return { ok: true, status: 200 }
+    },
+    onEvent: async (line) => events.push(line),
+    onSearchHistoryFallback: ({ body: retryBody }) => recoveredBodies.push(retryBody),
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.search_history_retried, true)
+  assert.equal(calls.length, 2)
+  assert.strictEqual(calls[1].body.input, body.input)
+  assert.strictEqual(calls[1].envelope.session, args.envelope.session)
+  assert.deepEqual(calls[1].body.tools, [{ type: 'web_search' }])
+  assert.equal(calls[1].body.tool_choice, 'none')
+  assert.strictEqual(recoveredBodies[0], calls[1].body)
+  assert.equal(events.length, 1)
+  assert.deepEqual(body.tools, [])
+})
+
+test('search history recovery is bounded and never replays after an emitted event', async () => {
+  const args = { body: { tools: [], input: [{ type: 'web_search_call' }] } }
+  const failure = { ok: false, status: 400, body: { error: { message: 'response protection is unavailable' } } }
+  for (const emitted of [false, true]) {
+    let calls = 0
+    await runCodexKernelHop({
+      args,
+      hop: async ({ onEvent }) => {
+        calls++
+        if (emitted) await onEvent('data: {"type":"response.created"}\n')
+        return failure
+      },
+    })
+    assert.equal(calls, emitted ? 1 : 2)
+  }
+})
+
+test('search history recovery respects cancellation and the existing transport retry budget', async () => {
+  const failure = { ok: false, status: 400, body: { error: { message: 'response protection is unavailable' } } }
+  const body = { tools: [], input: [{ type: 'web_search_call' }] }
+  const controller = new AbortController()
+  let calls = 0
+  await runCodexKernelHop({
+    args: { body, signal: controller.signal },
+    hop: async () => {
+      calls++
+      return failure
+    },
+    onSearchHistoryFallback: async () => controller.abort(),
+  })
+  assert.equal(calls, 1)
+  calls = 0
+  const result = await runCodexKernelHop({
+    args: { body },
+    hop: async () => {
+      calls++
+      return calls === 1 ? { ok: false, status: 502, transportError: true } : failure
+    },
+  })
+  assert.equal(calls, 2)
+  assert.equal(result.search_history_retried, undefined)
+})
+
+test('handleCodexProtocol records search recovery as two attempts on the same slot', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-search-history-'))
+  writeGptVm(root, 'vm-gpt-a')
+  writeGptVm(root, 'vm-gpt-b')
+  const logBag = {}
+  const calls = []
+  try {
+    const out = await handleCodexProtocol({
+      req: { headers: { 'user-agent': 'curl/8.0' }, apiKeyKind: 'user' },
+      res: { headersSent: false, write() {}, end() {} },
+      protocol: 'openai.responses',
+      ctx: {
+        path: '/v1/responses',
+        body: {
+          model: 'gpt-6.1-sol',
+          stream: false,
+          tools: [],
+          input: [
+            { type: 'web_search_call', id: 'ws_1', action: { type: 'search', query: 'docs' } },
+            { type: 'compaction_trigger' },
+          ],
+        },
+      },
+      inbound: { stream: false },
+      logBag,
+      stats: { errors: 0, requests: 0, by_route: {} },
+      json: (_res, status, body) => ({ status, body }),
+      writeSSEHeaders() {},
+      routing: {},
+      projectRoot: root,
+      captureOutbound: true,
+      ops: {
+        writeCodexKernelConfig() {},
+        ensureCodexKernel: async () => ({ ok: true }),
+        streamCodexKernel: async (call) => {
+          calls.push(call)
+          if (calls.length === 1)
+            return {
+              ok: false,
+              status: 400,
+              body: { error: { code: 'upstream_status', message: 'response protection is unavailable' } },
+            }
+          return { ok: true, status: 200, terminalState: 'verified', body: { id: 'resp_ok' } }
+        },
+      },
+    })
+    assert.equal(out.status, 200)
+    assert.deepEqual(
+      calls.map((call) => call.exec.vm.id),
+      ['vm-gpt-a', 'vm-gpt-a'],
+    )
+    assert.deepEqual(calls[1].body.input, calls[0].body.input)
+    assert.equal(calls[1].envelope.session.session_id, calls[0].envelope.session.session_id)
+    assert.equal(logBag.attempt_count, 2)
+    assert.equal(logBag.search_history_retried, true)
+    assert.strictEqual(logBag.outbound_body, calls[1].body)
+    assert.equal(logBag.outbound_body.tool_choice, 'none')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('quota 429 hops the next GPT slot and records 5h/7d extra', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-hop-'))
   writeGptVm(root, 'vm-gpt-a')

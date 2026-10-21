@@ -6,6 +6,12 @@
 
 上游 hop 始终 `stream:true`。客户端 SSE 透传；非流或 `x-kin-delivery: verified` 则缓冲到 `message_stop` 再聚合。
 
+## Codex 搜索历史与无工具请求
+
+上下文压缩等请求可能带有历史 `web_search_call`，但当前 `tools` 为空。实测这类请求可能在输出前收到 `response protection is unavailable`；补充 `web_search` 声明可越过该错误。
+
+仅在收到这条精确错误、状态为 400/500/502、尚未输出任何事件时，同账号补充 `tools: [{type: 'web_search'}]` 与 `tool_choice: 'none'` 重试一次。所有历史项、加密推理、模型和会话标识保持原样，禁止发起新工具调用。已有工具声明、强制工具选择、`previous_response_id` 续接、取消或已提交的请求均不走此恢复；同一 hop 不叠加传输或推理历史恢复重试。模型过载与其他上游错误不属于此恢复范围。
+
 ## 官方 Claude Code 判定
 
 `isOfficialClaudeCodeTraffic(headers, body)` 四闸：

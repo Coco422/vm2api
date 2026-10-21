@@ -64,6 +64,7 @@ import {
   resolveOutboundSessionId,
 } from '../identity/identity-rewrite.mjs'
 import { clientIp } from '../pool/sticky-router.mjs'
+import { searchHistoryFallback } from './codex-search-history.mjs'
 
 // Official Codex client headers for ChatGPT Responses. Auth is attached by the kernel.
 const CODEX_KERNEL_HEADER_ALLOWLIST = Object.freeze([
@@ -473,7 +474,13 @@ export function reasoningHistoryFallback(args, result) {
   }
 }
 
-export async function runCodexKernelHop({ hop, args = {}, onEvent, onReasoningFallback } = {}) {
+export async function runCodexKernelHop({
+  hop,
+  args = {},
+  onEvent,
+  onReasoningFallback,
+  onSearchHistoryFallback,
+} = {}) {
   let emitted = false
   const wrapped = async (line) => {
     emitted = true
@@ -492,6 +499,20 @@ export async function runCodexKernelHop({ hop, args = {}, onEvent, onReasoningFa
       ...(await hop({ ...fallback.args, onEvent: wrapped })),
       reasoning_history_retried: true,
       reasoning_history_fallback: fallback.info,
+    }
+  }
+  const searchFallback =
+    !emitted && !result?.transport_retried && !result?.reasoning_history_retried
+      ? searchHistoryFallback(args, result)
+      : null
+  if (searchFallback) {
+    if (onSearchHistoryFallback)
+      await onSearchHistoryFallback({ originalResult: result, body: searchFallback.args.body, ...searchFallback.info })
+    if (args.signal?.aborted) return result
+    result = {
+      ...(await hop({ ...searchFallback.args, onEvent: wrapped })),
+      search_history_retried: true,
+      search_history_fallback: searchFallback.info,
     }
   }
   return result
@@ -758,6 +779,9 @@ export async function handleCodexProtocol({
             onReasoningFallback: ({ body: retryBody }) => {
               if (captureOutbound) logBag.outbound_body = retryBody
             },
+            onSearchHistoryFallback: ({ body: retryBody }) => {
+              if (captureOutbound) logBag.outbound_body = retryBody
+            },
             onEvent: async (line) => {
               hopEmitted = true
               if (conversionError) return
@@ -796,7 +820,8 @@ export async function handleCodexProtocol({
         // A transient seat-local failure gets the same account up to N retries
         // before the request spends a switch. 401/403/429 are never retried here:
         // they are credential/account state and must move to another seat.
-        let sameAccountRetries = result?.transport_retried || result?.reasoning_history_retried ? 1 : 0
+        let sameAccountRetries =
+          result?.transport_retried || result?.reasoning_history_retried || result?.search_history_retried ? 1 : 0
         while (
           sameAccountRetries < failoverBudget.maxSameAccountRetries &&
           attempts < failoverBudget.maxAttempts &&
@@ -830,6 +855,10 @@ export async function handleCodexProtocol({
         if (result?.reasoning_history_retried) {
           logBag.attempt_count += 1
           logBag.reasoning_history_retried = true
+        }
+        if (result?.search_history_retried) {
+          logBag.attempt_count += 1
+          logBag.search_history_retried = true
         }
         last = result
         const hopUsage = result.usage || result.body?.usage || result.body?.response?.usage || null
