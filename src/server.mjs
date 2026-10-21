@@ -77,9 +77,12 @@ import { BackupService } from './lib/admin/backup-service.mjs'
 import { ClusterNodesRepo } from './lib/db/repos/cluster-nodes-repo.mjs'
 import { ClusterManager } from './lib/cluster/cluster-manager.mjs'
 import { createClusterRoutes } from './lib/cluster/cluster-routes.mjs'
-import { bindPlacement } from './lib/cluster/placement.mjs'
+import { bindPlacement, nodeImageBuildRunning } from './lib/cluster/placement.mjs'
+import { ClusterError } from './lib/cluster/ssh-link.mjs'
 import { nodeEgressProxyUrl, startNodeEgressSocks } from './lib/cluster/node-egress-socks.mjs'
 import { createSlotShell } from './lib/vm/slot-shell.mjs'
+import { vmLockBusy } from './lib/vm/vm-file.mjs'
+import { refreshSlotGuestBinDir } from './lib/vm/vm-runtime.mjs'
 
 import {
   classifyCredentialRefresh,
@@ -90,6 +93,7 @@ import { normalizeCredentialMode } from './lib/oauth/credential-mode.mjs'
 import { ensureWorkerCredential } from './lib/transport/go-worker-client.mjs'
 import { stopAllRustKernels } from './lib/transport/rust-kernel-supervisor.mjs'
 import { createRespond, parseRequestUrl } from './lib/http/respond.mjs'
+import { corsHeadersForRequest } from './lib/http/cors.mjs'
 import { isConsoleEntry, tryServeWebDist } from './lib/http/web-dist.mjs'
 import { createRoutingRuntime } from './lib/admin/routing-runtime.mjs'
 import { createImportCommit } from './lib/oauth/import-commit.mjs'
@@ -155,6 +159,9 @@ if (vmSync.upserted || vmSync.rebuilt) {
 }
 if (vmSync.proxy_cli_repaired) {
   console.log(`[vm] repaired proxy_cli_enabled on ${vmSync.proxy_cli_repaired} slot(s)`)
+}
+if (vmSync.reclaimed_vm_ids.length) {
+  console.log(`[vm] reclaimed ${vmSync.reclaimed_vm_ids.length} slot(s) assigned to deleted users`)
 }
 
 // --- P3 sticky + quota ---
@@ -300,7 +307,7 @@ groupsRepo = new GroupsRepo()
 const apiEndpointStore = new ApiEndpointStore({ dataDir: cfg.paths.data })
 const apiScheduler = new ApiScheduler()
 apiScheduler.reload(apiEndpointStore.listRaw())
-const panelUsers = new PanelUserStore({ dataDir: cfg.paths.data })
+const panelUsers = new PanelUserStore({ dataDir: cfg.paths.data, projectRoot: cfg.paths.project })
 try {
   panelUsers.bootstrapFromEnv(getPanelAdmin())
 } catch (e) {
@@ -364,6 +371,12 @@ proxyPool = new ProxyPool({
   egressCheck: (proxy) => proxyEgressReady(proxy, cfg.paths.project),
   repairEgress: (proxy) => ensureProxyEgress(cfg.paths.project, proxy),
 })
+// An upgrade replaces bin/ files; slots mounting data/run/slot-guest-bin must see the new ones.
+try {
+  refreshSlotGuestBinDir(cfg.paths.project)
+} catch (err) {
+  console.warn('[bootstrap] slot-guest-bin refresh failed:', err?.message || err)
+}
 proxyPool.startScheduler()
 
 // 首次安装的出口池是空的，槽没有可绑出口就起不来。本机出口永远成立，先补上。
@@ -371,7 +384,7 @@ try {
   if (!proxyPool.snapshot().proxies?.length) {
     const seeded = proxyPool.ensureLocal()
     if (seeded.created) {
-      ensureProxyEgress(cfg.paths.project, proxyPool.getProxyByIdWithAuth(seeded.proxy.id))
+      void ensureProxyEgress(cfg.paths.project, proxyPool.getProxyByIdWithAuth(seeded.proxy.id))
       console.log('[bootstrap] seeded local egress px-local')
     }
   }
@@ -884,8 +897,20 @@ function syncNodeLocalEgress() {
 const clusterManager = new ClusterManager({
   repo: new ClusterNodesRepo(),
   dataDir,
+  gateBin: process.env.KIN_CLUSTER_GATE_BIN || path.join(cfg.paths.project, 'bin', 'kin-slot-gate'),
   listen: { host: cfg.host, port: cfg.port },
   vmsOnNode: (nodeId) => listVms(cfg.paths.project).filter((vm) => vm.node_id === nodeId),
+  assertNodeEditable: (nodeId) => {
+    const busy = listVms(cfg.paths.project).some(
+      (vm) =>
+        vm.node_id === nodeId &&
+        (Number(poolScheduler?.vmInflight?.get(vm.id) || 0) > 0 ||
+          vmLockBusy(path.join(cfg.paths.project, 'vms', `${vm.id}.json`))),
+    )
+    if (busy || nodeImageBuildRunning(nodeId)) {
+      throw new ClusterError(409, 'node_in_use', '节点仍有进行中的请求、虚拟机操作或镜像构建，请完成后重试')
+    }
+  },
   onNodesChanged: () => syncNodeLocalEgress(),
   // A node's local row follows its link: re-probe as soon as the link settles.
   onLinkState: (nodeId, state) => {
@@ -907,7 +932,7 @@ if (proxyPool.snapshot().config.ipv6_enabled !== true) {
   }
 }
 const clusterRoutes = createClusterRoutes({ manager: clusterManager, json, readBody, ok: panel.ok })
-const slotShell = createSlotShell({ projectRoot: cfg.paths.project })
+const slotShell = createSlotShell({ projectRoot: cfg.paths.project, importOauth: commitImportedOauth })
 for (const vm of listVms(cfg.paths.project)) {
   if (isCodexVm(vm)) continue
   try {
@@ -994,13 +1019,9 @@ const handlePanel = createPanelHandler({
 
 const server = http.createServer(async (req, res) => {
   try {
+    res.req = req
     if (req.method === 'OPTIONS') {
-      res.writeHead(204, {
-        'access-control-allow-origin': '*',
-        'access-control-allow-headers':
-          'authorization, content-type, x-api-key, anthropic-version, anthropic-beta, x-session-id, x-kin-rewrite, x-panel-token, x-kin-vm, x-kin-backend',
-        'access-control-allow-methods': 'GET,POST,OPTIONS,PUT,DELETE',
-      })
+      res.writeHead(204, corsHeadersForRequest(req))
       return res.end()
     }
 

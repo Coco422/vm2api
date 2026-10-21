@@ -266,7 +266,9 @@ export async function switchSlotInferenceEngine(vm, projectRoot, engine, { timeo
   const name = containerName(vm.id)
   const existing = inspect(name)
   const needsKernelMount = engine === 'rust' && !!existing && !hasKernelMount(name) && !wrapUsesSlotKernel(wrap)
-  const boot = needsKernelMount ? start(vm, projectRoot, { recreate: true }) : reload(vm, projectRoot)
+  const boot = needsKernelMount
+    ? await start(vm, projectRoot, { recreate: true, routing: ops.routing })
+    : await reload(vm, projectRoot, { routing: ops.routing })
   if (!boot?.ok) {
     return {
       ok: false,
@@ -283,7 +285,7 @@ export async function switchSlotInferenceEngine(vm, projectRoot, engine, { timeo
   const rust = await startRust(exec, { timeoutMs })
   if (!rust?.ok) {
     const code = rust?.reason === 'health_timeout' ? 'kernel_health_timeout' : 'kernel_start_failed'
-    const rollback = reload(vm, projectRoot)
+    const rollback = await reload(vm, projectRoot, { routing: ops.routing })
     return {
       ok: false,
       code,

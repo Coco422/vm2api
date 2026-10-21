@@ -24,6 +24,12 @@ import { apiEndpointsQueryOptions } from '@/features/api-endpoints/queries'
 import { proxyLabel } from '@/features/proxies/proxy-sort'
 import { proxiesQueryOptions } from '@/features/proxies/queries'
 import {
+  applyConsoleResults,
+  type ConsoleResult,
+  type KeyResult,
+  endpointHasTestableKey,
+} from './console-results'
+import {
   type AuthScheme,
   DEFAULT_URL,
   DIRECT,
@@ -31,18 +37,6 @@ import {
   draftFromStored,
   endpointSaveRequest,
 } from './endpoint-save'
-
-type KeyResult = {
-  ok?: boolean
-  status?: number
-  text?: string
-  error?: string
-  proxy?: boolean
-}
-
-type ConsoleResult = KeyResult & {
-  items?: KeyResult[]
-}
 
 type ModelList = {
   models?: { id?: string; name?: string; alias?: string }[]
@@ -93,16 +87,15 @@ export function AnthropicConsolePage() {
   }
 
   function storeResults(data: ConsoleResult, index: number | null) {
-    const incoming = data.items?.length ? data.items : [data]
-    setResults((current) => {
-      const next = { ...current }
-      const targets =
-        index == null ? endpoints : [endpoints[index]].filter(Boolean)
-      targets.forEach((endpoint, offset) => {
-        if (incoming[offset]) next[endpoint.id] = incoming[offset]
-      })
-      return next
-    })
+    setResults((current) =>
+      applyConsoleResults(
+        endpoints,
+        (row) => endpointHasTestableKey(endpoints[row]),
+        current,
+        data,
+        index
+      )
+    )
   }
 
   const send = useMutation({

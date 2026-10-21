@@ -91,7 +91,9 @@ function logTail(logs) {
  * A down container carries its last log lines, which usually name the cause.
  */
 export async function inspectSlotContainer(vm) {
-  const connect = slotHost(vm).dockerApi()
+  const host = slotHost(vm)
+  if (typeof host.inspect === 'function') return host.inspect(vm)
+  const connect = host.dockerApi()
   const name = slotExecContainer(vm)
   const info = await inspectContainerOrNull(connect, name)
   if (!info) return { exists: false, running: false }
@@ -645,7 +647,7 @@ export function createSlotBridgeHealer({
       if (seenProxies.has(proxy.id)) continue
       seenProxies.add(proxy.id)
       if (egressAlive(proxy.id) || !due(`egress:${proxy.id}`)) continue
-      const result = startEgress(proxy)
+      const result = await startEgress(proxy)
       if (result?.ok) logger.warn(`[bridge-heal] kin-egress ${proxy.id} was down; restarted`)
       else logger.warn(`[bridge-heal] kin-egress ${proxy.id} restart failed: ${result?.error || 'unknown'}`)
     }

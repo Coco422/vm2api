@@ -1,4 +1,16 @@
-import { Check, Database, ShieldCheck } from 'lucide-react'
+import {
+  SESSION_IDLE_TTL_SECONDS_DEFAULT,
+  SESSION_IDLE_TTL_SECONDS_MAX,
+  SESSION_IDLE_TTL_SECONDS_MIN,
+} from '@/types/panel-routing'
+import {
+  Brain,
+  Check,
+  Clock3,
+  Database,
+  Scaling,
+  ShieldCheck,
+} from 'lucide-react'
 import {
   cacheTtlFromCompat,
   detectProxiedOfficialCcFromCompat,
@@ -7,7 +19,12 @@ import { cn } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
 import { SettingRow } from '@/components/setting-row'
-import { ChipGroup, PaneSection } from './scheduler-controls'
+import {
+  cchEnabledFromCompat,
+  sessionIdleTtlFromInference,
+  thinkingDisplayFromCompat,
+} from './protocol-authority'
+import { ChipGroup, PaneSection, StepperSetting } from './scheduler-controls'
 
 type Block = Record<string, unknown>
 
@@ -22,16 +39,27 @@ const CLAUDE_CODE_FINGERPRINT: [string, string][] = [
   ['计费块', 'cc_version = UA 版本'],
 ]
 
+function autoCompactWindowValue(value: unknown) {
+  const tokens = Number(value)
+  if (tokens === 200_000 || tokens === 500_000 || tokens === 1_000_000)
+    return String(tokens)
+  return 'model'
+}
+
 export function ProtocolPane({
   compat,
+  inference,
   onCompatChange,
+  onInferenceChange,
 }: {
   compat: Block
+  inference: Block
   onCompatChange: (next: Block) => void
+  onInferenceChange: (patch: Block) => void
 }) {
   const strict = compat.claude_code_only === true
   const relay = detectProxiedOfficialCcFromCompat(compat)
-
+  const cch = cchEnabledFromCompat(compat)
   return (
     <div className='space-y-4'>
       <PaneSection
@@ -147,6 +175,99 @@ export function ProtocolPane({
           保存后作为新会话和自有缺省标记的
           TTL。已有会话锁定值不变，官方透传仍保留调用方断点及缺失 TTL。
         </p>
+      </PaneSection>
+      <PaneSection
+        icon={Brain}
+        title='thinking 显示'
+        desc='调用方打开 thinking 却要求隐藏时，出站改成返回摘要。计费不变。'
+      >
+        <SettingRow
+          label='隐藏的 thinking 改为返回摘要'
+          desc={
+            thinkingDisplayFromCompat(compat) === 'summarized'
+              ? '开：omitted、updates，以及默认隐藏的模型上没写 display 的请求，出站改成 summarized。'
+              : '关：保留调用方的 display。updates 仍只在出站 beta 声明时保留，否则降成 omitted。'
+          }
+        >
+          <Switch
+            checked={thinkingDisplayFromCompat(compat) === 'summarized'}
+            onCheckedChange={(on) =>
+              onCompatChange({
+                ...compat,
+                thinking_display: on ? 'summarized' : 'passthrough',
+              })
+            }
+            aria-label='隐藏的 thinking 改为返回摘要'
+          />
+        </SettingRow>
+      </PaneSection>
+      <PaneSection
+        icon={Scaling}
+        title='Auto compact 窗口'
+        desc='默认跟随请求模型。显式值替换模型窗口，请求里的 CLAUDE_CODE_AUTO_COMPACT_WINDOW 仍优先。'
+      >
+        <SettingRow
+          label='窗口'
+          desc='跟随模型时，Opus / Sonnet / Haiku 5.x 使用 1M，其余模型使用 200K。'
+        >
+          <ChipGroup
+            label='Auto compact 窗口'
+            value={autoCompactWindowValue(compat.auto_compact_window)}
+            options={[
+              ['model', '跟随模型'],
+              ['200000', '200K'],
+              ['500000', '500K'],
+              ['1000000', '1M'],
+            ]}
+            onChange={(value) =>
+              onCompatChange({
+                ...compat,
+                auto_compact_window: value === 'model' ? null : Number(value),
+              })
+            }
+          />
+        </SettingRow>
+      </PaneSection>
+      <PaneSection
+        icon={Clock3}
+        title='CCH 统一附加'
+        desc='出站 billing 的 cch。开启后缺失也补，不区分试用或订阅。'
+      >
+        <SettingRow
+          label='强制附加 CCH'
+          desc={
+            cch
+              ? '开：出站补齐 cch；试用号缺失也写。保存后热写入各槽 kernel.json，不重启 CLI。'
+              : '关：固定发送 cch=00000;（5 个 0），不计算摘要。'
+          }
+        >
+          <Switch
+            checked={cch}
+            onCheckedChange={(on) =>
+              onCompatChange({ ...compat, cch_enabled: on })
+            }
+            aria-label='强制附加 CCH'
+          />
+        </SettingRow>
+      </PaneSection>
+      <PaneSection
+        icon={Clock3}
+        title='原生 sticky 槽'
+        desc='kernel 里 CLI 槽空闲回收。不是流空闲超时，也不是粘性页的账号绑定 TTL。'
+      >
+        <StepperSetting
+          id='inference-session-idle-ttl'
+          label='槽空闲超时'
+          desc='从最后一次任务完成开始计时，活动请求不回收。保存后热生效，不重启内核。'
+          value={sessionIdleTtlFromInference(inference)}
+          min={SESSION_IDLE_TTL_SECONDS_MIN}
+          max={SESSION_IDLE_TTL_SECONDS_MAX}
+          unit='秒'
+          fallback={SESSION_IDLE_TTL_SECONDS_DEFAULT}
+          onChange={(value) =>
+            onInferenceChange({ session_idle_ttl_seconds: value })
+          }
+        />
       </PaneSection>
     </div>
   )
