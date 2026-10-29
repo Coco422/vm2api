@@ -64,7 +64,7 @@ test('DNS type suppression persists both toggle states and rejects non-booleans'
   assert.equal(disabled.snapshot().config.dns_disable_svcb_https, false)
 })
 
-test('clampBindLimit defaults to 5 and stays in 1..32', () => {
+test('clampBindLimit defaults to 1 and stays in 1..32', () => {
   assert.equal(clampBindLimit(undefined), MAX_VMS_PER_PROXY)
   assert.equal(clampBindLimit(5), 5)
   assert.equal(clampBindLimit(1), 1)
@@ -74,12 +74,17 @@ test('clampBindLimit defaults to 5 and stays in 1..32', () => {
   assert.equal(clampBindLimit('x'), MAX_VMS_PER_PROXY)
 })
 
-test('bind_limit defaults to 5 and is configurable', () => {
+test('bind_limit defaults to 1 and explicit admin configuration persists', () => {
   const pool = makePool()
   pool.importLines('10.0.0.1:1080')
   const id = pool.snapshot().proxies[0].id
-  assert.equal(pool.bindLimit(), 5)
-  assert.equal(pool.snapshot().config.bind_limit, 5)
+  assert.equal(pool.bindLimit(), 1)
+  assert.equal(pool.snapshot().config.bind_limit, 1)
+  assert.equal(pool.bind(id, 'vm-default-1').ok, true)
+  assert.equal(pool.bind(id, 'vm-default-2').error, 'proxy_bind_limit')
+  pool.unbind(id)
+  assert.equal(pool.updateConfig({ bind_limit: 5 }).ok, true)
+  pool.stopScheduler()
   for (let i = 1; i <= 5; i++) {
     const r = pool.bind(id, `vm-0${i}`)
     assert.equal(r.ok, true, `bind vm-0${i}`)

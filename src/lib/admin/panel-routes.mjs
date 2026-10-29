@@ -5855,7 +5855,7 @@ export function createPanelHandler(ctx) {
         if (!result.ok) {
           const message =
             result.error === 'proxy_bind_limit'
-              ? `SOCKS5 最多绑定 ${result.max || 5} 台虚拟机`
+              ? `SOCKS5 最多绑定 ${result.max || 1} 台虚拟机`
               : result.error === 'local_proxy_node_mismatch'
                 ? LOCAL_PROXY_MISMATCH_MESSAGE
                 : result.error

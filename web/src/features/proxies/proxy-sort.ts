@@ -99,8 +99,8 @@ export function proxyBindLimit(
   prx: VmProxySnap | undefined,
   fallback: number
 ): number {
-  const n = Number(prx?.bind_limit || fallback || 5)
-  return Number.isFinite(n) && n > 0 ? n : 5
+  const n = Number(prx?.bind_limit || fallback || 1)
+  return Number.isFinite(n) && n > 0 ? n : 1
 }
 
 export function proxyIsInvalid(prx: VmProxySnap | undefined): boolean {

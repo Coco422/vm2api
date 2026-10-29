@@ -29,8 +29,12 @@ test('resolveLogMode: env + header overrides', () => {
   assert.equal(resolveLogMode('off', { headers: { 'x-kin-log': 'normal' } }), 'normal')
 })
 
-test('newRequestId keeps incoming X-Request-ID', () => {
-  assert.equal(newRequestId({ headers: { 'x-request-id': 'rid-1' } }), 'rid-1')
+test('newRequestId cannot be reused by a client to suppress another bill', () => {
+  const req = { headers: { 'x-request-id': 'rid-1' } }
+  const a = newRequestId(req)
+  const b = newRequestId(req)
+  assert.notEqual(a, b)
+  assert.notEqual(a, 'rid-1')
   assert.match(newRequestId({ headers: {} }), /^[0-9a-f-]{36}$/i)
 })
 

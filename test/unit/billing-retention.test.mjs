@@ -162,3 +162,108 @@ test('orphaned token, search, image and cost evidence survives age and debug siz
     assert.equal(repo.getDebug(`evidence-${i}`), null)
   })
 })
+
+test('client log-off and operator diagnostic-off cannot suppress an owned bill', (t) => {
+  const { db, dir, repo } = fixture(t)
+  for (const [mode, headers] of [
+    ['normal', { 'x-kin-log': 'off' }],
+    ['off', {}],
+  ]) {
+    const store = new RequestLogStore({ db, dataDir: dir, mode })
+    const ctx = store.start({ method: 'POST', headers, socket: {} }, { pathName: '/v1/messages' })
+    const row = store.finish(ctx, {
+      status: 200,
+      vm_id: 'vm-a',
+      account_id: 'account-old',
+      user_id: 'u1',
+      api_key_id: 'k1',
+      input_tokens: 120,
+      total_cost: 1.25,
+      actual_cost: 2.5,
+      pricing_model: 'local-fixture',
+      inbound_body: { secret: 'not-stored' },
+    })
+    assert.equal(row.log_mode, 'normal')
+    assert.equal(repo.getByRequestId(ctx.request_id).actual_cost, 2.5)
+    assert.equal(repo.getDebug(ctx.request_id), null)
+  }
+  assert.equal(repo.ownerBilling({ ownerUserId: 'u1' }).totals.cost_usd, 5)
+})
+
+test('reused client request IDs count every HTTP request, but finishing one context twice is idempotent', (t) => {
+  const { db, dir, repo } = fixture(t)
+  const store = new RequestLogStore({ db, dataDir: dir })
+  const ids = []
+  for (let i = 0; i < 2; i++) {
+    const ctx = store.start({ method: 'POST', headers: { 'x-request-id': 'caller-reused-id' }, socket: {} })
+    ids.push(ctx.request_id)
+    const usage = {
+      status: 200,
+      vm_id: 'vm-a',
+      account_id: 'account-old',
+      user_id: 'u1',
+      api_key_id: 'k1',
+      total_cost: 2,
+      actual_cost: 4,
+      pricing_model: 'local-fixture',
+    }
+    store.finish(ctx, usage)
+    store.finish(ctx, usage)
+  }
+  assert.equal(new Set(ids).size, 2)
+  const bill = repo.ownerBilling({ ownerUserId: 'u1' })
+  assert.equal(bill.totals.requests, 2)
+  assert.equal(bill.totals.cost_usd, 8)
+})
+
+test('two 30-day account cycles keep every daily bill across aging, restart and ownership changes', (t) => {
+  const { db, repo, ago, insert } = fixture(t)
+  for (let day = 0; day < 60; day++) {
+    const old = day >= 30
+    insert(`cycle-${day}`, day + 1, {
+      vm_id: 'vm-a',
+      account_id: old ? 'account-old' : 'account-new',
+      final_account_id: old ? 'account-old' : 'account-new',
+      vm_owner_user_id: old ? 'u1' : 'u2',
+      user_id: old ? 'u1' : 'u2',
+      api_key_id: old ? 'k1' : 'k2',
+      total_cost: old ? 1 : 2,
+      actual_cost: old ? 2 : 4,
+    })
+    repo.insertDebug(`cycle-${day}`, ago(day + 1), { body: 'temporary-body' })
+  }
+  db.prepare("UPDATE vms SET owner_user_id='u2' WHERE id='vm-a'").run()
+  for (let i = 0; i < 3; i++) new UsageLogsRepo(db).cleanup({ retainDays: 1, debugRetainDays: 1, maxBytes: 1 })
+  const reopened = new UsageLogsRepo(db)
+  assert.equal(reopened.costByModel({ vmId: 'vm-a', accountId: 'account-old' })[0].total_cost, 30)
+  assert.equal(reopened.costByModel({ vmId: 'vm-a', accountId: 'account-new' })[0].total_cost, 60)
+  assert.equal(reopened.ownerBilling({ ownerUserId: 'u1' }).totals.cost_usd, 60)
+  assert.equal(reopened.ownerBilling({ ownerUserId: 'u2' }).totals.cost_usd, 120)
+  assert.equal(reopened.query({ owner_user_id: 'u1' }).total, 30)
+  assert.equal(reopened.query({ owner_user_id: 'u2' }).total, 30)
+  assert.equal(reopened.getDebug('cycle-59'), null)
+})
+
+test('removing a VM does not implicitly erase old bills; explicit account-scoped cleanup is isolated', (t) => {
+  const { db, repo, insert } = fixture(t)
+  for (const [id, account, cost] of [
+    ['old', 'account-old', 3],
+    ['new', 'account-new', 7],
+  ])
+    insert(id, 45, {
+      vm_id: 'vm-a',
+      account_id: account,
+      user_id: 'u1',
+      vm_owner_user_id: 'u1',
+      total_cost: cost,
+      actual_cost: cost,
+    })
+  const before = repo.ownerBilling({ ownerUserId: 'u1' }).totals.cost_usd
+  db.prepare('DELETE FROM vms WHERE id = ?').run('vm-a')
+  repo.cleanup({ retainDays: 1 })
+  assert.equal(repo.ownerBilling({ ownerUserId: 'u1' }).totals.cost_usd, before)
+  // An operator's deliberate, scoped deletion is distinct from automatic retention.
+  db.prepare('DELETE FROM usage_logs WHERE vm_id = ? AND account_id = ?').run('vm-a', 'account-old')
+  assert.equal(repo.getByRequestId('old'), null)
+  assert.equal(repo.getByRequestId('new').actual_cost, 7)
+})

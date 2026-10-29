@@ -1,7 +1,7 @@
 /**
  * SOCKS5 Proxy Pool (SQLite-backed)
  * - Bulk import
- * - 1 proxy ↔ up to N VMs (`config.bind_limit`, default 5)
+ * - 1 proxy ↔ up to N VMs (`config.bind_limit`, default 1)
  * - Auto-assign a proxy with remaining capacity on VM create
  * - Health probe every 5/10/30/60 min
  * - On failure: disable proxy + disable bound VM scheduling
@@ -31,7 +31,7 @@ import { normalizeSocksHost, socksEndpoint, socksProxyUrl, socksProxyFamily } fr
 import { proxyBlockedReason } from './proxy-policy.mjs'
 import { canRevealClusterNodes, annotatePublicLocalProxy } from './local-proxy-nodes.mjs'
 
-export const MAX_VMS_PER_PROXY = 5
+export const MAX_VMS_PER_PROXY = 1
 export const BIND_LIMIT_MIN = 1
 export const BIND_LIMIT_MAX = 32
 export const PROXY_LABEL_MAX = 64

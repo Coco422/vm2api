@@ -11,7 +11,8 @@
  * (writes the previous data/request-logs/YYYY-MM-DD.jsonl format alongside).
  *
  * Env: KIN_REQUEST_LOG_MODE=off|normal|debug (default normal)
- * Per-request override: X-Kin-Debug: 1 or X-Kin-Log: debug|normal|off
+ * Per-request diagnostic override: X-Kin-Debug: 1 or X-Kin-Log: debug|normal|off
+ * Owned/billable request summaries always persist, including in off mode.
  */
 
 import fs from 'node:fs'
@@ -369,9 +370,9 @@ export function resolveLogMode(envMode, req) {
   return MODES.has(base) ? base : 'normal'
 }
 
-export function newRequestId(req) {
-  const incoming = String(req?.headers?.['x-request-id'] || '').trim()
-  if (incoming && incoming.length <= 128) return incoming
+export function newRequestId(_req) {
+  // This is the ledger's deduplication key, so callers must not choose it.
+  // Repeated finish() calls share the context id; separate HTTP calls do not.
   return crypto.randomUUID()
 }
 
@@ -510,11 +511,11 @@ export class RequestLogStore {
   }
 
   /**
-   * Write normal summary always (unless off).
+   * Always persist owned/billable summaries; off may suppress only unowned access logs.
    * Write debug full record when mode===debug.
    */
   finish(ctx, extra = {}) {
-    if (!ctx || ctx.mode === 'off') return null
+    if (!ctx) return null
     const duration_ms = Math.max(0, Date.now() - (ctx.t0 || Date.now()))
     const usage = normalizeUsage(disjointOpenaiUsage(extra.usage || {}) || {})
     const breakdown = cacheCreationBreakdown(usage)
@@ -601,6 +602,22 @@ export class RequestLogStore {
     // sub2api actual_cost: official cost × group rate multiplier (0 is a valid rate)
     if (summary.total_cost != null) {
       summary.actual_cost = extra.actual_cost ?? summary.total_cost * summary.rate_multiplier
+    }
+    // "off" controls diagnostic logging, never the accounting ledger.
+    // Record owned calls and usage/cost even when a caller suppresses bodies.
+    if (ctx.mode === 'off') {
+      const owned =
+        summary.vm_id || summary.account_id || summary.final_account_id || summary.api_key_id || summary.user_id
+      const billed =
+        summary.image_usage != null ||
+        Object.entries(summary).some(
+          ([key, value]) =>
+            (key.endsWith('_tokens') || key.endsWith('_cost') || key === 'web_search_requests') &&
+            Number(value) !== 0 &&
+            value != null,
+        )
+      if (!owned && !billed) return null
+      summary.log_mode = 'normal'
     }
     const classified = classifyRequestError(summary)
     if (classified?.error_class) summary.error_class = classified.error_class
