@@ -1,5 +1,6 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import type { ApiKeyItem, VmPool } from '@/types/panel-keys'
+import type { PanelUser } from '@/types/panel-users'
 import type { Vm } from '@/types/panel-vm'
 import { isCodexVm } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
@@ -94,6 +95,7 @@ export function KeyLimitsDialog({
   onSubmit,
   vms = [],
   pools,
+  users,
 }: {
   mode: 'create' | 'edit'
   open: boolean
@@ -103,6 +105,7 @@ export function KeyLimitsDialog({
   onSubmit: (draft: KeyLimitsDraft) => void
   vms?: Vm[]
   pools?: VmPool[]
+  users?: PanelUser[]
 }) {
   const [draft, setDraft] = useState<KeyLimitsDraft>(blankDraft())
 
@@ -123,6 +126,7 @@ export function KeyLimitsDialog({
         allowed_vms:
           group === 'all' || group === 'pool' ? [] : initial.allowed_vms || [],
         ...(pools ? { vm_pool_id: initial.vm_pool_id || '' } : {}),
+        user_id: initial.user_id || undefined,
       })
       return
     }
@@ -132,7 +136,12 @@ export function KeyLimitsDialog({
 
   const quotaOpts = mode === 'edit' ? QUOTA_EDIT : QUOTA_CREATE
   const rpmOpts = mode === 'edit' ? RPM_EDIT : RPM_CREATE
-  const listed = vmsInGroup(vms || [], draft.group_type)
+  const employee = users?.find(
+    (user) => user.id === draft.user_id && user.role === 'user'
+  )
+  const listed = vmsInGroup(vms || [], draft.group_type).filter(
+    (vm) => !employee || vm.owner_user_id === employee.id
+  )
   const scopeBlocked =
     draft.group_type === 'pool'
       ? !draft.vm_pool_id
@@ -157,6 +166,44 @@ export function KeyLimitsDialog({
           </p>
         ) : null}
         <div className='grid gap-3 sm:grid-cols-2'>
+          {users && (
+            <Field label='所属员工 / 用户'>
+              <Select
+                value={draft.user_id || '__default__'}
+                onValueChange={(value) =>
+                  setDraft((d) => ({
+                    ...d,
+                    user_id: value === '__default__' ? undefined : value,
+                    allowed_vms: [],
+                    ...(pools ? { vm_pool_id: '' } : {}),
+                  }))
+                }
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value='__default__'>
+                    {mode === 'create' ? '当前管理员（默认）' : '保持原归属'}
+                  </SelectItem>
+                  {users.map((user) => (
+                    <SelectItem
+                      key={user.id}
+                      value={user.id}
+                      disabled={user.enabled === false}
+                    >
+                      {user.username}
+                      {user.role !== 'user' ? ` · ${user.role}` : ''}
+                      {user.enabled === false ? '（已停用）' : ''}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className='text-[11px] text-muted-foreground'>
+                员工 Key 请选择对应平台，并勾选已分配给该员工的 VM。
+              </p>
+            </Field>
+          )}
           {mode === 'create' ? (
             <Field label='名称'>
               <Input
@@ -168,25 +215,27 @@ export function KeyLimitsDialog({
               />
             </Field>
           ) : null}
-          <Field label='分类'>
-            <Select
-              value={draft.category}
-              onValueChange={(v) =>
-                setDraft((d) => ({
-                  ...d,
-                  category: v === 'api' ? 'api' : 'oauth',
-                }))
-              }
-            >
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value='oauth'>OAuth 槽位</SelectItem>
-                <SelectItem value='api'>API 直连</SelectItem>
-              </SelectContent>
-            </Select>
-          </Field>
+          {pools ? (
+            <Field label='分类'>
+              <Select
+                value={draft.category}
+                onValueChange={(v) =>
+                  setDraft((d) => ({
+                    ...d,
+                    category: v === 'api' ? 'api' : 'oauth',
+                  }))
+                }
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value='oauth'>OAuth 槽位</SelectItem>
+                  <SelectItem value='api'>API 直连</SelectItem>
+                </SelectContent>
+              </Select>
+            </Field>
+          ) : null}
           <Field label='并发'>
             <NumSelect
               kind='conc'
@@ -213,6 +262,9 @@ export function KeyLimitsDialog({
                 setDraft((d) => ({ ...d, quota_usd: Number(e.target.value) }))
               }
             />
+            <p className='text-[11px] text-muted-foreground'>
+              0 表示不限额度。
+            </p>
           </Field>
           <Field label='RPM'>
             <NumSelect

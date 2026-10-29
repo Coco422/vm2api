@@ -41,16 +41,24 @@ export function LoginPage() {
         base: hideBase ? '' : base.trim().replace(/\/$/, '') || apiBase(),
       })
       signIn(result.token, result.user)
+      // Role and onboarding must belong to this login, not the previous user.
+      queryClient.clear()
       let needsWelcome = false
+      let isTenant = false
       try {
         const onboarding = await queryClient.fetchQuery(
           onboardingQueryOptions(true)
         )
         needsWelcome = Boolean(onboarding.needs_welcome)
+        isTenant = onboarding.role === 'user'
       } catch {
         needsWelcome = false
       }
       toast.success('登录成功')
+      if (isTenant) {
+        await navigate({ to: '/vm' })
+        return
+      }
       if (needsWelcome) {
         await navigate({ to: '/welcome', search: { setup: true } })
         return

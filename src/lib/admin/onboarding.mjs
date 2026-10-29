@@ -12,7 +12,7 @@ export const DEFAULT_ADMIN_PASSWORD = '123456'
 
 export const STEPS_BY_ROLE = Object.freeze({
   admin: Object.freeze(['admin_password', 'egress', 'slot_account', 'schedulable', 'api_key', 'first_request']),
-  user: Object.freeze(['egress', 'slot_account', 'schedulable', 'api_key', 'first_request']),
+  user: Object.freeze(['api_key', 'first_request']),
   super: Object.freeze(['schedulable', 'first_request']),
 })
 

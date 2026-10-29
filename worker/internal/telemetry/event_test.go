@@ -1,11 +1,29 @@
 package telemetry
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 )
+
+func decodeProcess(value any) (map[string]any, error) {
+	raw, ok := value.(string)
+	if !ok {
+		return nil, fmt.Errorf("process is %T", value)
+	}
+	body, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err = json.Unmarshal(body, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
 
 func TestInitEventUsesOfficial1PEnvelope(t *testing.T) {
 	ev := InitEvent(Identity{
@@ -46,13 +64,15 @@ func TestInitEventUsesOfficial1PEnvelope(t *testing.T) {
 		`"device_id":"` + strings.Repeat("ab", 32) + `"`,
 		`"account_uuid":"acc"`,
 		`"organization_uuid":"org"`,
-		`"email":"slot@example.com"`,
 		`"session_id":"sess"`,
 		`"client_timestamp":"2026-08-23T01:00:00.000Z"`,
 		`"platform":"linux"`,
 		`"platform_raw":"linux"`,
 		`"arch":"x64"`,
 		`"shell":"bash"`,
+		`"node_version":"v26.3.0"`,
+		`"is_running_with_bun":true`,
+		`"build_time":"2026-10-18T20:20:57Z"`,
 		`"linux_distro_id":"ubuntu"`,
 		`"linux_distro_version":"24.04"`,
 		`"linux_kernel":"6.8.0-generic"`,
@@ -64,7 +84,10 @@ func TestInitEventUsesOfficial1PEnvelope(t *testing.T) {
 			t.Fatalf("missing %s in %s", must, raw)
 		}
 	}
-	for _, drop := range []string{`"node_version"`, `"is_running_with_bun"`, `"betas"`, `"additional_metadata"`, `"model"`} {
+	if strings.Contains(string(raw), `"email"`) {
+		t.Fatalf("main path must not upload email: %s", raw)
+	}
+	for _, drop := range []string{`"betas"`, `"additional_metadata"`, `"coworker_type"`, `"github_event_name"`} {
 		if strings.Contains(string(raw), drop) {
 			t.Fatalf("did not expect %s in %s", drop, raw)
 		}
@@ -96,11 +119,22 @@ func TestSuccessEventMatchesBridgeEnvelope(t *testing.T) {
 	if ContainsForbidden(raw) {
 		t.Fatalf("forbidden: %s", raw)
 	}
-	if !strings.Contains(string(raw), `"linux_kernel"`) {
-		t.Fatalf("full env missing linux_kernel: %s", raw)
+	env := ev.EventData["env"].(map[string]any)
+	if _, ok := env["linux_kernel"]; ok {
+		t.Fatalf("empty linux_kernel must be omitted: %s", raw)
 	}
-	if strings.Contains(string(raw), `"model"`) || strings.Contains(string(raw), "claude-sonnet-5") {
-		t.Fatalf("model must not be uploaded: %s", raw)
+	if env["node_version"] != "v26.3.0" || env["is_running_with_bun"] != true {
+		t.Fatalf("required env missing: %s", raw)
+	}
+	proc, err := decodeProcess(ev.EventData["process"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := proc["cpuWindowMs"]; !ok {
+		t.Fatalf("process missing cpuWindowMs: %v", proc)
+	}
+	if ev.EventData["model"] != "claude-sonnet-5" {
+		t.Fatalf("model=%v", ev.EventData["model"])
 	}
 }
 
@@ -152,12 +186,18 @@ func TestEventUsesConfiguredEnvAndOmitsBetas(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := string(raw)
-	for _, must := range []string{`"linux_kernel":"from-env"`, `"version":"2.1.278"`, `"shell":"bash"`, `"vcs":"git"`, `"runtimes":"node"`} {
+	for _, must := range []string{
+		`"linux_kernel":"from-env"`, `"version":"2.1.278"`, `"shell":"bash"`, `"runtimes":"node"`,
+		`"node_version":"v1"`, `"is_running_with_bun":true`,
+	} {
 		if !strings.Contains(body, must) {
 			t.Fatalf("missing %s in %s", must, body)
 		}
 	}
-	for _, drop := range []string{"thinking-binding-controls-2026-08-01", `"node_version"`, `"is_running_with_bun"`, "2.1.241"} {
+	if strings.Contains(body, `"vcs"`) {
+		t.Fatalf("empty vcs must be omitted: %s", body)
+	}
+	for _, drop := range []string{"thinking-binding-controls-2026-08-01", "2.1.241"} {
 		if strings.Contains(body, drop) {
 			t.Fatalf("unexpected %s in %s", drop, body)
 		}
@@ -168,19 +208,20 @@ func TestEventUsesConfiguredEnvAndOmitsBetas(t *testing.T) {
 	if strings.Contains(body, "thinking-binding-controls") || strings.Contains(body, "advanced-tool-use") {
 		t.Fatalf("fallback uploaded betas: %s", body)
 	}
-	if !strings.Contains(body, `"version":"2.1.293"`) || !strings.Contains(body, `"shell":"bash"`) {
+	if !strings.Contains(body, `"version":"2.1.303"`) || !strings.Contains(body, `"shell":"bash"`) || !strings.Contains(body, `"node_version":"v26.3.0"`) {
 		t.Fatalf("fallback=%s", body)
 	}
 	attrs := GrowthbookEval(Identity{UserID: "u"})["attributes"].(map[string]any)
-	if attrs["appVersion"] != "2.1.293" {
+	if attrs["appVersion"] != "2.1.303" {
 		t.Fatalf("appVersion=%v", attrs["appVersion"])
 	}
 }
 
-func TestSanitizeEnvKeepsObservedHardwareAndDropsSecrets(t *testing.T) {
+func TestSanitizeEnvDropsGuestHardwareAndSecrets(t *testing.T) {
 	ev := InitEvent(Identity{
 		Env: map[string]any{
 			"platform":         "linux",
+			"shell":            "zsh",
 			"cpu_model":        "Intel(R) Xeon(R) CPU",
 			"cpu_cores":        float64(4),
 			"memory_bytes":     float64(4294967296),
@@ -199,16 +240,10 @@ func TestSanitizeEnvKeepsObservedHardwareAndDropsSecrets(t *testing.T) {
 		},
 	}, time.Date(2026, 8, 23, 1, 0, 0, 0, time.UTC))
 	env, _ := ev.EventData["env"].(map[string]any)
-	if env["cpu_model"] != "Intel(R) Xeon(R) CPU" {
-		t.Fatalf("cpu_model=%v", env["cpu_model"])
+	if env["platform"] != "linux" || env["shell"] != "zsh" || env["node_version"] != "v1" {
+		t.Fatalf("official keys lost: %v", env)
 	}
-	if env["cpu_cores"] != float64(4) || env["memory_bytes"] != float64(4294967296) {
-		t.Fatalf("numeric hardware=%v", env)
-	}
-	if env["dmi_product"] != "OptiPlex 7090" || env["mac"] != "52:54:00:11:22:33" {
-		t.Fatalf("dmi/mac=%v", env)
-	}
-	for _, drop := range []string{"node_version", "authorization", "hostname", "machine_id"} {
+	for _, drop := range append([]string{"authorization", "hostname", "machine_id"}, guestHardwareKeys...) {
 		if _, ok := env[drop]; ok {
 			t.Fatalf("leaked %s in %v", drop, env)
 		}
@@ -222,26 +257,18 @@ func TestSanitizeEnvKeepsObservedHardwareAndDropsSecrets(t *testing.T) {
 	}
 }
 
-func TestEnvBlockFallbackUsesIdentityHardware(t *testing.T) {
-	ev := InitEvent(Identity{
-		Platform:        "linux",
-		CPUModel:        "AMD EPYC",
-		CPUCores:        8,
-		MemoryBytes:     8589934592,
-		RootDisk:        "/dev/vda1",
-		MAC:             "52:54:00:aa:bb:cc",
-		DMIManufacturer: "QEMU",
-		DMIProduct:      "Standard PC",
-		DMIUUID:         "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-	}, time.Date(2026, 8, 23, 1, 0, 0, 0, time.UTC))
+func TestEnvBlockFallbackHasNoGuestHardware(t *testing.T) {
+	ev := InitEvent(Identity{Platform: "linux"}, time.Date(2026, 8, 23, 1, 0, 0, 0, time.UTC))
 	env, _ := ev.EventData["env"].(map[string]any)
-	if env["cpu_model"] != "AMD EPYC" {
-		t.Fatalf("cpu_model=%v", env["cpu_model"])
+	for _, key := range guestHardwareKeys {
+		if _, ok := env[key]; ok {
+			t.Fatalf("fallback env has %s: %v", key, env)
+		}
 	}
-	if env["cpu_cores"] != int64(8) || env["memory_bytes"] != int64(8589934592) {
-		t.Fatalf("numeric=%v", env)
-	}
-	if env["dmi_manufacturer"] != "QEMU" || env["mac"] != "52:54:00:aa:bb:cc" {
-		t.Fatalf("dmi/mac=%v", env)
-	}
+}
+
+var guestHardwareKeys = []string{
+	"cpu_model", "cpu_cores", "memory_bytes", "root_disk", "mac",
+	"dmi_manufacturer", "dmi_product", "dmi_version", "dmi_family",
+	"dmi_serial", "dmi_uuid",
 }

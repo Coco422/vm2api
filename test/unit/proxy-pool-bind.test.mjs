@@ -64,7 +64,7 @@ test('DNS type suppression persists both toggle states and rejects non-booleans'
   assert.equal(disabled.snapshot().config.dns_disable_svcb_https, false)
 })
 
-test('clampBindLimit defaults to 5 and stays in 1..32', () => {
+test('clampBindLimit defaults to 1 and stays in 1..32', () => {
   assert.equal(clampBindLimit(undefined), MAX_VMS_PER_PROXY)
   assert.equal(clampBindLimit(5), 5)
   assert.equal(clampBindLimit(1), 1)
@@ -74,12 +74,17 @@ test('clampBindLimit defaults to 5 and stays in 1..32', () => {
   assert.equal(clampBindLimit('x'), MAX_VMS_PER_PROXY)
 })
 
-test('bind_limit defaults to 5 and is configurable', () => {
+test('bind_limit defaults to 1 and explicit admin configuration persists', () => {
   const pool = makePool()
   pool.importLines('10.0.0.1:1080')
   const id = pool.snapshot().proxies[0].id
-  assert.equal(pool.bindLimit(), 5)
-  assert.equal(pool.snapshot().config.bind_limit, 5)
+  assert.equal(pool.bindLimit(), 1)
+  assert.equal(pool.snapshot().config.bind_limit, 1)
+  assert.equal(pool.bind(id, 'vm-default-1').ok, true)
+  assert.equal(pool.bind(id, 'vm-default-2').error, 'proxy_bind_limit')
+  pool.unbind(id)
+  assert.equal(pool.updateConfig({ bind_limit: 5 }).ok, true)
+  pool.stopScheduler()
   for (let i = 1; i <= 5; i++) {
     const r = pool.bind(id, `vm-0${i}`)
     assert.equal(r.ok, true, `bind vm-0${i}`)
@@ -216,7 +221,7 @@ test('egress_down does not mark a live SOCKS proxy dead', async () => {
   }
 })
 
-test('TCP connect then close is not a SOCKS death', async () => {
+test('TCP connect without a SOCKS5 reply is not healthy', async () => {
   const server = net.createServer((socket) => socket.destroy())
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
   const addr = server.address()
@@ -224,9 +229,101 @@ test('TCP connect then close is not a SOCKS death', async () => {
   pool.stopScheduler()
   try {
     pool.importLines(`${addr.address}:${addr.port}`)
-    const result = await pool._probeSocks(pool.state.proxies[0])
-    assert.equal(result.ok, true)
+    const row = pool.state.proxies[0]
+    const result = await pool._probeSocks(row)
+    assert.equal(result.ok, false)
+    assert.equal(result.error, 'not_socks5：请填写 SOCKS5 端口')
+    pool._applyProbeResult(row, { ...result, scope: 'socks' })
+    assert.equal(row.status, 'fail')
+    assert.equal(row.last_error, 'not_socks5：请填写 SOCKS5 端口')
   } finally {
+    pool.stopScheduler()
+    server.close()
+  }
+})
+
+test('silent TCP accept is not_socks5 instead of a healthy timeout', async () => {
+  const server = net.createServer(() => {})
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const addr = server.address()
+  const pool = new ProxyPool({ dataDir: tmpDir() })
+  pool.stopScheduler()
+  pool.state.config.probe_timeout_ms = 200
+  try {
+    pool.importLines(`${addr.address}:${addr.port}`)
+    const started = Date.now()
+    const result = await pool.probeOne(pool.state.proxies[0])
+    assert.equal(result.ok, false)
+    assert.equal(result.scope, 'socks')
+    assert.equal(result.error, 'not_socks5：请填写 SOCKS5 端口')
+    assert.ok(Date.now() - started < 1500)
+  } finally {
+    pool.stopScheduler()
+    server.close()
+  }
+})
+
+test('HTTP banner is not_socks5', async () => {
+  const server = net.createServer((socket) => {
+    socket.write('HTTP/1.1 400 Bad Request\r\n\r\n')
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const addr = server.address()
+  const pool = new ProxyPool({ dataDir: tmpDir() })
+  pool.stopScheduler()
+  try {
+    pool.importLines(`${addr.address}:${addr.port}`)
+    const result = await pool._probeSocks(pool.state.proxies[0])
+    assert.equal(result.ok, false)
+    assert.equal(result.error, 'not_socks5：请填写 SOCKS5 端口')
+  } finally {
+    pool.stopScheduler()
+    server.close()
+  }
+})
+
+test('split SOCKS5 method reply still counts as healthy', async () => {
+  let client
+  let releaseSecond
+  const firstHandled = new Promise((resolve) => {
+    releaseSecond = resolve
+  })
+  const server = net.createServer((socket) => {
+    client = socket
+    socket.write(Buffer.from([0x05]))
+    firstHandled.then(() => {
+      if (!socket.destroyed) socket.write(Buffer.from([0x00]))
+    })
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const addr = server.address()
+  const chunks = []
+  const pool = new ProxyPool({ dataDir: tmpDir() })
+  const connect = net.connect
+  net.connect = (...args) => {
+    const socket = connect.apply(net, args)
+    const on = socket.on.bind(socket)
+    socket.on = (event, listener) => {
+      if (event !== 'data') return on(event, listener)
+      return on(event, (data) => {
+        chunks.push(data.length)
+        const result = listener(data)
+        if (chunks.length === 1) releaseSecond()
+        return result
+      })
+    }
+    return socket
+  }
+  pool.stopScheduler()
+  try {
+    pool.importLines(`${addr.address}:${addr.port}`)
+    const result = await pool._probeSocks(pool.state.proxies[0])
+    assert.equal(client.bytesWritten, 2)
+    assert.deepEqual(chunks, [1, 1])
+    assert.equal(result.ok, true)
+    assert.equal(result.error, null)
+  } finally {
+    net.connect = connect
     pool.stopScheduler()
     server.close()
   }

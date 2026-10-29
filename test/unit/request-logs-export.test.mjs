@@ -53,7 +53,7 @@ seed([
   { session_id: 's9', user_id: 'u2', api_key_id: 'k2', status: 500, error_code: 'upstream_error' },
 ])
 
-async function exportLogs(query, { role = 'admin', userId = null, headers = {} } = {}) {
+async function exportLogs(query, { role = 'admin', userId = null, headers = {}, expectedStatus = 200 } = {}) {
   const out = {}
   const handlePanel = createPanelHandler({
     cfg: { paths: { project: root }, vm: { id: null } },
@@ -82,7 +82,8 @@ async function exportLogs(query, { role = 'admin', userId = null, headers = {} }
     },
   }
   await handlePanel({ method: 'GET', url, headers }, res, new URL(`http://localhost${url}`))
-  assert.equal(out.status, 200, JSON.stringify(out.body).slice(0, 300))
+  assert.equal(out.status, expectedStatus, JSON.stringify(out.body).slice(0, 300))
+  if (out.status !== 200) return { status: out.status, body: out.body }
   const rows = String(out.body || '')
     .split('\n')
     .filter(Boolean)
@@ -114,10 +115,11 @@ test('default muting hides auth errors unless include_muted is sent', async () =
   assert.ok(ids((await exportLogs('session_id=s1&include_muted=1')).rows).includes('req-6'))
 })
 
-test('tenant export stays owner-scoped and ignores user_id', async () => {
-  const { rows } = await exportLogs('user_id=u2', { role: 'user', userId: 'u1' })
-  assert.ok(rows.length > 0)
-  assert.ok(!ids(rows).includes('req-7'))
+test('read-only tenants cannot export logs even with owner filters', async () => {
+  const before = db.prepare('SELECT COUNT(*) AS n FROM usage_logs').get().n
+  const result = await exportLogs('user_id=u2', { role: 'user', userId: 'u1', expectedStatus: 403 })
+  assert.equal(result.body.error.code, 'forbidden')
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM usage_logs').get().n, before)
 })
 
 test('a trusted cross-origin console can read the export and its count headers', async (t) => {

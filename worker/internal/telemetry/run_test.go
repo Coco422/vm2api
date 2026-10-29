@@ -212,8 +212,8 @@ func TestRunReloadsTelemetryWithoutRestart(t *testing.T) {
 	if strings.Contains(got, "2.1.241") {
 		t.Fatalf("stale version in %s", got)
 	}
-	if !strings.Contains(got, `"cpu_model":"CPU-cd"`) || !strings.Contains(got, `"memory_bytes":8589934592`) {
-		t.Fatalf("reloaded body missing hardware: %s", got)
+	if strings.Contains(got, `"cpu_model"`) || strings.Contains(got, `"memory_bytes"`) {
+		t.Fatalf("guest hardware was uploaded: %s", got)
 	}
 }
 
@@ -420,5 +420,30 @@ func TestRunReloadsUploadIntervalWithoutResendingInit(t *testing.T) {
 	}
 	if successes.Load() != 2 {
 		t.Fatalf("successes=%d, interval reload did not apply", successes.Load())
+	}
+}
+
+func TestReadTouchKeepsModelAndFallsBackToMtime(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, touchName)
+	when := time.Date(2026, 10, 18, 20, 20, 57, 0, time.UTC)
+	body := when.Format(time.RFC3339Nano) + " claude-sonnet-5\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, model := readTouch(path)
+	if !got.Equal(when) || model != "claude-sonnet-5" {
+		t.Fatalf("touch=%s model=%q", got, model)
+	}
+	if err := os.WriteFile(path, []byte("not-a-time\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, model = readTouch(path)
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Equal(info.ModTime()) || model != "" {
+		t.Fatalf("legacy touch=%s model=%q", got, model)
 	}
 }

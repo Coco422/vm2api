@@ -25,6 +25,7 @@ import { QueryGate } from '@/components/query-gate'
 import { StatusMark } from '@/components/status-mark'
 import { meQueryOptions } from '@/features/auth/queries'
 import { apiKeysQueryOptions } from '@/features/keys/queries'
+import { usersQueryOptions } from '@/features/users/queries'
 import { vmsListQueryOptions } from '@/features/vm/queries'
 import {
   keyExpiryText,
@@ -46,6 +47,7 @@ export function KeysPage() {
   const q = useQuery(apiKeysQueryOptions())
   const me = useQuery(meQueryOptions())
   const isAdmin = me.data?.role === 'admin'
+  const users = useQuery({ ...usersQueryOptions(), enabled: isAdmin })
   const pools = useQuery({ ...vmPoolsQueryOptions(), enabled: isAdmin })
   const vms = useQuery(vmsListQueryOptions())
   const vmItems = vms.data?.items || []
@@ -197,7 +199,11 @@ export function KeysPage() {
     <PageHeader
       title={VIEW_TITLES.keys}
       description='发给客户端的 sk-vm- 密钥。请求走这张密钥，不要把主控密钥写进环境变量。'
-      extra={<Button onClick={() => setCreateOpen(true)}>生成</Button>}
+      extra={
+        isAdmin ? (
+          <Button onClick={() => setCreateOpen(true)}>生成</Button>
+        ) : undefined
+      }
     >
       {isAdmin ? <VmPoolsCard vms={vmItems} /> : null}
       <QueryGate
@@ -208,8 +214,8 @@ export function KeysPage() {
         {keys.length === 0 ? (
           <EmptyState
             reason='尚无密钥。协议密钥只能调 /v1。'
-            actionLabel='生成'
-            onAction={() => setCreateOpen(true)}
+            actionLabel={isAdmin ? '生成' : undefined}
+            onAction={isAdmin ? () => setCreateOpen(true) : undefined}
           />
         ) : (
           <Table>
@@ -230,6 +236,7 @@ export function KeysPage() {
                 <KeyRow
                   key={k.id}
                   item={k}
+                  canManage={isAdmin}
                   busy={
                     toggle.isPending ||
                     resetQuota.isPending ||
@@ -262,6 +269,7 @@ export function KeysPage() {
         pending={create.isPending}
         vms={vmItems}
         pools={isAdmin ? pools.data?.pools || [] : undefined}
+        users={isAdmin ? users.data?.items || [] : undefined}
         onSubmit={(draft) => create.mutate(draft)}
       />
       <KeyLimitsDialog
@@ -273,6 +281,7 @@ export function KeysPage() {
         initial={editing}
         vms={vmItems}
         pools={isAdmin ? pools.data?.pools || [] : undefined}
+        users={isAdmin ? users.data?.items || [] : undefined}
         pending={edit.isPending}
         onSubmit={(draft) => {
           if (!editId) return
@@ -330,6 +339,7 @@ function draftName(payload: unknown): string | undefined {
 
 function KeyRow({
   item,
+  canManage,
   busy,
   onView,
   onCopy,
@@ -341,6 +351,7 @@ function KeyRow({
   onDelete,
 }: {
   item: ApiKeyItem
+  canManage: boolean
   busy: boolean
   onView: () => void
   onCopy: () => void
@@ -389,7 +400,7 @@ function KeyRow({
                 复制
               </Button>
             </>
-          ) : (
+          ) : canManage ? (
             <Button
               size='sm'
               variant='ghost'
@@ -398,6 +409,10 @@ function KeyRow({
             >
               换新
             </Button>
+          ) : (
+            <span className='text-xs text-muted-foreground'>
+              请联系管理员获取密钥
+            </span>
           )}
         </div>
       </TableCell>
@@ -421,23 +436,32 @@ function KeyRow({
         <Button size='sm' variant='ghost' disabled={busy} onClick={onStats}>
           统计
         </Button>
-        <Button size='sm' variant='ghost' disabled={busy} onClick={onEdit}>
-          编辑
-        </Button>
-        <Button size='sm' variant='ghost' disabled={busy} onClick={onToggle}>
-          {active ? '停用' : '启用'}
-        </Button>
-        <Button size='sm' variant='ghost' disabled={busy} onClick={onReset}>
-          清零
-        </Button>
-        <Button
-          size='sm'
-          variant='destructive'
-          disabled={busy}
-          onClick={onDelete}
-        >
-          删除
-        </Button>
+        {canManage ? (
+          <>
+            <Button size='sm' variant='ghost' disabled={busy} onClick={onEdit}>
+              编辑
+            </Button>
+            <Button
+              size='sm'
+              variant='ghost'
+              disabled={busy}
+              onClick={onToggle}
+            >
+              {active ? '停用' : '启用'}
+            </Button>
+            <Button size='sm' variant='ghost' disabled={busy} onClick={onReset}>
+              清零
+            </Button>
+            <Button
+              size='sm'
+              variant='destructive'
+              disabled={busy}
+              onClick={onDelete}
+            >
+              删除
+            </Button>
+          </>
+        ) : null}
       </TableCell>
     </TableRow>
   )

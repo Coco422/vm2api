@@ -11,7 +11,14 @@ import { dashboardQueryOptions } from '@/features/overview/queries'
 import { vmQueryOptions, vmsListQueryOptions } from '@/features/vm/queries'
 import { useVmPerms } from '@/features/vm/vm-perms'
 
+function newResetOperationId() {
+  return Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) =>
+    byte.toString(16).padStart(2, '0')
+  ).join('')
+}
+
 type QuotaPayload = {
+  outcome?: 'reset' | 'unknown' | 'already_used'
   reset_credits?: {
     available_count?: number
     credits?: Array<{ expires_at?: string }>
@@ -22,6 +29,7 @@ type QuotaPayload = {
 function useOpenaiQuotaActions(vm: Vm) {
   const qc = useQueryClient()
   const [confirm, setConfirm] = useState(false)
+  const [operationId, setOperationId] = useState(newResetOperationId)
   const credits = vm.reset_credits
   const available = Math.max(0, Number(credits?.available_count) || 0)
   const expiry = credits?.credits?.[0]?.expires_at
@@ -56,11 +64,24 @@ function useOpenaiQuotaActions(vm: Vm) {
     mutationFn: () =>
       api<QuotaPayload>(
         `/api/panel/vms/${encodeURIComponent(vm.id)}/openai-quota/reset`,
-        { method: 'POST', signal: AbortSignal.timeout(90_000) }
+        {
+          method: 'POST',
+          signal: AbortSignal.timeout(90_000),
+          headers: { 'Idempotency-Key': operationId },
+        }
       ),
     onSuccess: async (data) => {
       setConfirm(false)
       await refreshAll()
+      if (data?.outcome === 'unknown') {
+        toast.warning('重置结果待管理员核实，请勿重复消费')
+        return
+      }
+      setOperationId(newResetOperationId())
+      if (data?.outcome === 'already_used') {
+        toast.info('此操作已处理')
+        return
+      }
       if (data?.warning === 'reset_credit_cache_refresh_failed') {
         toast.warning('重置券已消费，但回读额度失败，请再点查询')
         return
@@ -98,7 +119,7 @@ export function OpenaiQuotaActions({
     resetQuota,
     setConfirm,
   } = useOpenaiQuotaActions(vm)
-  const canUse = useVmPerms().credential
+  const canUse = useVmPerms().resetCredits
 
   if (!canUse) return null
 

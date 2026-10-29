@@ -44,6 +44,7 @@ import { StatusMark } from '@/components/status-mark'
 import { meQueryOptions } from '@/features/auth/queries'
 import { ProxyChip } from '@/features/proxies/proxy-chip'
 import { usersQueryOptions } from '@/features/users/queries'
+import { ActiveVmBadge } from '@/features/vm/active-vm-badge'
 import { restrictionTitle } from '@/features/vm/clear-restriction'
 import { Field } from '@/features/vm/detail-section-primitives'
 import { NodeChip } from '@/features/vm/node-chip'
@@ -105,6 +106,7 @@ function CardBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
     <>
       <div className='flex flex-wrap items-center gap-1.5'>
         <PlatformChip vm={vm} />
+        <ActiveVmBadge vm={vm} />
         <StatusMark tone={accountStatus(vm)} variant='pill' />
         {tier.key !== 'none' ? <StatusMark tone={tier} variant='pill' /> : null}
         {poolStatus(vm).key !== accountStatus(vm).key ? (
@@ -275,15 +277,17 @@ function CardBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
             </Button>
           </>
         ) : null}
-        <Button
-          size='sm'
-          variant='outline'
-          disabled={!restricted || actions.recoveringId === vm.id}
-          title={restricted ?? '当前没有冷却或熔断'}
-          onClick={() => actions.recover(vm)}
-        >
-          <RotateCcw /> 恢复状态
-        </Button>
+        {perms.admin || perms.dashboard ? (
+          <Button
+            size='sm'
+            variant='outline'
+            disabled={!restricted || actions.recoveringId === vm.id}
+            title={restricted ?? '当前没有冷却或熔断'}
+            onClick={() => actions.recover(vm)}
+          >
+            <RotateCcw /> 恢复状态
+          </Button>
+        ) : null}
         {admin && actions.openAssignOwner ? (
           <Button
             size='sm'

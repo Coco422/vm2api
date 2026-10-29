@@ -13,7 +13,7 @@ import {
   persistVmQuotaOverride,
   persistVmSessionSlots,
   persistVmMaxSessions,
-  setVmSchedulable,
+  markUnschedulable,
 } from '../vm/vm-registry.mjs'
 import { normalizeInferenceConfig, normalizeSessionSlots, resolveInferenceEngine } from '../vm/slot-engine.mjs'
 import { slotExec } from '../vm/slot-runtime.mjs'
@@ -21,7 +21,6 @@ import { maxRequestBytes, streamIdleTimeoutMs } from '../core/config.mjs'
 
 import { accountTierKey, mergeTierMaps, normalizeTiers } from '../pool/quota-tiers.mjs'
 import { vmQuotaOverrideOf } from '../pool/vm-quota-override.mjs'
-import { setManualScheduleWins } from '../pool/schedule-policy.mjs'
 import { PoolScheduler, normalizePoolRouting } from '../pool/pool-scheduler.mjs'
 import { FailoverRunner } from '../pool/failover-runner.mjs'
 import { unitCircuit } from '../pool/unit-circuit.mjs'
@@ -381,7 +380,8 @@ export function createRoutingRuntime(ctx) {
     return (
       Object.prototype.hasOwnProperty.call(compatibility, 'cache_ttl') ||
       Object.prototype.hasOwnProperty.call(compatibility, 'persona_preset') ||
-      Object.prototype.hasOwnProperty.call(compatibility, 'cch_enabled')
+      Object.prototype.hasOwnProperty.call(compatibility, 'cch_enabled') ||
+      Object.prototype.hasOwnProperty.call(compatibility, 'cc_entrypoint')
     )
   }
 
@@ -448,7 +448,6 @@ export function createRoutingRuntime(ctx) {
     if (body.concurrency) routingConfig.concurrency = { ...(routingConfig.concurrency || {}), ...body.concurrency }
     if (body.pool) {
       routingConfig.pool = normalizePoolRouting({ ...(routingConfig.pool || {}), ...body.pool })
-      setManualScheduleWins(routingConfig.pool.manual_schedule_wins)
     }
     if (body.failover) routingConfig.failover = { ...(routingConfig.failover || {}), ...body.failover }
     if (body.inference) {
@@ -683,6 +682,7 @@ export function createRoutingRuntime(ctx) {
   }
 
   function initPoolRuntime() {
+    getPool()?.stopMaintenance()
     const routingConfig = getRouting()
     const runtimeRepo = new AccountRuntimeRepo()
     const attemptsRepo = new RequestAttemptsRepo()
@@ -701,6 +701,7 @@ export function createRoutingRuntime(ctx) {
       config: poolSchedulerConfig(),
     })
     setPool(poolScheduler)
+    poolScheduler.startMaintenance()
     configureUnitCircuit(routingConfig)
     ctx.accountQuota.onQuotaCooldownCleared = () => {
       try {
@@ -766,8 +767,17 @@ export function createRoutingRuntime(ctx) {
           return
         }
         if (policy?.reason === 'oauth_no_refresh' && shouldMarkMissingRefresh(selected.vm)) {
-          setVmSchedulable(ctx.cfg.paths.project, selected.vmId, false, 'oauth_no_refresh')
+          markUnschedulable(ctx.cfg.paths.project, selected.vmId, 'oauth_no_refresh')
         }
+      },
+      // Org refusal: 不可调度 even over the operator's "on"; only an operator action reopens it.
+      onSchedulePause: ({ selected, policy }) => {
+        if (!selected?.vmId) return
+        markUnschedulable(ctx.cfg.paths.project, selected.vmId, policy?.reason || 'organization_disabled', {
+          ...policy?.detail,
+          account_id: selected.accountId || null,
+          at: new Date().toISOString(),
+        })
       },
     })
     setFailover(failoverRunner)

@@ -36,13 +36,16 @@ export function LogsPane({ value: logging, onChange }: LogsPaneProps) {
             </SelectContent>
           </Select>
         </SettingRow>
-        <SettingRow label='保留天数'>
+        <SettingRow
+          label='普通日志保留天数'
+          desc='计费摘要长期保留，不随普通访问日志和请求体清理。'
+        >
           <Input
             className='w-24'
             type='number'
             min={1}
             max={90}
-            value={Number(logging.retain_days ?? 7)}
+            value={Number(logging.retain_days ?? 30)}
             onChange={(event) =>
               onChange({
                 ...logging,
@@ -53,7 +56,7 @@ export function LogsPane({ value: logging, onChange }: LogsPaneProps) {
         </SettingRow>
         <SettingRow
           label='Debug 保留天数'
-          desc='request_log_debug 行。不超过上面的保留天数。'
+          desc='请求与响应体的保留天数，不影响计费明细。'
         >
           <Input
             className='w-24'

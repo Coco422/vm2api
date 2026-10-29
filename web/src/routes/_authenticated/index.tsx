@@ -8,14 +8,18 @@ export const Route = createFileRoute('/_authenticated/')({
     // fetch would 401 and the global handler would bounce to the sign-in page.
     if (!hasSession()) throw redirect({ to: '/welcome' })
     let needsWelcome = false
+    let isTenant = false
     try {
       const data = await context.queryClient.ensureQueryData(
         onboardingQueryOptions()
       )
       needsWelcome = Boolean(data.needs_welcome)
+      isTenant = data.role === 'user'
     } catch {
       throw redirect({ to: '/overview' })
     }
-    throw redirect({ to: needsWelcome ? '/welcome' : '/overview' })
+    throw redirect({
+      to: isTenant ? '/vm' : needsWelcome ? '/welcome' : '/overview',
+    })
   },
 })

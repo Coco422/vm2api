@@ -10,6 +10,7 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as AuthenticatedRouteRouteImport } from './routes/_authenticated/route'
+import { Route as EmployeeRouteImport } from './routes/employee'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as WelcomeRouteImport } from './routes/welcome'
 import { Route as AuthenticatedIndexRouteImport } from './routes/_authenticated/index'
@@ -37,6 +38,11 @@ import { Route as AuthenticatedVmIdRouteImport } from './routes/_authenticated/v
 
 const AuthenticatedRouteRoute = AuthenticatedRouteRouteImport.update({
   id: '/_authenticated',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const EmployeeRoute = EmployeeRouteImport.update({
+  id: '/employee',
+  path: '/employee',
   getParentRoute: () => rootRouteImport,
 } as any)
 const LoginRoute = LoginRouteImport.update({
@@ -164,6 +170,7 @@ const AuthenticatedVmIdRoute = AuthenticatedVmIdRouteImport.update({
 
 export interface FileRoutesByFullPath {
   '/': typeof AuthenticatedIndexRoute
+  '/employee': typeof EmployeeRoute
   '/login': typeof LoginRoute
   '/welcome': typeof WelcomeRoute
   '/anthropic': typeof AuthenticatedAnthropicRoute
@@ -189,6 +196,7 @@ export interface FileRoutesByFullPath {
   '/vm/': typeof AuthenticatedVmIndexRoute
 }
 export interface FileRoutesByTo {
+  '/employee': typeof EmployeeRoute
   '/login': typeof LoginRoute
   '/welcome': typeof WelcomeRoute
   '/anthropic': typeof AuthenticatedAnthropicRoute
@@ -217,6 +225,7 @@ export interface FileRoutesByTo {
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/_authenticated': typeof AuthenticatedRouteRouteWithChildren
+  '/employee': typeof EmployeeRoute
   '/login': typeof LoginRoute
   '/welcome': typeof WelcomeRoute
   '/_authenticated/anthropic': typeof AuthenticatedAnthropicRoute
@@ -246,6 +255,7 @@ export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
     | '/'
+    | '/employee'
     | '/login'
     | '/welcome'
     | '/anthropic'
@@ -271,6 +281,7 @@ export interface FileRouteTypes {
     | '/vm/'
   fileRoutesByTo: FileRoutesByTo
   to:
+    | '/employee'
     | '/login'
     | '/welcome'
     | '/anthropic'
@@ -298,6 +309,7 @@ export interface FileRouteTypes {
   id:
     | '__root__'
     | '/_authenticated'
+    | '/employee'
     | '/login'
     | '/welcome'
     | '/_authenticated/anthropic'
@@ -326,6 +338,7 @@ export interface FileRouteTypes {
 }
 export interface RootRouteChildren {
   AuthenticatedRouteRoute: typeof AuthenticatedRouteRouteWithChildren
+  EmployeeRoute: typeof EmployeeRoute
   LoginRoute: typeof LoginRoute
   WelcomeRoute: typeof WelcomeRoute
 }
@@ -337,6 +350,13 @@ declare module '@tanstack/react-router' {
       path: ''
       fullPath: '/'
       preLoaderRoute: typeof AuthenticatedRouteRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/employee': {
+      id: '/employee'
+      path: '/employee'
+      fullPath: '/employee'
+      preLoaderRoute: typeof EmployeeRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/login': {
@@ -565,6 +585,7 @@ const AuthenticatedRouteRouteWithChildren =
 
 const rootRouteChildren: RootRouteChildren = {
   AuthenticatedRouteRoute: AuthenticatedRouteRouteWithChildren,
+  EmployeeRoute: EmployeeRoute,
   LoginRoute: LoginRoute,
   WelcomeRoute: WelcomeRoute,
 }

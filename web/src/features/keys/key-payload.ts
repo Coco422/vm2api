@@ -11,6 +11,7 @@ export type KeyLimitsDraft = {
   group_type: KeyGroupType
   allowed_vms: string[]
   vm_pool_id?: string
+  user_id?: string
 }
 
 function nonNegative(value: number, label: string): number {
@@ -33,12 +34,14 @@ export function keyLimitsPayload(
   const requests = nonNegative(draft.quota_requests, '请求额度')
   if (!Number.isInteger(requests)) throw new Error('请求额度必须是整数')
   const body: Record<string, unknown> = {
-    category: draft.category,
     max_concurrency: nonNegative(draft.max_concurrency, '并发'),
     quota_requests: requests,
     quota_usd: nonNegative(draft.quota_usd, 'USD 额度'),
     rpm: nonNegative(draft.rpm, 'RPM'),
   }
+  if (isAdmin && draft.user_id?.trim()) body.user_id = draft.user_id.trim()
+  // API 直连不经过槽位，只有管理员可以设置
+  if (isAdmin) body.category = draft.category
   if (isAdmin && draft.group_type === 'pool') {
     const vm_pool_id = String(draft.vm_pool_id || '').trim()
     if (!vm_pool_id) throw new Error('选择一个账号池')

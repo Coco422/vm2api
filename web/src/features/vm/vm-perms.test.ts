@@ -16,21 +16,23 @@ describe('vmPermsFor follows panel-acl roles', () => {
       test: true,
       testModels: true,
       credential: true,
+      resetCredits: true,
       remove: true,
     })
   })
 
-  it('tenant cannot read dashboard or manage the slot, but can power, test, import and delete', () => {
+  it('tenant can only read owned usage and use reset credits', () => {
     const p = vmPermsFor('user')
     expect(p.known).toBe(true)
     expect(p.admin).toBe(false)
     expect(p.dashboard).toBe(false)
-    expect(p.power).toBe(true)
-    expect(p.test).toBe(true)
+    expect(p.power).toBe(false)
+    expect(p.test).toBe(false)
     // The backend only serves GET /api/panel/test-models to admins.
     expect(p.testModels).toBe(false)
-    expect(p.credential).toBe(true)
-    expect(p.remove).toBe(true)
+    expect(p.credential).toBe(false)
+    expect(p.resetCredits).toBe(true)
+    expect(p.remove).toBe(false)
   })
 
   it('super only reads dashboard and toggles scheduling', () => {
@@ -65,12 +67,7 @@ describe('vmDetailTabs', () => {
       'ops',
       'seed',
     ])
-    expect(vmDetailTabs(vmPermsFor('user'))).toEqual([
-      'overview',
-      'account',
-      'proxy',
-      'test',
-    ])
+    expect(vmDetailTabs(vmPermsFor('user'))).toEqual(['overview'])
     expect(vmDetailTabs(vmPermsFor('super'))).toEqual([
       'overview',
       'account',
@@ -82,8 +79,8 @@ describe('vmDetailTabs', () => {
     const tabs = vmDetailTabs(vmPermsFor('user'))
     expect(visibleTab('ops', tabs)).toBe('overview')
     expect(visibleTab('seed', tabs)).toBe('overview')
-    expect(visibleTab('test', tabs)).toBe('test')
-    expect(visibleTab('proxy', tabs)).toBe('proxy')
+    expect(visibleTab('test', tabs)).toBe('overview')
+    expect(visibleTab('proxy', tabs)).toBe('overview')
   })
 })
 

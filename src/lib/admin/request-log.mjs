@@ -11,7 +11,8 @@
  * (writes the previous data/request-logs/YYYY-MM-DD.jsonl format alongside).
  *
  * Env: KIN_REQUEST_LOG_MODE=off|normal|debug (default normal)
- * Per-request override: X-Kin-Debug: 1 or X-Kin-Log: debug|normal|off
+ * Per-request diagnostic override: X-Kin-Debug: 1 or X-Kin-Log: debug|normal|off
+ * Owned/billable request summaries always persist, including in off mode.
  */
 
 import fs from 'node:fs'
@@ -34,7 +35,7 @@ export function presentedApiKeyForLog(token) {
 
 const MODES = new Set(['off', 'normal', 'debug'])
 
-const DEFAULT_RETAIN_DAYS = 7
+const DEFAULT_RETAIN_DAYS = 30
 const DEFAULT_DEBUG_RETAIN_DAYS = 3
 const DEFAULT_MAX_MB = 2048
 const CLEANUP_INTERVAL_MS = 10 * 60 * 1000
@@ -105,8 +106,8 @@ function summarizeBody(body) {
 
 /**
  * Cache-creation TTL breakdown.
- * Prefer usage.cache_creation.ephemeral_5m/1h; when the split is absent but
- * cache_creation_input_tokens > 0, bill 1h only on an explicit cache_ttl === '1h',
+ * Prefer usage.cache_creation.ephemeral_5m/1h; cache_creation_input_tokens beyond
+ * that split (absent, or stale after message_delta) bills 1h only on an explicit cache_ttl === '1h',
  * else 5m. DEFAULT_CACHE_TTL is not a billing fallback.
  */
 function cacheCreationBreakdown(usage) {
@@ -117,14 +118,19 @@ function cacheCreationBreakdown(usage) {
   let five = Number(nested?.ephemeral_5m_input_tokens) || 0
   let hour = Number(nested?.ephemeral_1h_input_tokens) || 0
   const total = Number(usage.cache_creation_input_tokens ?? usage.cache_creation_tokens) || 0
-  if (five === 0 && hour === 0 && total > 0) {
-    if (usage.cache_ttl === '1h') hour = total
-    else five = total
+  const unsplit = total - five - hour
+  if (unsplit > 0) {
+    if (usage.cache_ttl === '1h') hour += unsplit
+    else five += unsplit
   }
   if (five === 0 && hour === 0) {
     return { cache_creation_5m_tokens: null, cache_creation_1h_tokens: null }
   }
   return { cache_creation_5m_tokens: five, cache_creation_1h_tokens: hour }
+}
+
+function imageTokenCount(v) {
+  return Number.isSafeInteger(v) && v > 0 ? v : 0
 }
 
 function webSearchRequestsOf(usage) {
@@ -138,6 +144,7 @@ const PRICED_COLUMN_KEYS = [
   'cache_read_cost',
   'cache_creation_cost',
   'web_search_cost',
+  'image_cost',
   'total_cost',
   'pricing_model',
   'price_source',
@@ -147,19 +154,27 @@ const PRICED_COLUMN_KEYS = [
   'long_context',
 ]
 
+/** Image generation usage on this row; an Images endpoint row (`openai.images`) bills it alone. */
+function imageForLog(extra) {
+  const only = extra.protocol === 'openai.images'
+  if (!extra.image_usage && !only) return null
+  return { usage: extra.image_usage || null, model: extra.image_model || null, only }
+}
+
 function costColumnsForLog(usage, model, extra = {}) {
   if (extra.pricing_model != null) {
     const out = {}
     for (const key of PRICED_COLUMN_KEYS) out[key] = extra[key] ?? null
     return out
   }
-  const priced = costColumnsFromUsage(usage, model)
+  const priced = costColumnsFromUsage(usage, model, imageForLog(extra))
   return {
     input_cost: priced.input_cost ?? null,
     output_cost: priced.output_cost ?? null,
     cache_read_cost: priced.cache_read_cost ?? null,
     cache_creation_cost: priced.cache_creation_cost ?? null,
     web_search_cost: priced.web_search_cost ?? null,
+    image_cost: priced.image_cost ?? null,
     total_cost: priced.total_cost ?? null,
     pricing_model: priced.pricing_model ?? null,
     price_source: priced.price_source ?? null,
@@ -355,9 +370,9 @@ export function resolveLogMode(envMode, req) {
   return MODES.has(base) ? base : 'normal'
 }
 
-export function newRequestId(req) {
-  const incoming = String(req?.headers?.['x-request-id'] || '').trim()
-  if (incoming && incoming.length <= 128) return incoming
+export function newRequestId(_req) {
+  // This is the ledger's deduplication key, so callers must not choose it.
+  // Repeated finish() calls share the context id; separate HTTP calls do not.
   return crypto.randomUUID()
 }
 
@@ -496,11 +511,11 @@ export class RequestLogStore {
   }
 
   /**
-   * Write normal summary always (unless off).
+   * Always persist owned/billable summaries; off may suppress only unowned access logs.
    * Write debug full record when mode===debug.
    */
   finish(ctx, extra = {}) {
-    if (!ctx || ctx.mode === 'off') return null
+    if (!ctx) return null
     const duration_ms = Math.max(0, Date.now() - (ctx.t0 || Date.now()))
     const usage = normalizeUsage(disjointOpenaiUsage(extra.usage || {}) || {})
     const breakdown = cacheCreationBreakdown(usage)
@@ -558,6 +573,8 @@ export class RequestLogStore {
       upstream_model: extra.upstream_model || null,
       model_mismatch: modelMismatch(extra.requested_model || extra.model, extra.upstream_model),
       first_token_ms: extra.first_token_ms ?? null,
+      first_byte_ms: extra.first_byte_ms ?? null,
+      generation_ms: extra.generation_ms ?? null,
       stop_reason: extra.stop_reason || usage.stop_reason || null,
       attempt_count: extra.attempt_count ?? null,
       final_state: extra.final_state || null,
@@ -568,16 +585,39 @@ export class RequestLogStore {
       inbound_device_id: sessionIdForLog(extra.inbound_device_id),
       // Gate verdict JSON from intercept-gate; the risk audit groups on it.
       intercept: extra.intercept ? String(extra.intercept).slice(0, 400) : null,
+      // Exact classifyJev payload.state. Context, not a span the model named.
+      jev_state: extra.jev_state ? String(extra.jev_state).slice(0, 64000) : null,
+      image_model: extra.image_model || null,
+      image_usage: extra.image_usage ? JSON.stringify(extra.image_usage) : null,
+      image_input_tokens: imageTokenCount(extra.image_usage?.input_tokens),
+      image_output_tokens: imageTokenCount(extra.image_usage?.output_tokens),
       // sub2api ownership + billing columns
       user_id: extra.user_id ?? null,
       vm_owner_user_id: this.repo.vmOwnerOf(extra.vm_id),
       group_id: extra.group_id ?? 1,
       rate_multiplier: Number.isFinite(Number(extra.rate_multiplier)) ? Number(extra.rate_multiplier) : 1,
       ...costColumnsForLog(billedUsage, extra.upstream_model || extra.model || extra.requested_model, extra),
+      upstream_service_tier: extra.upstream_service_tier || null,
     }
     // sub2api actual_cost: official cost × group rate multiplier (0 is a valid rate)
     if (summary.total_cost != null) {
       summary.actual_cost = extra.actual_cost ?? summary.total_cost * summary.rate_multiplier
+    }
+    // "off" controls diagnostic logging, never the accounting ledger.
+    // Record owned calls and usage/cost even when a caller suppresses bodies.
+    if (ctx.mode === 'off') {
+      const owned =
+        summary.vm_id || summary.account_id || summary.final_account_id || summary.api_key_id || summary.user_id
+      const billed =
+        summary.image_usage != null ||
+        Object.entries(summary).some(
+          ([key, value]) =>
+            (key.endsWith('_tokens') || key.endsWith('_cost') || key === 'web_search_requests') &&
+            Number(value) !== 0 &&
+            value != null,
+        )
+      if (!owned && !billed) return null
+      summary.log_mode = 'normal'
     }
     const classified = classifyRequestError(summary)
     if (classified?.error_class) summary.error_class = classified.error_class
@@ -609,6 +649,11 @@ export class RequestLogStore {
         classifier: extra.classifier || null,
         outbound_headers:
           ctx.capture_outbound && extra.outbound_headers != null ? redactHeaders(extra.outbound_headers) : null,
+        outbound_headers_source: ctx.capture_outbound ? extra.outbound_headers_source || null : null,
+        worker_envelope_headers:
+          ctx.capture_outbound && extra.worker_envelope_headers != null
+            ? redactHeaders(extra.worker_envelope_headers)
+            : null,
         outbound_body:
           ctx.capture_outbound && !extra.classifier && extra.outbound_body != null
             ? clampBody(extra.outbound_body, this.maxDebugBodyChars)
@@ -695,6 +740,10 @@ export class RequestLogStore {
 
   vmUsageStats(opts = {}) {
     return this.repo.vmUsageStats(opts)
+  }
+
+  costBetween(opts = {}) {
+    return this.repo.costBetween(opts)
   }
 
   keyUsageStats(opts = {}) {
@@ -813,6 +862,8 @@ const EXPORT_COLUMNS = [
   'api_key_presented',
   'duration_ms',
   'first_token_ms',
+  'first_byte_ms',
+  'generation_ms',
   'input_tokens',
   'output_tokens',
   'total_cost',

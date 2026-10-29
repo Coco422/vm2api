@@ -3,7 +3,24 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { buildUsage, buildVmList, indexBillingAccounts, lookupBilling } from '../../src/lib/admin/panel-api.mjs'
+import {
+  buildUsage,
+  buildVmList,
+  findAccount,
+  indexBillingAccounts,
+  lookupBilling,
+} from '../../src/lib/admin/panel-api.mjs'
+
+test('account rotation cannot fall back to the previous account bill or quota', () => {
+  const old = { account_id: 'old-uuid', vm_id: 'vm-02', total_cost: 193, requests: 100 }
+  const vm = { id: 'vm-02', account_uuid: 'new-uuid' }
+  assert.equal(lookupBilling(indexBillingAccounts({ accounts: [old] }), vm), null)
+  assert.equal(findAccount({ snapshot: () => ({ accounts: [old] }) }, vm), null)
+  const current = { account_id: 'new-uuid', vm_id: 'vm-02', total_cost: 1, requests: 1 }
+  const index = indexBillingAccounts({ accounts: [old, current] })
+  assert.equal(lookupBilling(index, vm), current)
+  assert.equal(lookupBilling(index, { account_id: 'old-uuid', vm_id: 'vm-02' }), old)
+})
 
 test('billing index keeps UUID row when leftover vm-id account is empty', () => {
   const leftover = {

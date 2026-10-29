@@ -1,7 +1,8 @@
 /**
- * Claude Code 2.1.296 1P env / event / GrowthBook payloads.
- * device_id is the install userID (64 hex). Betas, node_version,
- * is_running_with_bun, model, and additional_metadata are not sent.
+ * Claude Code 2.1.303 1P env / event / GrowthBook payloads.
+ * device_id is the install userID (64 hex). The main path does not send
+ * email, betas, model, or additional_metadata. node_version and
+ * is_running_with_bun are always present; empty optional env keys are omitted.
  */
 import crypto from 'node:crypto'
 import { OFFICIAL_CLI_VERSION } from './vm-identity.mjs'
@@ -19,15 +20,16 @@ export const DEFAULT_PROCESS_RANGES = Object.freeze({
   external_range: [1_000_000, 3_000_000],
   array_buffers_range: [10_000, 50_000],
 })
-
 export const FULL_ENV_KEYS = Object.freeze([
   'platform',
   'platform_raw',
   'arch',
+  'node_version',
   'terminal',
   'shell',
   'package_managers',
   'runtimes',
+  'is_running_with_bun',
   'is_ci',
   'is_claubbit',
   'is_claude_code_remote',
@@ -37,9 +39,13 @@ export const FULL_ENV_KEYS = Object.freeze([
   'is_claude_code_action',
   'is_claude_ai_auth',
   'version',
-  'version_base',
   'build_time',
   'deployment_environment',
+])
+
+/** Written only when the value is non-empty. coworker_type is not on the 2.1.303 main path. */
+export const OPTIONAL_ENV_KEYS = Object.freeze([
+  'version_base',
   'vcs',
   'github_event_name',
   'github_actions_runner_environment',
@@ -50,24 +56,9 @@ export const FULL_ENV_KEYS = Object.freeze([
   'claude_code_container_id',
   'claude_code_remote_session_id',
   'tags',
-  'coworker_type',
   'linux_distro_id',
   'linux_distro_version',
   'linux_kernel',
-])
-
-export const HARDWARE_ENV_KEYS = Object.freeze([
-  'cpu_model',
-  'cpu_cores',
-  'memory_bytes',
-  'root_disk',
-  'mac',
-  'dmi_manufacturer',
-  'dmi_product',
-  'dmi_version',
-  'dmi_family',
-  'dmi_serial',
-  'dmi_uuid',
 ])
 
 function str(v) {
@@ -148,10 +139,12 @@ export function buildFullEnvJson(id = {}) {
     platform,
     platform_raw: str(id.platform_raw || platform),
     arch: str(id.arch || 'x64'),
+    node_version: str(id.node_version || 'v26.3.0'),
     terminal: str(id.terminal || 'unknown'),
     shell: telemetryShell(id.shell),
     package_managers: str(id.package_managers || ''),
     runtimes: str(id.runtimes) || 'node',
+    is_running_with_bun: true,
     is_ci: false,
     is_claubbit: false,
     is_claude_code_remote: false,
@@ -161,62 +154,23 @@ export function buildFullEnvJson(id = {}) {
     is_claude_code_action: false,
     is_claude_ai_auth: !!(id.account_uuid || id.is_claude_ai_auth),
     version,
+    build_time: str(id.build_time).trim() || '2026-10-18T20:20:57Z',
+    deployment_environment: str(
+      id.deployment_environment || (platform === 'linux' ? 'unknown-linux' : `unknown-${platform}`),
+    ),
+  }
+  const optional = {
     version_base: str(id.version_base || versionBase(version)),
-    deployment_environment: str(id.deployment_environment || (platform === 'linux' ? 'unknown-linux' : '')),
-    vcs: str(id.vcs) || 'git',
-    github_event_name: '',
-    github_actions_runner_environment: '',
-    github_actions_runner_os: '',
-    github_action_ref: '',
-    wsl_version: '',
-    remote_environment_type: '',
-    claude_code_container_id: '',
-    claude_code_remote_session_id: '',
-    tags: [],
-    coworker_type: '',
+    vcs: str(id.vcs),
     linux_distro_id: str(id.linux_distro_id || ''),
     linux_distro_version: str(id.linux_distro_version || ''),
     linux_kernel: str(id.linux_kernel || ''),
   }
-  const buildTime = str(id.build_time).trim()
-  if (buildTime) env.build_time = buildTime
-  applyHardwareEnv(env, id)
-  return env
-}
-
-function hardwareNumber(value) {
-  const n = typeof value === 'number' ? value : Number.parseInt(String(value ?? ''), 10)
-  return Number.isFinite(n) && n >= 0 ? n : null
-}
-
-/** Copy observed guest hardware into telemetry env. Empty facts stay omitted. */
-export function applyHardwareEnv(env, id = {}) {
-  const hw = id.hardware && typeof id.hardware === 'object' ? id.hardware : {}
-  const dmi = hw.dmi && typeof hw.dmi === 'object' ? hw.dmi : {}
-  const src = {
-    cpu_model: id.cpu_model ?? hw.cpu_model,
-    cpu_cores: id.cpu_cores ?? hw.cpu_cores,
-    memory_bytes: id.memory_bytes ?? hw.memory_bytes,
-    root_disk: id.root_disk ?? hw.root_disk,
-    mac: id.mac ?? hw.mac,
-    dmi_manufacturer: id.dmi_manufacturer ?? dmi.manufacturer,
-    dmi_product: id.dmi_product ?? dmi.product,
-    dmi_version: id.dmi_version ?? dmi.version,
-    dmi_family: id.dmi_family ?? dmi.family,
-    dmi_serial: id.dmi_serial ?? dmi.serial,
-    dmi_uuid: id.dmi_uuid ?? dmi.uuid,
+  for (const [key, value] of Object.entries(optional)) {
+    if (value) env[key] = value
   }
-  for (const key of HARDWARE_ENV_KEYS) {
-    const value = src[key]
-    if (value == null || value === '') continue
-    if (key === 'cpu_cores' || key === 'memory_bytes') {
-      const n = hardwareNumber(value)
-      if (n != null) env[key] = n
-      continue
-    }
-    const text = String(value).trim()
-    if (text) env[key] = text
-  }
+  const tags = Array.isArray(id.tags) ? id.tags.filter(Boolean) : []
+  if (tags.length) env.tags = tags
   return env
 }
 
@@ -235,6 +189,7 @@ export function buildProcessJson(proc = DEFAULT_PROCESS_RANGES, uptimeSecs = 0) 
       system: randomInRange(15_000, 150_000),
     },
     cpuPercent: 0.5 + Math.random() * 4.5,
+    cpuWindowMs: randomInRange(1000, 10_000),
   }
 }
 
@@ -273,9 +228,10 @@ export function buildEventData(id = {}, opts = {}) {
   }
   const device = officialDeviceID(id.user_id, id.device_id)
   if (device) data.device_id = device
-  if (id.email) data.email = id.email
   if (Object.keys(auth).length) data.auth = auth
   if (eventName !== 'tengu_init') {
+    const model = str(opts.model).trim()
+    if (model) data.model = model
     data.process = encodeProcessB64(id.process || DEFAULT_PROCESS_RANGES, opts.uptime_secs || 0)
   }
   return data
@@ -303,7 +259,6 @@ export function buildGrowthbookEval(id = {}) {
     userType: 'external',
     entrypoint: str(id.entrypoint || 'cli'),
   }
-  if (id.email) attrs.email = id.email
   if (id.account_uuid) attrs.accountUUID = id.account_uuid
   if (id.org_uuid || id.organization_uuid) attrs.organizationUUID = id.org_uuid || id.organization_uuid
   if (id.subscription_type) attrs.subscriptionType = id.subscription_type

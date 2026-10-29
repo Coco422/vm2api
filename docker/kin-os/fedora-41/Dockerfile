@@ -1,7 +1,8 @@
 FROM fedora:41
+COPY --from=node:22-bookworm-slim /usr/local/bin/node /usr/local/bin/node
 ENV LANG=C.UTF-8
 ENV PATH=/usr/local/lib/nodejs/current/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-RUN dnf install -y ca-certificates curl git tzdata python3 bash procps-ng \
+RUN dnf install -y ca-certificates curl git tzdata python3 bash procps-ng chromium xorg-x11-server-Xvfb xkeyboard-config \
  && dnf clean all \
  && groupadd -g 987 kincli \
  && useradd -u 999 -g 987 -d /home/kincli -m -s /bin/bash kincli \
