@@ -37,6 +37,7 @@ import {
 } from '@/features/proxies/proxy-tone'
 import { useLocalProxyLabelOpts } from '@/features/proxies/use-vps-ip'
 import { Field } from '@/features/vm/detail-section-primitives'
+import { EgressAuditCard } from '@/features/vm/egress-audit-card'
 import { proxyHealthOf } from '@/features/vm/proxy-health'
 
 type VmProxyTabProps = {
@@ -327,6 +328,9 @@ export function VmProxyTab(props: VmProxyTabProps) {
       ) : (
         <p className='text-sm text-muted-foreground'>池里没有可绑的空闲出口</p>
       )}
+      {canManage ? (
+        <EgressAuditCard key={vm.id} vmId={vm.id} proxyConfigured={!!boundId} />
+      ) : null}
     </TabsContent>
   )
 }

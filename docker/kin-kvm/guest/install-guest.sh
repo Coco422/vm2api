@@ -130,9 +130,49 @@ relax_selinux() {
   fi
 }
 
+ensure_audit_browser() {
+  command -v chromium >/dev/null 2>&1 && return 0
+  command -v chromium-browser >/dev/null 2>&1 && return 0
+  command -v google-chrome >/dev/null 2>&1 && return 0
+  case "${ID:-}" in
+    debian)
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y --no-install-recommends chromium
+      ;;
+    ubuntu)
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y --no-install-recommends ca-certificates curl
+      curl --fail --show-error --location --proto '=https' --tlsv1.2 https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -o /tmp/kin-audit-chrome.deb
+      apt-get install -y --no-install-recommends /tmp/kin-audit-chrome.deb
+      rm /tmp/kin-audit-chrome.deb
+      ;;
+    fedora) dnf install -y chromium ;;
+    arch) pacman -Sy --noconfirm --needed chromium ;;
+    *) return 1 ;;
+  esac
+}
+
+ensure_audit_node() {
+  if command -v node >/dev/null 2>&1 && node -e 'if (process.versions.bun || Number(process.versions.node.split(".")[0]) < 18) process.exit(1)' 2>/dev/null; then return 0; fi
+  case "${ID:-}" in
+    debian|ubuntu)
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update && apt-get install -y --no-install-recommends nodejs
+      ;;
+    fedora) dnf install -y nodejs ;;
+    arch) pacman -Sy --noconfirm --needed nodejs ;;
+    *) return 1 ;;
+  esac
+}
+
 install_files
 ensure_setpriv
 ensure_python
+# Diagnostic-only dependency. A download failure must not prevent a VM from booting.
+if ! ensure_audit_browser; then log "audit browser unavailable; environment checks will report browser_missing"; fi
+if ! ensure_audit_node; then log "audit Node unavailable; environment checks will report audit_node_missing"; fi
 ensure_ssh_root
 relax_selinux
 

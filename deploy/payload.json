@@ -1,12 +1,12 @@
 {
   "repo": "dofastted/vm2api",
-  "release": "payload-2026.10.19-kernel-cli",
+  "release": "payload-2026.10.28-kernel-agent-id",
   "files": [
     {
       "path": "bin/kin-kernel",
       "asset": "kin-kernel",
-      "size": 12892440,
-      "sha256": "8f1347ccffa6ac66d2a6625fded59ea2b9d46c3499f4f192d77cc0510a636a68"
+      "size": 12947192,
+      "sha256": "8a61aaa3cba06567a4c3b0039d357b341975e2495ec7fc7e8b5c3425cc53ec16"
     },
     {
       "path": "bin/kin-codex-kernel",
@@ -23,14 +23,32 @@
     {
       "path": "bin/kin-computer",
       "asset": "kin-computer",
-      "size": 5527768,
-      "sha256": "fa431f10321e6043ee88a4012b6dd8c515acac3a63fc40645091d1edf6334c01"
+      "size": 5531864,
+      "sha256": "a64970838469da0e3b86831212e8f6b0806e3433a65dd062f6556252403c2bb9"
+    },
+    {
+      "path": "bin/kin-worker",
+      "asset": "kin-worker",
+      "size": 16455001,
+      "sha256": "d6b29f1144cd389696fe11edd6b5a024499bfc598da6a9ac96a4c7a9f9d6071b"
+    },
+    {
+      "path": "bin/kin-egress",
+      "asset": "kin-egress",
+      "size": 9047621,
+      "sha256": "0bf1eeb0424fb341ad371fed1e40c39e68e940770222a0ac940d3340f3b4e277"
+    },
+    {
+      "path": "bin/kin-slot-gate",
+      "asset": "kin-slot-gate",
+      "size": 8120583,
+      "sha256": "78f78d59e4f61917aca202a384eb687488a8f511acfc41662d3877223431c859"
     },
     {
       "path": "share/wrap-cli/cli-node",
       "asset": "cli-node",
-      "size": 27174928,
-      "sha256": "b5054cb8494670354e61f3e0a0f7b2c3b768832c841140a4e22407fec24ab009"
+      "size": 27789668,
+      "sha256": "4975763790088a0eba226f20152b3c45261a0654b8bbc038701757b7699ab4e1"
     },
     {
       "path": "share/wrap-cli/cc-node",
@@ -41,8 +59,8 @@
     {
       "path": "share/wrap-cli/kin-kernel.bin",
       "asset": "kin-kernel",
-      "size": 12892440,
-      "sha256": "8f1347ccffa6ac66d2a6625fded59ea2b9d46c3499f4f192d77cc0510a636a68"
+      "size": 12947192,
+      "sha256": "8a61aaa3cba06567a4c3b0039d357b341975e2495ec7fc7e8b5c3425cc53ec16"
     },
     {
       "path": "share/wrap-cli/glibc239/ld-linux-x86-64.so.2",

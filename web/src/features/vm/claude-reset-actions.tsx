@@ -153,7 +153,7 @@ export function ClaudeResetActions({
     redeem,
     setConfirm,
   } = useClaudeResetActions(vm)
-  const canUse = useVmPerms().credential
+  const canUse = useVmPerms().resetCredits
   const held = (credits?.credits || []).reduce(
     (sum, credit) => sum + Math.max(0, Number(credit.resets_left) || 0),
     0

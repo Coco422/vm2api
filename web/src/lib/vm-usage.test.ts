@@ -74,3 +74,20 @@ describe('GPT vm-id usage rows are live when the slot has no uuid', () => {
     expect(usageAccountForVm(claude, [leftover])).toBeNull()
   })
 })
+
+describe('account rotation on the same VM', () => {
+  const vm = { id: 'vm-02', account_uuid: 'new-uuid' } as Vm
+  const old = { account_id: 'old-uuid', vm_id: 'vm-02', total_cost: 193 }
+
+  it('starts the new account at zero before its first request', () => {
+    expect(usageAccountForVm(vm, [old])).toBeNull()
+    expect(vmTotalCost(vm, [old])).toBe(0)
+  })
+
+  it('uses the new account even when the old account spent more', () => {
+    const current = { account_id: 'new-uuid', vm_id: 'vm-02', total_cost: 1 }
+    expect(usageAccountForVm(vm, [old, current])).toBe(current)
+    expect(vmTotalCost(vm, [old, current])).toBe(1)
+    expect(old.total_cost).toBe(193)
+  })
+})

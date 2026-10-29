@@ -3,6 +3,7 @@ import type { VmUsageStatsDay, VmUsageStatsRank } from '@/types/panel-vm'
 export type ApiKeyItem = {
   id: string
   name?: string
+  user_id?: string | null
   /** 旧字段别名。列表请用 `key_prefix` / `maskApiKeyItem()`。 */
   prefix?: string
   key_prefix?: string

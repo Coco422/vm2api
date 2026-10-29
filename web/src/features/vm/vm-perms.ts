@@ -17,7 +17,9 @@ export type VmPerms = {
   testModels: boolean
   /** oauth/*、导入凭证、额度刷新、重置券、诊断与恢复服务。 */
   credential: boolean
-  /** DELETE /vms/:id（租户只能删自己的，由后端判）。 */
+  /** 查询和使用当前 VM 的上游重置券；不授予凭证管理权限。 */
+  resetCredits: boolean
+  /** 删除 VM。 */
   remove: boolean
 }
 
@@ -29,6 +31,7 @@ const NONE: VmPerms = {
   test: false,
   testModels: false,
   credential: false,
+  resetCredits: false,
   remove: false,
 }
 
@@ -45,19 +48,11 @@ export function vmPermsFor(
       test: true,
       testModels: true,
       credential: true,
+      resetCredits: true,
       remove: true,
     }
   }
-  if (role === 'user') {
-    return {
-      ...NONE,
-      known: true,
-      power: true,
-      test: true,
-      credential: true,
-      remove: true,
-    }
-  }
+  if (role === 'user') return { ...NONE, known: true, resetCredits: true }
   if (role === 'super') return { ...NONE, known: true, dashboard: true }
   return NONE
 }
@@ -71,7 +66,8 @@ export type VmDetailTab =
   'overview' | 'account' | 'proxy' | 'test' | 'ops' | 'seed'
 
 export function vmDetailTabs(perms: VmPerms): VmDetailTab[] {
-  const tabs: VmDetailTab[] = ['overview', 'account', 'proxy']
+  const tabs: VmDetailTab[] = ['overview']
+  if (perms.admin || perms.dashboard) tabs.push('account', 'proxy')
   if (perms.test) tabs.push('test')
   if (perms.admin) tabs.push('ops', 'seed')
   return tabs

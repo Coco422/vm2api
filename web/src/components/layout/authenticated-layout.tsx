@@ -56,7 +56,8 @@ export function AuthenticatedLayout({
 function GuideGate() {
   const navigate = useNavigate()
   const onboarding = useQuery(onboardingQueryOptions())
-  const unused = onboarding.data?.guide_used === false
+  const unused =
+    onboarding.data?.role !== 'user' && onboarding.data?.guide_used === false
   useEffect(() => {
     if (!unused) return
     void navigate({ to: '/welcome', search: { setup: true }, replace: true })

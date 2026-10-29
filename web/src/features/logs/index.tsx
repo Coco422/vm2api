@@ -282,15 +282,17 @@ export function LogsPage() {
               </button>
             </CollapsibleTrigger>
             <div className='flex items-center gap-1'>
-              <Button
-                variant='outline'
-                size='sm'
-                className='h-8 gap-1.5 text-xs'
-                onClick={() => setExportOpen(true)}
-              >
-                <Download className='h-3.5 w-3.5' />
-                导出
-              </Button>
+              {isAdmin ? (
+                <Button
+                  variant='outline'
+                  size='sm'
+                  className='h-8 gap-1.5 text-xs'
+                  onClick={() => setExportOpen(true)}
+                >
+                  <Download className='h-3.5 w-3.5' />
+                  导出
+                </Button>
+              ) : null}
               <ColumnVisibilityDropdown
                 hidden={hiddenColumns}
                 onChange={(next) => {

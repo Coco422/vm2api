@@ -376,7 +376,7 @@ test('log coverage follows recorded prunes, not the oldest row or the current re
     const iso = (msAgo) => new Date(now - msAgo).toISOString()
     db.prepare("UPDATE schema_migrations SET applied_at = ? WHERE version = '001'").run(iso(30 * 86400_000))
     seed(repo, [
-      { created_at: iso(3 * 86400_000), vm_id: 'vm-a', account_id: 'acc-1', input_tokens: 1 },
+      { created_at: iso(3 * 86400_000), model: null },
       { created_at: iso(3600_000), vm_id: 'vm-a', account_id: 'acc-1', input_tokens: 1 },
     ])
     // Never pruned: a quiet stretch before the oldest row is still complete history.

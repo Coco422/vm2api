@@ -14,6 +14,19 @@ const draft: KeyLimitsDraft = {
 }
 
 describe('API key limit payload', () => {
+  it('assigns an employee only from the admin form, and keeps existing defaults when unspecified', () => {
+    expect(
+      keyLimitsPayload({ ...draft, user_id: ' employee-1 ' }, 'create', {
+        isAdmin: true,
+      }).user_id
+    ).toBe('employee-1')
+    expect(
+      keyLimitsPayload({ ...draft, user_id: 'employee-1' }, 'edit', {
+        isAdmin: false,
+      })
+    ).not.toHaveProperty('user_id')
+    expect(keyLimitsPayload(draft, 'edit')).not.toHaveProperty('user_id')
+  })
   it('keeps request and USD quotas separate', () => {
     expect(keyLimitsPayload(draft, 'create')).toEqual({
       name: 'ops',
@@ -26,6 +39,18 @@ describe('API key limit payload', () => {
       group_type: 'anthropic',
       allowed_vms: ['vm-01'],
     })
+  })
+
+  it('sends category only for admins', () => {
+    expect(keyLimitsPayload(draft, 'create', { isAdmin: true }).category).toBe(
+      'api'
+    )
+    expect(
+      keyLimitsPayload(draft, 'create', { isAdmin: false })
+    ).not.toHaveProperty('category')
+    expect(
+      keyLimitsPayload(draft, 'edit', { isAdmin: false })
+    ).not.toHaveProperty('category')
   })
 
   it('omits create-only fields from edits and rejects invalid quotas', () => {
