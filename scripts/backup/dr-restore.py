@@ -65,6 +65,15 @@ def prepare_live_root(root, *, overwrite=False):
     root.rename(previous)
     return str(previous)
 
+def restore_record(daily, role, *, allow_partial=False):
+    complete = daily / 'complete.json'
+    path = complete if complete.exists() else daily / 'run.json'
+    value = json.loads(path.read_text())
+    if value.get('tool') != TOOL: raise ValueError('Foreign restore set')
+    if value.get('status') != 'complete' and not allow_partial: raise ValueError('Daily set is not complete; review it before --allow-partial')
+    if role not in value.get('nodes', {}): raise ValueError('Requested node was not successfully backed up')
+    return value['nodes'][role]
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--daily', required=True, type=Path)
@@ -72,15 +81,14 @@ def main():
     parser.add_argument('--images', required=True, type=Path)
     parser.add_argument('--destination', type=Path)
     parser.add_argument('--apply', action='store_true')
+    parser.add_argument('--allow-partial', action='store_true', help='Use a verified successful node from an incomplete multi-node run')
     parser.add_argument('--confirm-live-target', action='store_true')
     parser.add_argument('--overwrite', action='store_true')
     parser.add_argument('--load-images', action='store_true')
     parser.add_argument('--start-control', action='store_true')
     parser.add_argument('--start-dependencies', action='store_true')
     args = parser.parse_args(); os.umask(0o077)
-    complete = json.loads((args.daily / 'complete.json').read_text())
-    if complete.get('tool') != TOOL or complete.get('status') != 'complete': raise ValueError('Daily set is not complete')
-    record = complete['nodes'][args.role]; archive = args.daily / record['file']
+    record = restore_record(args.daily, args.role, allow_partial=args.allow_partial); archive = args.daily / record['file']
     if sha256(archive) != record['sha256']: raise ValueError('Node archive checksum mismatch')
     manifest = verify_bundle(archive, args.role)
     destination = args.destination.resolve() if args.destination else None

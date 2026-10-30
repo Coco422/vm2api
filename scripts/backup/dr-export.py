@@ -121,6 +121,11 @@ def snapshot(config, dest):
             archive.add(stage, arcname='.', filter=preserve)
     return inv
 
+def release_alias(alias, *, created, original_tags):
+    # An untagged image in use cannot lose its only reference during backup cleanup.
+    if created and original_tags:
+        subprocess.run(['docker', 'image', 'rm', '--no-prune', alias], check=False, stdout=subprocess.DEVNULL)
+
 def stream(path, metadata):
     header = {'tool': TOOL, 'bytes': path.stat().st_size, 'sha256': sha256(path), **metadata}
     sys.stdout.buffer.write((json.dumps(header) + '\n').encode()); sys.stdout.buffer.flush()
@@ -160,7 +165,8 @@ def main():
                         assert source.wait() == 0 and compressor.returncode == 0
                     stream(archive, {'image_id': image_id, 'alias': alias})
                 finally:
-                    if created: subprocess.run(['docker', 'image', 'rm', '--no-prune', alias], check=True, stdout=subprocess.DEVNULL)
+                    release_alias(alias, created=created, original_tags=item['tags'])
+
 
 if __name__ == '__main__':
     main()

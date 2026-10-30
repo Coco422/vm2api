@@ -55,6 +55,12 @@ class Recovery(unittest.TestCase):
         self.assertEqual((restored / 'identity').read_text(), 'stable-machine-id')
         self.assertFalse((restored / 'run').exists() or (restored / 'escape').exists())
         self.assertIn('uid', next(x for x in files.values() if x.get('type') == 'directory'))
+    def test_image_cleanup_keeps_only_tag_for_running_image_and_never_forces_removal(self):
+        with patch.object(exporter.subprocess, 'run') as run:
+            exporter.release_alias('vm2api-dr:fixture', created=True, original_tags=[])
+            run.assert_not_called()
+            exporter.release_alias('vm2api-dr:fixture', created=True, original_tags=['app:production'])
+            self.assertNotIn('--force', run.call_args.args[0]); self.assertFalse(run.call_args.kwargs['check'])
     def test_guest_binary_directories_keep_executable_permissions_under_run(self):
         payload = self.root / 'run/slot-guest-bin'; payload.mkdir(parents=True); payload.chmod(0o755); (payload / 'worker').write_bytes(b'fake-binary'); (payload / 'worker').chmod(0o755)
         stage = self.root / 'export'; stage.mkdir(); files = {}; exporter.copy_path(payload, stage, files, include_runtime=True)
@@ -89,6 +95,12 @@ class Recovery(unittest.TestCase):
             with self.assertRaises(FileExistsError): module.prepare_live_root(root)
             previous = Path(module.prepare_live_root(root, overwrite=True))
         self.assertFalse(root.exists()); self.assertEqual((previous / 'kin.db-wal').read_text(), 'old-wal'); self.assertEqual((previous / 'kin.db').read_text(), 'old-db')
+    def test_latest_successful_node_is_recoverable_when_another_worker_failed(self):
+        module = load_script('dr-restore'); daily = self.root / 'partial'; daily.mkdir()
+        (daily / 'run.json').write_text(json.dumps({'tool':TOOL, 'status':'incomplete', 'nodes':{'control':{'file':'control.tar.gz'}}, 'errors':{'worker188':'ConnectionError'}}))
+        with self.assertRaises(ValueError): module.restore_record(daily, 'control')
+        self.assertEqual(module.restore_record(daily, 'control', allow_partial=True)['file'], 'control.tar.gz')
+        with self.assertRaises(ValueError): module.restore_record(daily, 'worker188', allow_partial=True)
     def test_pull_is_direct_and_ignores_user_ssh_jump_configuration(self):
         module = load_script('dr-pull')
         args = module.ssh_args({'known_hosts':'/known', 'identity_file':'/key', 'ssh_config':'/unwanted-jump'}, {'ssh':'root@host'}, 'snapshot')
