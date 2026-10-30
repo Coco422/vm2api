@@ -3,8 +3,11 @@
 from pathlib import Path
 from zoneinfo import ZoneInfo
 import argparse, datetime, fcntl, hashlib, json, os, shutil, subprocess, sys, uuid
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dr_common import TOOL, sha256, verify_bundle, prune_daily
+
+SSH_STARTUPS = threading.BoundedSemaphore(4)
 
 def now(): return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
@@ -14,13 +17,16 @@ def ssh_args(config, source, command):
 def receive_stream(config, source, command, target, log):
     partial = target.with_suffix(target.suffix + '.partial'); h = hashlib.sha256(); count = 0
     with log.open('ab') as errors, partial.open('wb') as output:
-        child = subprocess.Popen(ssh_args(config, source, command), stdout=subprocess.PIPE, stderr=errors)
+        child = None
         try:
-            header = child.stdout.readline(64 * 1024)
-            meta = json.loads(header)
-            if meta.get('tool') != TOOL: raise ValueError('Backup transport header mismatch')
-            if not isinstance(meta.get('bytes'), int) or not 0 < meta['bytes'] < 32 * 1024**3: raise ValueError('Backup transport size rejected')
-            if shutil.disk_usage(target.parent).free < meta['bytes'] + 512 * 1024**2: raise ValueError('Insufficient backup destination space')
+            # Bound simultaneous handshakes even when established transfers overlap.
+            with SSH_STARTUPS:
+                child = subprocess.Popen(ssh_args(config, source, command), stdout=subprocess.PIPE, stderr=errors)
+                header = child.stdout.readline(64 * 1024)
+                meta = json.loads(header)
+                if meta.get('tool') != TOOL: raise ValueError('Backup transport header mismatch')
+                if not isinstance(meta.get('bytes'), int) or not 0 < meta['bytes'] < 32 * 1024**3: raise ValueError('Backup transport size rejected')
+                if shutil.disk_usage(target.parent).free < meta['bytes'] + 512 * 1024**2: raise ValueError('Insufficient backup destination space')
             while chunk := child.stdout.read(4 * 1024 * 1024):
                 output.write(chunk); h.update(chunk); count += len(chunk)
                 if count > meta['bytes']: raise ValueError('Backup stream too large')
@@ -28,9 +34,10 @@ def receive_stream(config, source, command, target, log):
                 raise ValueError('Incomplete/corrupt backup transport')
             output.flush(); os.fsync(output.fileno())
         except BaseException:
-            if child.poll() is None: child.terminate(); child.wait()
+            if child is not None and child.poll() is None: child.terminate(); child.wait()
             raise
-        finally: child.stdout.close()
+        finally:
+            if child is not None: child.stdout.close()
     partial.replace(target); target.chmod(0o600)
     return meta
 
@@ -49,7 +56,7 @@ def validate_artifact_meta(meta):
 
 def receive_chunked(config, source, command, target, log):
     workers = source.get('chunk_workers', 1)
-    if type(workers) is not int or not 1 <= workers <= 8: raise ValueError('Invalid chunk concurrency')
+    if type(workers) is not int or not 1 <= workers <= 16: raise ValueError('Invalid chunk concurrency')
     receipt = target.with_suffix(target.suffix + '.transfer.json')
     if receipt.is_file():
         saved = json.loads(receipt.read_text())
@@ -144,6 +151,8 @@ def run(config, resume=None):
     result['status'] = 'complete'
     tools = stage / 'tools'; tools.mkdir(mode=0o700)
     for script in Path(__file__).parent.glob('dr*.py'): shutil.copy2(script, tools / script.name)
+    instructions = Path(__file__).with_name('DISASTER_RECOVERY.md')
+    if instructions.is_file(): shutil.copy2(instructions, tools / instructions.name)
     (stage / 'complete.json').write_text(json.dumps(result, indent=2) + '\n')
     final = root / 'daily' / str(today); retired = root / 'daily' / ('.retired-' + runid)
     if final.exists():

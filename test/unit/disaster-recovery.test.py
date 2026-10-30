@@ -164,10 +164,30 @@ class Recovery(unittest.TestCase):
         extra=self.root/'nginx.conf';extra.write_text('synthetic service configuration')
         config={'role':'worker23','root':str(app),'work':str(work),'extra_paths':[str(extra)],'recovery_links':[str(link)]}
         archive=self.root/'edge.tar.gz'
-        with patch.object(exporter,'inventory',return_value={'role':'worker23','containers':[]}),patch.object(exporter.Path,'home',return_value=self.root):
+        with patch.object(exporter,'inventory',return_value={'tool':TOOL,'role':'worker23','containers':[]}),patch.object(exporter.Path,'home',return_value=self.root):
             result=exporter.snapshot(config,archive)
+        verify_bundle(archive,'worker23')
         self.assertEqual(result['recovery_links'],{str(link):'../archive/cert1.pem'})
         self.assertIn('rootfs/'+str(cert).lstrip('/'),result['files']);self.assertNotIn('rootfs/'+str(link).lstrip('/'),result['files'])
         with tarfile.open(archive) as tar:self.assertFalse(any(x.issym() for x in tar))
+
+    def test_transport_start_failure_releases_handshake_capacity(self):
+        module=load_script('dr-pull');source={'ssh':'root@direct'};config={'known_hosts':'/known','identity_file':'/key'}
+        with patch.object(module.subprocess,'Popen',side_effect=OSError('fixture failed startup')):
+            with self.assertRaises(OSError):module.receive_stream(config,source,'snapshot',self.root/'target',self.root/'log')
+        acquired=[]
+        try:
+            for _ in range(4):acquired.append(module.SSH_STARTUPS.acquire(blocking=False))
+            self.assertTrue(all(acquired));self.assertFalse(module.SSH_STARTUPS.acquire(blocking=False))
+        finally:
+            for success in acquired:
+                if success:module.SSH_STARTUPS.release()
+
+    def test_transport_corruption_never_publishes_target(self):
+        from types import SimpleNamespace
+        module=load_script('dr-pull');meta={'tool':TOOL,'bytes':7,'sha256':'0'*64};child=SimpleNamespace(stdout=io.BytesIO((json.dumps(meta)+'\n').encode()+b'corrupt'),wait=lambda:0,poll=lambda:0)
+        with patch.object(module.subprocess,'Popen',return_value=child):
+            with self.assertRaises(ValueError):module.receive_stream({'known_hosts':'/known','identity_file':'/key'},{'ssh':'root@direct'},'snapshot',self.root/'target',self.root/'log')
+        self.assertFalse((self.root/'target').exists());self.assertTrue((self.root/'target.partial').exists())
 
 if __name__ == '__main__': unittest.main()
