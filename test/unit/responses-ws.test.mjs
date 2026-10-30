@@ -316,13 +316,20 @@ test('disabled gates reject the handshake with zero upstream hops', async () => 
       assert.equal(second.ok, false)
       assert.equal(second.status, 403)
       assert.equal(hops.length, 0)
-      const httpRes = await fetch(gptOff.httpUrl, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', authorization: 'Bearer sk-test' },
-        body: JSON.stringify({ model: 'gpt-5.4', input: 'hi' }),
+      const httpRes = await new Promise((resolve, reject) => {
+        const req = http.request(
+          gptOff.httpUrl,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', authorization: 'Bearer sk-test' },
+          },
+          resolve,
+        )
+        req.on('error', reject)
+        req.end(JSON.stringify({ model: 'gpt-5.4', input: 'hi' }))
       })
-      assert.equal(httpRes.status, 200)
-      assert.deepEqual(await httpRes.json(), { ok: true, transport: 'http' })
+      assert.equal(httpRes.statusCode, 200)
+      assert.deepEqual(await readJson(httpRes), { ok: true, transport: 'http' })
     } finally {
       await gptOff.close()
     }

@@ -11,15 +11,8 @@ import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
 import { loadConfig, reloadActiveVm, routingConfigFile } from './lib/core/config.mjs'
-import {
-  extractApiKey,
-  timingSafeEqualStr,
-  createRateLimiter,
-  verifyPanelSession,
-  extractPanelToken,
-  attachPanelAuth,
-  getPanelAdmin,
-} from './lib/core/security.mjs'
+import { createRateLimiter, attachPanelAuth, getPanelAdmin } from './lib/core/security.mjs'
+import { createRequestAuth } from './lib/core/request-auth.mjs'
 import { loadModelPolicy } from './lib/protocol/model-policy.mjs'
 import { gatewayModelCatalog } from './lib/protocol/models.mjs'
 import {
@@ -687,123 +680,13 @@ const { json, writeSSEHeaders, readBody, readRawBody } = createRespond(cfg, {
   tcpNodelay: () => routingConfig?.inference?.tcp_nodelay !== false,
 })
 
-function rejectAuth(req, res, error) {
-  req.authError = {
-    code: error?.body?.error?.code || ErrorCode.INVALID_API_KEY,
-    message: error?.body?.error?.message || 'Invalid credentials',
-    status: error?.status || 401,
-  }
-  json(res, error.status, error.body)
-  return false
-}
-
-function requireAuth(req, res) {
-  req.presentedApiKey = extractApiKey(req)
-  const token = extractPanelToken(req) || req.presentedApiKey
-  if (!token) {
-    return rejectAuth(
-      req,
-      res,
-      makeError({
-        type: ErrorType.AUTH,
-        code: ErrorCode.MISSING_API_KEY,
-        message: 'Missing credentials. Login at /api/panel/login or provide Authorization Bearer token.',
-        status: 401,
-      }),
-    )
-  }
-  // Panel session
-  const session = verifyPanelSession(token)
-  if (session) {
-    if (!allowRate('panel:' + session.user)) {
-      return rejectAuth(
-        req,
-        res,
-        makeError({
-          type: ErrorType.RATE_LIMIT,
-          code: ErrorCode.GATEWAY_RATE_LIMIT,
-          message: 'Gateway rate limit exceeded. Retry later.',
-          status: 429,
-        }),
-      )
-    }
-    req.panelUser = session.user
-    req.panelRole = session.role || panelUsers.getByUsername(session.user)?.role || 'user'
-    const rec = panelUsers.getByUsername(session.user)
-    req.panelUserId = rec?.id || null
-    req.panelVmCreateQuota = rec?.vm_create_quota ?? 0
-    return true
-  }
-  // Master env API key — unlimited admin
-  if (timingSafeEqualStr(token, cfg.api_key)) {
-    if (!allowRate(token)) {
-      return rejectAuth(
-        req,
-        res,
-        makeError({
-          type: ErrorType.RATE_LIMIT,
-          code: ErrorCode.GATEWAY_RATE_LIMIT,
-          message: 'Gateway rate limit exceeded. Retry later.',
-          status: 429,
-        }),
-      )
-    }
-    req.apiKeyKind = 'master'
-    req.panelRole = 'admin'
-    req.panelUser = 'master'
-    return true
-  }
-
-  // Managed multi-keys (sub2api-style)
-  const managed = apiKeyStore.authenticate(token)
-  if (!managed.ok) {
-    return rejectAuth(
-      req,
-      res,
-      makeError({
-        type: ErrorType.AUTH,
-        code: ErrorCode.INVALID_API_KEY,
-        message: 'Invalid credentials',
-        status: 401,
-      }),
-    )
-  }
-  const gate = apiKeyStore.canAccept(managed.record)
-  if (!gate.ok) {
-    const type =
-      gate.status === 429
-        ? gate.code.includes('quota')
-          ? ErrorType.QUOTA
-          : ErrorType.RATE_LIMIT
-        : ErrorType.PERMISSION
-    return rejectAuth(
-      req,
-      res,
-      makeError({
-        type,
-        code: gate.code,
-        message: gate.message,
-        status: gate.status,
-        details: gate.detail || undefined,
-      }),
-    )
-  }
-  if (!allowRate(token)) {
-    return rejectAuth(
-      req,
-      res,
-      makeError({
-        type: ErrorType.RATE_LIMIT,
-        code: ErrorCode.GATEWAY_RATE_LIMIT,
-        message: 'Gateway rate limit exceeded. Retry later.',
-        status: 429,
-      }),
-    )
-  }
-  req.apiKeyKind = 'managed'
-  req.apiKeyRecord = managed.record
-  return true
-}
+const { requireAuth, requireProtocolAuth } = createRequestAuth({
+  cfg,
+  apiKeyStore,
+  panelUsers,
+  allowRate,
+  json,
+})
 
 function fetchWorkerModels(opts) {
   return gatewayModelCatalog(opts)
@@ -834,7 +717,7 @@ const { handleProtocol, handleSearch, handleImages } = createHandleProtocol({
   json,
   writeSSEHeaders,
   readBody,
-  requireAuth,
+  requireAuth: requireProtocolAuth,
   cfg,
   requestLog,
   stickyRouter,
@@ -867,7 +750,7 @@ const { handleProtocol, handleSearch, handleImages } = createHandleProtocol({
 
 const responsesWs = createResponsesWsHandler({
   handleProtocol,
-  requireAuth,
+  requireAuth: requireProtocolAuth,
   json,
   getRouting: () => routingConfig,
   maxBodyBytes: cfg.limits.max_body_bytes,
@@ -1114,7 +997,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && p === '/v1/models') {
-      if (!requireAuth(req, res)) return
+      if (!requireProtocolAuth(req, res)) return
       if (resolveInferenceBackend(req) === 'api') {
         return json(res, 200, apiScheduler.catalog())
       }
@@ -1129,7 +1012,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && p === '/v1/usage') {
       return await handleUserUsage(req, res, {
         json,
-        requireAuth,
+        requireAuth: requireProtocolAuth,
         apiKeyStore,
         stickyRouter,
         accountQuota,
