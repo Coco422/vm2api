@@ -3,6 +3,7 @@ from unittest.mock import patch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.dont_write_bytecode = True
 sys.path.insert(0, str(ROOT / 'scripts/backup'))
 from dr_common import TOOL, extract_bundle, member_name, prune_daily, sha256, verify_bundle
 spec = importlib.util.spec_from_file_location('exporter', ROOT / 'scripts/backup/dr-export.py')
