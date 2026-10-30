@@ -34,6 +34,8 @@
 
 本定制分支沿用原生租户控制台：普通租户只读自己的 VM、Key 与用量，可自主使用上游重置券；VM、额度与并发由管理员管理。分配流程及生产维护见 [公司订阅管理扩展](docs/COMPANY_SUBSCRIPTIONS.md)。
 
+本实例的实际镜像、七台VM分配、本地工作目录和备份现状以 [当前生产部署状态](docs/PRODUCTION_STATUS.md) 的核验快照为准；主控或worker宕机时按 [189恢复手册](docs/DISASTER_RECOVERY.md) 操作。下文上游旧版本徽章和历史更新不代表本实例的当前运行版本。
+
 <br/>
 
 > [!NOTE]

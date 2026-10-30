@@ -4,6 +4,8 @@
 
 公司订阅定制实例使用自己的镜像，不能直接用下文上游安装器覆盖。普通租户使用原生用户名/密码登录，旧独立员工 API 已停用；定制发布、备份、回滚与上游合入流程见 [COMPANY_SUBSCRIPTIONS.md](COMPANY_SUBSCRIPTIONS.md)。
 
+定制生产实例每次部署结束前，必须同步更新 [PRODUCTION_STATUS.md](PRODUCTION_STATUS.md)：记录实际核验时间、运行镜像及业务提交、主机/VM与接单状态、最后成功备份及未完成事项，不以本地HEAD代替已部署版本。恢复步骤或依赖变化时同步更新 [DISASTER_RECOVERY.md](DISASTER_RECOVERY.md)，将两份文档提交到自有生产维护分支，并同步189的离线副本；回滚后也按实际运行状态更新。
+
 ## 机器
 
 Ubuntu 24.04 + Docker Engine。Debian 12 上槽内核常常起不来。
