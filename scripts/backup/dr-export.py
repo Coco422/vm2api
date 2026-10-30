@@ -101,6 +101,16 @@ def snapshot(config, dest):
         agent = Path(config['work']).parent
         for name in ['dr-export.py', 'dr_common.py', 'source.json']:
             copy_path(agent / name, stage, files)
+        for extra in config.get('extra_paths', []):
+            copy_path(Path(extra), stage, files)
+        # Only explicit administrator-selected edge links are resolved; VM data links
+        # still stay excluded. Restore links manually after reviewing the manifest.
+        inv['recovery_links'] = {}
+        for link in config.get('recovery_links', []):
+            path = Path(link)
+            if not path.is_symlink(): raise ValueError('Configured recovery link is no longer a link')
+            copy_path(path.resolve(strict=True), stage, files)
+            inv['recovery_links'][str(path)] = os.readlink(path)
         # Include vm2api-owned dependency configuration (e.g. the existing 188 Mihomo).
         # Docker sockets/devices/volumes are runtime dependencies, never copied as host data.
         for container in inv['containers']:
@@ -147,12 +157,48 @@ def stream(path, metadata):
         shutil.copyfileobj(payload, sys.stdout.buffer, 4 * 1024 * 1024)
     sys.stdout.buffer.flush()
 
+def publish_artifact(config, path, metadata):
+    """Expose only an exporter-created immutable blob, never a requested host path."""
+    digest = sha256(path); root = Path(config['work']) / 'artifacts'
+    root.mkdir(mode=0o700, exist_ok=True)
+    target = root / (digest + '.tar.gz')
+    if not target.exists():
+        try: os.link(path, target)
+        except OSError: shutil.copyfile(path, target)
+        target.chmod(0o600)
+    result = {'tool': TOOL, 'bytes': target.stat().st_size, 'sha256': digest, **metadata}
+    (root / (digest + '.json')).write_text(json.dumps(result) + '\n')
+    # Snapshots can be resumed for two days; immutable images remain in image_cache.
+    cutoff = datetime.datetime.now().timestamp() - 2 * 86400
+    for marker in root.glob('*.json'):
+        if marker.stem != digest and marker.stat().st_mtime < cutoff and re.fullmatch('[a-f0-9]{64}', marker.stem):
+            blob = marker.with_suffix('.tar.gz')
+            if blob.is_file() and not blob.is_symlink(): blob.unlink()
+            marker.unlink()
+    print(json.dumps(result), flush=True)
+
+def artifact_chunk(config, digest, offset, length):
+    if not re.fullmatch('[a-f0-9]{64}', digest) or offset < 0 or not 0 < length <= 8 * 1024**2:
+        raise ValueError('Invalid artifact range')
+    root = Path(config['work']) / 'artifacts'; path = root / (digest + '.tar.gz')
+    if path.is_symlink(): raise ValueError('Artifact link rejected')
+    meta = json.loads((root / (digest + '.json')).read_text())
+    if meta.get('tool') != TOOL or meta.get('sha256') != digest or path.stat().st_size != meta['bytes'] or offset + length > meta['bytes']:
+        raise ValueError('Unknown artifact or invalid range')
+    with path.open('rb') as payload: payload.seek(offset); body = payload.read(length)
+    if len(body) != length: raise ValueError('Artifact changed during read')
+    header = {'tool': TOOL, 'bytes': length, 'sha256': hashlib.sha256(body).hexdigest(), 'artifact': digest, 'offset': offset}
+    sys.stdout.buffer.write((json.dumps(header) + '\n').encode() + body); sys.stdout.buffer.flush()
+
 def main():
     parser = argparse.ArgumentParser(); parser.add_argument('--config', required=True); args = parser.parse_args()
     config = json.loads(Path(args.config).read_text()); work = Path(config['work']); work.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.umask(0o077); os.nice(10)
     original = os.environ.get('SSH_ORIGINAL_COMMAND', '')
-    if original not in {'inventory', 'snapshot'} and not re.fullmatch(r'image sha256:[a-f0-9]{64}', original):
+    chunk = re.fullmatch(r'chunk ([a-f0-9]{64}) ([0-9]{1,12}) ([0-9]{1,8})', original)
+    if chunk:
+        artifact_chunk(config, chunk[1], int(chunk[2]), int(chunk[3])); return
+    if original not in {'inventory', 'snapshot', 'snapshot-info'} and not re.fullmatch(r'image(?:-info)? sha256:[a-f0-9]{64}', original):
         raise SystemExit('Unsupported backup command')
     with (work / 'export.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -163,14 +209,18 @@ def main():
             print(json.dumps(safe)); return
         with tempfile.TemporaryDirectory(prefix='export-', dir=work) as tmp:
             archive = Path(tmp) / 'payload.tar.gz'
-            if original == 'snapshot':
-                result = snapshot(config, archive); stream(archive, {'role': config['role'], 'captured_at': result['capture_finished_at']})
+            metadata_only = original == 'snapshot-info' or original.startswith('image-info ')
+            def emit(path, metadata):
+                if metadata_only: publish_artifact(config, path, metadata)
+                else: stream(path, metadata)
+            if original in {'snapshot', 'snapshot-info'}:
+                result = snapshot(config, archive); emit(archive, {'role': config['role'], 'captured_at': result['capture_finished_at']})
             else:
                 image_id = original.split()[1]; item = next((i for i in inv['images'] if i['id'] == image_id), None)
                 if not item: raise SystemExit('Image is not part of vm2api recovery inventory')
                 cached = cached_image(config, image_id)
                 if cached:
-                    stream(cached, {'image_id': image_id, 'alias': item['alias']}); return
+                    emit(cached, {'image_id': image_id, 'alias': item['alias']}); return
                 alias = item['alias']; prior = subprocess.run(['docker', 'image', 'inspect', alias], capture_output=True, text=True)
                 if prior.returncode == 0 and json.loads(prior.stdout)[0]['Id'] != image_id: raise SystemExit('Recovery alias collision')
                 created = prior.returncode != 0
@@ -180,7 +230,7 @@ def main():
                         source = subprocess.Popen(['docker', 'image', 'save', alias], stdout=subprocess.PIPE)
                         compressor = subprocess.run(['gzip', '-1'], stdin=source.stdout, stdout=output); source.stdout.close()
                         assert source.wait() == 0 and compressor.returncode == 0
-                    stream(archive, {'image_id': image_id, 'alias': alias})
+                    emit(archive, {'image_id': image_id, 'alias': alias})
                 finally:
                     release_alias(alias, created=created, original_tags=item['tags'])
 

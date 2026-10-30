@@ -113,4 +113,61 @@ class Recovery(unittest.TestCase):
         args = module.ssh_args({'known_hosts':'/known', 'identity_file':'/key', 'ssh_config':'/unwanted-jump'}, {'ssh':'root@host'}, 'snapshot')
         self.assertEqual(args[1:3], ['-F','/dev/null']); self.assertNotIn('/unwanted-jump',args)
 
+    def test_chunk_transfer_resumes_verified_parts_and_rejects_corrupt_cache(self):
+        module = load_script('dr-pull'); blob = os.urandom(5 * 1024**2)
+        import hashlib
+        meta = {'tool':TOOL,'sha256':hashlib.sha256(blob).hexdigest(),'bytes':len(blob),'role':'worker188'}
+        source = {'ssh':'root@direct-source','chunk_workers':1}; target = self.root/'worker188.tar.gz'; log = self.root/'log'; calls=[]
+        def receive(config, source, command, dest, log):
+            _,digest,offset,size=command.split();offset=int(offset);size=int(size);calls.append(offset)
+            if offset >= 2*1024**2: raise OSError('fixture interrupted connection')
+            data=blob[offset:offset+size];dest.write_bytes(data)
+            return {'tool':TOOL,'artifact':digest,'offset':offset,'bytes':size,'sha256':hashlib.sha256(data).hexdigest()}
+        with patch.object(module,'artifact_info',return_value=meta),patch.object(module,'receive_stream',side_effect=receive):
+            with self.assertRaises(OSError): module.receive_chunked({},source,'snapshot',target,log)
+        parts=self.root/('.chunks-'+meta['sha256']);self.assertTrue((parts/'0').exists())
+        (parts/'0').write_bytes(b'corrupt cached part');calls.clear()
+        def finish(config, source, command, dest, log):
+            _,digest,offset,size=command.split();offset=int(offset);size=int(size);calls.append(offset);data=blob[offset:offset+size];dest.write_bytes(data)
+            return {'tool':TOOL,'artifact':digest,'offset':offset,'bytes':size,'sha256':hashlib.sha256(data).hexdigest()}
+        with patch.object(module,'artifact_info') as info,patch.object(module,'receive_stream',side_effect=finish):
+            module.receive_chunked({},source,'snapshot',target,log);info.assert_not_called()
+        self.assertIn(0,calls);self.assertEqual(target.read_bytes(),blob);self.assertFalse(parts.exists())
+
+    def test_chunk_transfer_skips_valid_parts_and_refuses_bad_metadata(self):
+        module=load_script('dr-pull');blob=b'fixture';import hashlib
+        digest=hashlib.sha256(blob).hexdigest();meta={'tool':TOOL,'sha256':digest,'bytes':len(blob)}
+        source={'ssh':'root@direct','chunk_workers':2};target=self.root/'image.tar.gz';parts=self.root/('.chunks-'+digest);parts.mkdir();(parts/'0').write_bytes(blob)
+        (parts/'0.json').write_text(json.dumps({'artifact':digest,'offset':0,'bytes':len(blob),'sha256':digest}))
+        with patch.object(module,'artifact_info',return_value=meta),patch.object(module,'receive_stream') as receive:
+            module.receive_chunked({},source,'image sha256:'+digest,target,self.root/'log');receive.assert_not_called()
+        with self.assertRaises(ValueError):module.validate_artifact_meta({'tool':TOOL,'sha256':'../../escape','bytes':10})
+        with self.assertRaises(ValueError):module.validate_artifact_meta({'tool':TOOL,'sha256':digest,'bytes':-1})
+
+    def test_export_chunk_only_reads_registered_blob_with_bounded_range(self):
+        import hashlib
+        work=self.root/'work';artifacts=work/'artifacts';artifacts.mkdir(parents=True);blob=b'private registered fixture';digest=hashlib.sha256(blob).hexdigest()
+        (artifacts/(digest+'.tar.gz')).write_bytes(blob);(artifacts/(digest+'.json')).write_text(json.dumps({'tool':TOOL,'sha256':digest,'bytes':len(blob)}))
+        output=type('BinaryOutput',(),{'buffer':io.BytesIO()})()
+        with patch.object(exporter.sys,'stdout',output):exporter.artifact_chunk({'work':str(work)},digest,2,5)
+        header,data=output.buffer.getvalue().split(b'\n',1);self.assertEqual(data,blob[2:7]);self.assertEqual(json.loads(header)['sha256'],hashlib.sha256(data).hexdigest())
+        for offset,length in [(-1,1),(0,9*1024**2),(len(blob),1)]:
+            with self.assertRaises(ValueError):exporter.artifact_chunk({'work':str(work)},digest,offset,length)
+        with self.assertRaises(ValueError):exporter.artifact_chunk({'work':str(work)},'../../escape',0,1)
+        (artifacts/(digest+'.tar.gz')).unlink();(artifacts/(digest+'.tar.gz')).symlink_to('/etc/passwd')
+        with self.assertRaises(ValueError):exporter.artifact_chunk({'work':str(work)},digest,0,1)
+
+    def test_edge_links_are_recorded_and_only_explicit_targets_are_copied(self):
+        app=self.root/'app';app.mkdir();work=self.root/'agent/tmp';work.mkdir(parents=True)
+        cert=self.root/'archive/cert1.pem';cert.parent.mkdir();cert.write_bytes(b'synthetic certificate')
+        link=self.root/'live/cert.pem';link.parent.mkdir();link.symlink_to('../archive/cert1.pem')
+        extra=self.root/'nginx.conf';extra.write_text('synthetic service configuration')
+        config={'role':'worker23','root':str(app),'work':str(work),'extra_paths':[str(extra)],'recovery_links':[str(link)]}
+        archive=self.root/'edge.tar.gz'
+        with patch.object(exporter,'inventory',return_value={'role':'worker23','containers':[]}),patch.object(exporter.Path,'home',return_value=self.root):
+            result=exporter.snapshot(config,archive)
+        self.assertEqual(result['recovery_links'],{str(link):'../archive/cert1.pem'})
+        self.assertIn('rootfs/'+str(cert).lstrip('/'),result['files']);self.assertNotIn('rootfs/'+str(link).lstrip('/'),result['files'])
+        with tarfile.open(archive) as tar:self.assertFalse(any(x.issym() for x in tar))
+
 if __name__ == '__main__': unittest.main()

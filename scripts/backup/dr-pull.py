@@ -3,6 +3,7 @@
 from pathlib import Path
 from zoneinfo import ZoneInfo
 import argparse, datetime, fcntl, hashlib, json, os, shutil, subprocess, sys, uuid
+from concurrent.futures import ThreadPoolExecutor
 from dr_common import TOOL, sha256, verify_bundle, prune_daily
 
 def now(): return datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -10,7 +11,7 @@ def now(): return datetime.datetime.now(datetime.timezone.utc).isoformat()
 def ssh_args(config, source, command):
     return ['ssh', '-F', '/dev/null', '-T', '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'UserKnownHostsFile=' + config['known_hosts'], '-o', 'ConnectTimeout=20', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=4', '-i', config['identity_file'], source['ssh'], command]
 
-def receive(config, source, command, target, log):
+def receive_stream(config, source, command, target, log):
     partial = target.with_suffix(target.suffix + '.partial'); h = hashlib.sha256(); count = 0
     with log.open('ab') as errors, partial.open('wb') as output:
         child = subprocess.Popen(ssh_args(config, source, command), stdout=subprocess.PIPE, stderr=errors)
@@ -33,17 +34,90 @@ def receive(config, source, command, target, log):
     partial.replace(target); target.chmod(0o600)
     return meta
 
-def run(config):
+def artifact_info(config, source, command, log):
+    with log.open('ab') as errors:
+        child = subprocess.run(ssh_args(config, source, command), stdout=subprocess.PIPE, stderr=errors, timeout=600, check=True)
+    if len(child.stdout) > 65536: raise ValueError('Artifact header too large')
+    return validate_artifact_meta(json.loads(child.stdout))
+
+def validate_artifact_meta(meta):
+    if meta.get('tool') != TOOL or not isinstance(meta.get('bytes'), int) or not 0 < meta['bytes'] < 32 * 1024**3:
+        raise ValueError('Artifact metadata rejected')
+    digest = meta.get('sha256', '')
+    if len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest): raise ValueError('Artifact digest rejected')
+    return meta
+
+def receive_chunked(config, source, command, target, log):
+    workers = source.get('chunk_workers', 1)
+    if type(workers) is not int or not 1 <= workers <= 8: raise ValueError('Invalid chunk concurrency')
+    receipt = target.with_suffix(target.suffix + '.transfer.json')
+    if receipt.is_file():
+        saved = json.loads(receipt.read_text())
+        if saved.get('command') != command or saved.get('ssh') != source['ssh']: raise ValueError('Transfer receipt mismatch')
+        meta = saved['meta']
+    else:
+        info_command = 'snapshot-info' if command == 'snapshot' else command.replace('image ', 'image-info ', 1)
+        meta = artifact_info(config, source, info_command, log)
+        receipt.write_text(json.dumps({'command': command, 'ssh': source['ssh'], 'meta': meta}) + '\n')
+    meta = validate_artifact_meta(meta)
+    digest = meta['sha256']; parts = target.parent / ('.chunks-' + digest); parts.mkdir(mode=0o700, exist_ok=True)
+    if parts.is_symlink(): raise ValueError('Chunk destination link rejected')
+    if shutil.disk_usage(target.parent).free < meta['bytes'] * 2 + 512 * 1024**2: raise ValueError('Insufficient chunk staging space')
+    chunk_size = 2 * 1024**2
+    def part(offset):
+        size = min(chunk_size, meta['bytes'] - offset); dest = parts / str(offset); proof = parts / (str(offset) + '.json')
+        if dest.is_file() and proof.is_file():
+            check = json.loads(proof.read_text())
+            if check.get('artifact') == digest and check.get('offset') == offset and check.get('bytes') == size and dest.stat().st_size == size and sha256(dest) == check.get('sha256'):
+                return
+        for attempt in range(3):
+            try:
+                check = receive_stream(config, source, f'chunk {digest} {offset} {size}', dest, log)
+                if check.get('artifact') != digest or check.get('offset') != offset or check['bytes'] != size: raise ValueError('Chunk identity mismatch')
+                proof.write_text(json.dumps(check) + '\n'); return
+            except (OSError, ValueError, subprocess.SubprocessError):
+                if attempt == 2: raise
+    offsets = range(0, meta['bytes'], chunk_size)
+    with ThreadPoolExecutor(max_workers=workers) as pool: list(pool.map(part, offsets))
+    partial = target.with_suffix(target.suffix + '.partial')
+    with partial.open('wb') as output:
+        for offset in offsets:
+            with (parts / str(offset)).open('rb') as stream: shutil.copyfileobj(stream, output, 4 * 1024**2)
+        output.flush(); os.fsync(output.fileno())
+    if partial.stat().st_size != meta['bytes'] or sha256(partial) != digest: raise ValueError('Assembled artifact checksum mismatch')
+    partial.replace(target); target.chmod(0o600); shutil.rmtree(parts); receipt.unlink()
+    return meta
+
+def receive(config, source, command, target, log):
+    return receive_chunked(config, source, command, target, log) if source.get('chunk_workers') else receive_stream(config, source, command, target, log)
+
+def run(config, resume=None):
     root = Path(config['destination']); marker = root / '.vm2api-dr-owner.json'
     if json.loads(marker.read_text()).get('tool') != TOOL: raise ValueError('Destination owner marker mismatch')
     today = datetime.datetime.now(ZoneInfo('Asia/Shanghai')).date(); stamp = now(); runid = uuid.uuid4().hex[:12]
-    stage = root / 'daily' / ('.partial-' + str(today) + '-' + runid); stage.mkdir(mode=0o700)
+    if resume:
+        stage = Path(resume)
+        if stage.is_symlink() or stage.resolve().parent != (root / 'daily').resolve() or not stage.name.startswith('.partial-'):
+            raise ValueError('Resume directory is outside owned staging area')
+        owner = json.loads((stage / 'transfer-owner.json').read_text())
+        if owner.get('tool') != TOOL or owner.get('date') != str(today): raise ValueError('Only resume today\'s owned transfer')
+    else:
+        stage = root / 'daily' / ('.partial-' + str(today) + '-' + runid); stage.mkdir(mode=0o700)
+        (stage / 'transfer-owner.json').write_text(json.dumps({'tool': TOOL, 'date': str(today)}) + '\n')
     result = {'tool': TOOL, 'started_at': stamp, 'date': str(today), 'status': 'incomplete', 'nodes': {}, 'errors': {}}
     images = root / 'images'; images.mkdir(exist_ok=True, mode=0o700)
     for source in config['sources']:
         role = source['role']; log = root / 'logs' / (str(today) + '-' + role + '.log')
         try:
-            dest = stage / (role + '.tar.gz'); meta = receive(config, source, 'snapshot', dest, log)
+            dest = stage / (role + '.tar.gz'); receipt = stage / (role + '.verified.json')
+            if dest.is_file() and receipt.is_file():
+                meta = json.loads(receipt.read_text())
+                if meta.get('tool') != TOOL or meta.get('role') != role or dest.stat().st_size != meta['bytes'] or sha256(dest) != meta['sha256']:
+                    raise ValueError('Resumed node archive mismatch')
+            else:
+                meta = receive(config, source, 'snapshot', dest, log)
+                if meta.get('role') != role: raise ValueError('Snapshot transport role mismatch')
+                receipt.write_text(json.dumps(meta) + '\n')
             manifest = verify_bundle(dest, role); image_records = []
             for image in manifest['images']:
                 key = image['id'].split(':')[1]
@@ -62,6 +136,7 @@ def run(config):
         except Exception as error:
             # Preserve other nodes even when a machine is down; do not rotate the last complete set.
             result['errors'][role] = type(error).__name__
+        (stage / 'run.json').write_text(json.dumps(result, indent=2) + '\n')
     result['finished_at'] = now()
     (stage / 'run.json').write_text(json.dumps(result, indent=2) + '\n')
     if result['errors']:
@@ -94,10 +169,10 @@ def run(config):
     (root / 'status.json').write_text(json.dumps(status, indent=2) + '\n'); print(json.dumps(status), flush=True)
 
 def main():
-    parser = argparse.ArgumentParser(); parser.add_argument('--config', required=True); args = parser.parse_args()
+    parser = argparse.ArgumentParser(); parser.add_argument('--config', required=True); parser.add_argument('--resume'); args = parser.parse_args()
     os.umask(0o077); config = json.loads(Path(args.config).read_text()); root = Path(config['destination'])
     with (root / 'pull.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        run(config)
+        run(config, args.resume)
 
 if __name__ == '__main__': main()
