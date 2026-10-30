@@ -19,7 +19,7 @@ python3 /data2/vm2api-bak/bin/dr-pull.py --config /data2/vm2api-bak/config/pull.
 cat /data2/vm2api-bak/status.json
 ```
 
-`pull.json` 中的三个目标必须通过正常路由直连TCP22。若旁路由接管了出网，应对这三个目标设DIRECT；不能用未验证的跨网段网关强行替换189默认网关。不要为备份重启Docker或调整其他项目网络。
+`pull.json` 中的三个目标通过正常路由直连TCP22。当前189仅为这三个地址设置经192.168.1.1、enp6s18的/32直连路由，已验证ARP和真实SSH；默认网关192.168.100.254保持。NetworkManager的 `/etc/NetworkManager/dispatcher.d/90-vm2api-backup-direct` 在接口上线后重建三条路由；不依赖Docker启动，不使用ProxyJump。局域网或网卡变更时应先验证再更新此受限脚本，不要强行替换默认网关。源端可通过 `image_cache` 复用已校验的不可变镜像归档，缓存损坏或无匹配摘要时回退到重新导出。
 
 ## 先验证，再恢复
 

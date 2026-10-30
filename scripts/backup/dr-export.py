@@ -121,6 +121,20 @@ def snapshot(config, dest):
             archive.add(stage, arcname='.', filter=preserve)
     return inv
 
+def cached_image(config, image_id):
+    """Reuse an existing immutable, verified source-side archive when available."""
+    if not config.get('image_cache'): return None
+    root = Path(config['image_cache'])
+    try:
+        marker = json.loads((root / 'complete.json').read_text())
+        if marker.get('tool') != TOOL: return None
+        item = next((x for x in marker.get('images', []) if x['id'] == image_id), None)
+        if not item: return None
+        archive = root / (image_id.split(':')[1] + '.tar.gz')
+        if archive.is_symlink() or archive.stat().st_size != item['bytes'] or sha256(archive) != item['sha256']: return None
+        return archive
+    except (OSError, ValueError, KeyError, IndexError): return None
+
 def release_alias(alias, *, created, original_tags):
     # An untagged image in use cannot lose its only reference during backup cleanup.
     if created and original_tags:
@@ -154,6 +168,9 @@ def main():
             else:
                 image_id = original.split()[1]; item = next((i for i in inv['images'] if i['id'] == image_id), None)
                 if not item: raise SystemExit('Image is not part of vm2api recovery inventory')
+                cached = cached_image(config, image_id)
+                if cached:
+                    stream(cached, {'image_id': image_id, 'alias': item['alias']}); return
                 alias = item['alias']; prior = subprocess.run(['docker', 'image', 'inspect', alias], capture_output=True, text=True)
                 if prior.returncode == 0 and json.loads(prior.stdout)[0]['Id'] != image_id: raise SystemExit('Recovery alias collision')
                 created = prior.returncode != 0

@@ -56,6 +56,12 @@ class Recovery(unittest.TestCase):
         self.assertEqual((restored / 'identity').read_text(), 'stable-machine-id')
         self.assertFalse((restored / 'run').exists() or (restored / 'escape').exists())
         self.assertIn('uid', next(x for x in files.values() if x.get('type') == 'directory'))
+    def test_image_cache_requires_matching_identity_size_and_checksum(self):
+        cache = self.root / 'cache'; cache.mkdir(); image_id = 'sha256:' + 'a'*64; archive = cache / ('a'*64 + '.tar.gz'); archive.write_bytes(b'synthetic immutable image archive')
+        marker = {'tool':TOOL, 'images':[{'id':image_id, 'bytes':archive.stat().st_size, 'sha256':sha256(archive)}]}; (cache / 'complete.json').write_text(json.dumps(marker))
+        self.assertEqual(exporter.cached_image({'image_cache':str(cache)}, image_id), archive)
+        self.assertIsNone(exporter.cached_image({'image_cache':str(cache)}, 'sha256:' + 'b'*64))
+        archive.write_bytes(b'corrupt'); self.assertIsNone(exporter.cached_image({'image_cache':str(cache)}, image_id))
     def test_image_cleanup_keeps_only_tag_for_running_image_and_never_forces_removal(self):
         with patch.object(exporter.subprocess, 'run') as run:
             exporter.release_alias('vm2api-dr:fixture', created=True, original_tags=[])
