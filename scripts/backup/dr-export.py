@@ -42,20 +42,20 @@ def inventory(config):
         images.append({'id': item['Id'], 'tags': item.get('RepoTags') or [], 'alias': 'vm2api-dr:' + item['Id'].split(':')[1], 'bytes': item['Size'], 'projection': image_projection(item)})
     return {'tool': TOOL, 'role': config['role'], 'node_id': config.get('node_id'), 'root': config['root'], 'captured_at': now(), 'images': images, 'containers': containers, 'source_uid': os.getuid()}
 
-def copy_path(source, staging, manifest):
+def copy_path(source, staging, manifest, *, include_runtime=False):
     """Copy regular persisted data without following links, sockets or runtime caches."""
     source = Path(source)
     if not source.exists() or source.is_symlink():
         return
     parts = source.parts
-    if any(part in SKIP_DIRS for part in parts):
+    if not include_runtime and any(part in SKIP_DIRS for part in parts):
         return
     if source.is_dir():
         info = source.stat(); name = 'rootfs/' + str(source).lstrip('/')
         dest = staging / name; dest.mkdir(parents=True, exist_ok=True, mode=0o700)
         manifest[name] = {'type': 'directory', 'mode': stat.S_IMODE(info.st_mode), 'uid': info.st_uid, 'gid': info.st_gid}
         for child in sorted(source.iterdir()):
-            copy_path(child, staging, manifest)
+            copy_path(child, staging, manifest, include_runtime=include_runtime)
         return
     info = source.stat()
     if not stat.S_ISREG(info.st_mode) or source.name.endswith(('-wal', '-shm', '.lock')):
@@ -81,8 +81,9 @@ def snapshot(config, dest):
             with sqlite3.connect('file:' + str(target) + '?mode=ro', uri=True) as db:
                 assert db.execute('PRAGMA quick_check').fetchone()[0] == 'ok'
                 inv['database'] = {'usage_rows': db.execute('SELECT COUNT(*) FROM usage_logs').fetchone()[0], 'vm_rows': db.execute('SELECT COUNT(*) FROM vms').fetchone()[0], 'user_rows': db.execute('SELECT COUNT(*) FROM users WHERE deleted_at IS NULL').fetchone()[0]}
-            target.chmod(0o600)
-            files[str(target.relative_to(stage))] = {'sha256': sha256(target), 'bytes': target.stat().st_size, 'mode': 0o600, 'uid': os.getuid(), 'gid': os.getgid()}
+            original = (root / 'data/kin.db').stat(); mode = stat.S_IMODE(original.st_mode)
+            target.chmod(mode)
+            files[str(target.relative_to(stage))] = {'sha256': sha256(target), 'bytes': target.stat().st_size, 'mode': mode, 'uid': original.st_uid, 'gid': original.st_gid}
             for name in ['.env', 'docker-compose.yml', 'src/config', 'vms', 'bin', 'share']:
                 copy_path(root / name, stage, files)
             data = root / 'data'
@@ -91,11 +92,7 @@ def snapshot(config, dest):
                     copy_path(child, stage, files)
             # `run` normally contains sockets; its shared binary directory is durable payload.
             payload = data / 'run/slot-guest-bin'
-            if payload.is_dir():
-                for entry in payload.rglob('*'):
-                    if entry.is_file() and not entry.is_symlink():
-                        name = 'rootfs/' + str(entry).lstrip('/'); destfile = stage / name; destfile.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(entry, destfile); st = entry.stat()
-                        files[name] = {'sha256': sha256(destfile), 'bytes': st.st_size, 'mode': stat.S_IMODE(st.st_mode), 'uid': st.st_uid, 'gid': st.st_gid}
+            copy_path(payload, stage, files, include_runtime=True)
         else:
             for name in ['vms', 'guest-bin', 'bin', 'share']:
                 copy_path(root / name, stage, files)

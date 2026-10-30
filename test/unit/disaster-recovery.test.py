@@ -55,6 +55,11 @@ class Recovery(unittest.TestCase):
         self.assertEqual((restored / 'identity').read_text(), 'stable-machine-id')
         self.assertFalse((restored / 'run').exists() or (restored / 'escape').exists())
         self.assertIn('uid', next(x for x in files.values() if x.get('type') == 'directory'))
+    def test_guest_binary_directories_keep_executable_permissions_under_run(self):
+        payload = self.root / 'run/slot-guest-bin'; payload.mkdir(parents=True); payload.chmod(0o755); (payload / 'worker').write_bytes(b'fake-binary'); (payload / 'worker').chmod(0o755)
+        stage = self.root / 'export'; stage.mkdir(); files = {}; exporter.copy_path(payload, stage, files, include_runtime=True)
+        key = 'rootfs/' + str(payload).lstrip('/')
+        self.assertEqual(files[key]['type'], 'directory'); self.assertEqual(files[key]['mode'], 0o755); self.assertEqual(files[key + '/worker']['mode'], 0o755)
     def test_online_sqlite_snapshot_includes_committed_wal_without_stopping_writer(self):
         live = self.root / 'live.db'; writer = sqlite3.connect(live); writer.execute('PRAGMA journal_mode=WAL'); writer.execute('CREATE TABLE usage(id INTEGER, cost REAL)'); writer.execute('INSERT INTO usage VALUES(1,7)'); writer.commit()
         with sqlite3.connect('file:' + str(live) + '?mode=ro', uri=True) as db: db.execute('VACUUM INTO ?', (str(self.root / 'copy.db'),))
