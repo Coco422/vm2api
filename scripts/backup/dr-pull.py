@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dr_common import TOOL, sha256, verify_bundle, prune_daily
 
 SSH_STARTUPS = threading.BoundedSemaphore(4)
+CHUNK_TIMEOUT_SECONDS = 180
 
 def now(): return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
@@ -17,17 +18,19 @@ def ssh_args(config, source, command):
 def receive_stream(config, source, command, target, log):
     partial = target.with_suffix(target.suffix + '.partial'); h = hashlib.sha256(); count = 0
     with log.open('ab') as errors, partial.open('wb') as output:
-        child = None
+        child = None; deadline = None
         try:
             # Bound simultaneous handshakes even when established transfers overlap.
             with SSH_STARTUPS:
                 child = subprocess.Popen(ssh_args(config, source, command), stdout=subprocess.PIPE, stderr=errors)
+                if command.startswith('chunk '):
+                    deadline = threading.Timer(CHUNK_TIMEOUT_SECONDS, child.terminate); deadline.daemon = True; deadline.start()
                 header = child.stdout.readline(64 * 1024)
                 meta = json.loads(header)
                 if meta.get('tool') != TOOL: raise ValueError('Backup transport header mismatch')
                 if not isinstance(meta.get('bytes'), int) or not 0 < meta['bytes'] < 32 * 1024**3: raise ValueError('Backup transport size rejected')
                 if shutil.disk_usage(target.parent).free < meta['bytes'] + 512 * 1024**2: raise ValueError('Insufficient backup destination space')
-            while chunk := child.stdout.read(4 * 1024 * 1024):
+            while chunk := child.stdout.read1(4 * 1024 * 1024):
                 output.write(chunk); h.update(chunk); count += len(chunk)
                 if count > meta['bytes']: raise ValueError('Backup stream too large')
             if child.wait() != 0 or count != meta['bytes'] or h.hexdigest() != meta['sha256']:
@@ -37,6 +40,7 @@ def receive_stream(config, source, command, target, log):
             if child is not None and child.poll() is None: child.terminate(); child.wait()
             raise
         finally:
+            if deadline is not None: deadline.cancel()
             if child is not None: child.stdout.close()
     partial.replace(target); target.chmod(0o600)
     return meta

@@ -190,4 +190,17 @@ class Recovery(unittest.TestCase):
             with self.assertRaises(ValueError):module.receive_stream({'known_hosts':'/known','identity_file':'/key'},{'ssh':'root@direct'},'snapshot',self.root/'target',self.root/'log')
         self.assertFalse((self.root/'target').exists());self.assertTrue((self.root/'target.partial').exists())
 
+    def test_stalled_chunk_connection_is_terminated_without_publishing(self):
+        import threading,time
+        from types import SimpleNamespace
+        module=load_script('dr-pull');ended=threading.Event();meta={'tool':TOOL,'bytes':7,'sha256':'0'*64}
+        class Stalled(io.BytesIO):
+            def read(self,*args):ended.wait(2);return b''
+            read1=read
+        child=SimpleNamespace(stdout=Stalled((json.dumps(meta)+'\n').encode()),terminate=lambda:ended.set(),wait=lambda:-15,poll=lambda:-15 if ended.is_set() else None)
+        start=time.monotonic()
+        with patch.object(module.subprocess,'Popen',return_value=child),patch.object(module,'CHUNK_TIMEOUT_SECONDS',.03):
+            with self.assertRaises(ValueError):module.receive_stream({'known_hosts':'/known','identity_file':'/key'},{'ssh':'root@direct'},'chunk '+('a'*64)+' 0 7',self.root/'target',self.root/'log')
+        self.assertTrue(ended.is_set());self.assertLess(time.monotonic()-start,1);self.assertFalse((self.root/'target').exists())
+
 if __name__ == '__main__': unittest.main()
