@@ -12,7 +12,8 @@ export type ProxyHealth = {
  * 有票无代理是 fail-closed，直接 0 分。
  */
 export function proxyHealthOf(vm: Vm, proxy: VmProxySnap): ProxyHealth {
-  if (vm.has_token && !proxy.host && !vm.proxy_id) {
+  const configured = vm.proxy_configured || proxy.host || vm.proxy_id
+  if (vm.has_token && !configured) {
     return {
       score: 0,
       tone: {
@@ -24,7 +25,7 @@ export function proxyHealthOf(vm: Vm, proxy: VmProxySnap): ProxyHealth {
       reasons: ['有凭证但未绑代理，出站会直接拒绝'],
     }
   }
-  if (!proxy.host && !vm.proxy_id) {
+  if (!configured) {
     return {
       score: 0,
       tone: {

@@ -6,6 +6,8 @@
  * cannot send the panel Bearer token.
  */
 
+import { tenantProxyView } from '../../company/tenant-panel-privacy.mjs'
+
 export const SEAT_STREAM_THROTTLE_MS = 250
 export const SEAT_STREAM_PING_MS = 15_000
 
@@ -52,7 +54,11 @@ export function servePoolSeatStream({
   const sendProxies = () => {
     proxyTimer = null
     if (closed || !proxyPool) return
-    const frame = { proxies: scope(proxyPool.liveStatusByVm?.() || {}), ts: Date.now() }
+    const scoped = scope(proxyPool.liveStatusByVm?.() || {})
+    const proxies = visibleVmIds
+      ? Object.fromEntries(Object.entries(scoped).map(([id, proxy]) => [id, tenantProxyView(proxy)]))
+      : scoped
+    const frame = { proxies, ts: Date.now() }
     res.write(`event: proxy\ndata: ${JSON.stringify(frame)}\n\n`)
   }
   // Both run inside acquire/release and probe paths: only arm a timer, never throw.

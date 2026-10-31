@@ -382,6 +382,8 @@ test('local proxy node labels are present for admin and absent for tenant', asyn
     vmNodeOf: (vmId) => vms.find((vm) => vm.id === vmId)?.node_id || null,
   })
   t.after(() => pool.stopScheduler())
+  // This label fixture intentionally shares one node exit between two slots.
+  pool.updateConfig({ bind_limit: 2 })
   pool.ensureLocal()
   // A generic px-local bind lands each slot on its own VPS's local row.
   assert.equal(pool.bind('px-local', 'vm-ctrl').proxy.id, 'px-local')

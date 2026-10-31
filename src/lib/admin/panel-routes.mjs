@@ -1,3 +1,4 @@
+import { tenantPanelPayload } from '../../company/tenant-panel-privacy.mjs'
 /**
  * /admin and /api/panel routes. Login / logout / me and { ok, data }
  * envelopes are unchanged; slot start/reload go through startSlotReady.
@@ -603,7 +604,14 @@ function slotProxyHint(px = {}, label = null) {
 export function createPanelHandler(ctx) {
   // A checkout can change under a live Node process; report its boot version.
   const runningVersion = readLocalVersion(ctx.cfg?.paths?.project)
-  const json = (...args) => ctx.json(...args)
+  const responseRequests = new WeakMap()
+  const json = (res, status, payload, ...rest) => {
+    const req = responseRequests.get(res)
+    if (req?.panelRole === 'user' && req.apiKeyKind !== 'master') {
+      payload = tenantPanelPayload(payload, { projectRoot: ctx.cfg?.paths?.project, ownerUserId: req.panelUserId })
+    }
+    return ctx.json(res, status, payload, ...rest)
+  }
   const hostUnsupported = (res, vm, cap) => {
     if (slotHost(vm).supports(cap)) return false
     json(res, 409, {
@@ -1189,6 +1197,7 @@ export function createPanelHandler(ctx) {
   }
 
   return async function handlePanel(req, res, url) {
+    responseRequests.set(res, req)
     const p = url.pathname
     if (!p.startsWith('/admin') && !p.startsWith('/api/panel')) return false
 

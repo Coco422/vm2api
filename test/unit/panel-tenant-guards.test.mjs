@@ -30,6 +30,50 @@ const { readCodexAccounts, upsertCodexAccount } = await import('../../src/lib/vm
 const TENANT = { panelUser: 'tenant', panelRole: 'user', panelUserId: 'u-1' }
 const ADMIN = { apiKeyKind: 'master', panelRole: 'admin' }
 
+test('tenant VM JSON hides purchased proxy metadata and operator labels; admin keeps them', async (t) => {
+  const root = makeProject(t)
+  const original = {
+    id: 'vm-private-exit',
+    name: 'US · private-supplier-07',
+    note: 'Bought from private-supplier',
+    status: 'stopped',
+    owner_user_id: 'u-1',
+    claude: {},
+    proxy: {
+      id: 'px-private-supplier',
+      host: 'private-supplier.example',
+      port: 10007,
+      username: 'private-proxy-user',
+      password: 'private-proxy-password',
+      url: 'socks5://private-proxy-user:private-proxy-password@private-supplier.example:10007',
+    },
+  }
+  writeVm(root, original)
+  const extra = { accountQuota: { config: {}, snapshot: () => ({ accounts: [] }) } }
+  for (const url of ['/api/panel/vms', '/api/panel/vms/vm-private-exit']) {
+    const tenant = await makeHandler(root, TENANT, null, extra).call('GET', url)
+    assert.equal(tenant.status, 200)
+    const vm = tenant.body.data.items?.[0] || tenant.body.data.vm
+    assert.equal(vm.name, original.id)
+    assert.equal(vm.note, null)
+    assert.equal(vm.proxy_id, null)
+    assert.equal(vm.proxy_configured, true)
+    assert.equal(vm.proxy.label, '已配置')
+    assert.equal(vm.proxy.host, undefined)
+    assert.equal(tenant.body.data.proxy_pool, null)
+    assert.doesNotMatch(JSON.stringify(tenant.body), /private-supplier|private-proxy-user|private-proxy-password|10007/)
+
+    const admin = await makeHandler(root, ADMIN, null, extra).call('GET', url)
+    assert.equal(admin.status, 200)
+    const full = admin.body.data.items?.[0] || admin.body.data.vm
+    assert.equal(full.name, original.name)
+    assert.equal(full.proxy.host, original.proxy.host)
+    assert.equal(full.proxy.port, original.proxy.port)
+  }
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(root, 'vms', original.id + '.json'))).proxy, original.proxy)
+})
+
+
 function makeProject(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-tenant-guards-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
