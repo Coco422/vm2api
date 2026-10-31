@@ -8,7 +8,7 @@
 
 ## 当前生产与运维入口
 
-实际运行镜像、主机和七台VM分配、并发、日志及最后成功备份统一维护在 [PRODUCTION_STATUS.md](PRODUCTION_STATUS.md)，故障处理见 [DISASTER_RECOVERY.md](DISASTER_RECOVERY.md)。2026-10-31核验仍为正式版1.4.025，业务镜像已更新到 `vm2api-coco422:1.4.025-20261030-auth-473e7c6d`；下文10月29日镜像和“两台VM、一个节点”是当时发布记录，不是当前规模。
+实际运行镜像、主机和当前VM分配、并发、日志及最后成功备份统一维护在 [PRODUCTION_STATUS.md](PRODUCTION_STATUS.md)，故障处理见 [DISASTER_RECOVERY.md](DISASTER_RECOVERY.md)。2026-10-31核验仍为正式版1.4.025，业务镜像已更新到 `vm2api-coco422:1.4.025-20261030-auth-473e7c6d`；下文10月29日镜像和“两台VM、一个节点”是当时发布记录，不是当前规模。
 
 出口检测记录和未达标事项见 [VM_EGRESS_AUDIT.md](VM_EGRESS_AUDIT.md)。真实检测与四张截图已有保存，但没有达到四项全通过；临时浏览器运行时已清理，不能因入口存在就判定环境合格。
 
