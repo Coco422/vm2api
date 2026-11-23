@@ -14,7 +14,9 @@ const serverSrc = [
   fs.readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../src/server.mjs'), 'utf8'),
 ].join('\n')
 
-test('user sees owned VMs, keys, logs and statistics', () => {
+test('only admins have a CRAG subscription view', () => {
+  for (const role of ['user', 'super']) assert.equal(canViewPage(role, 'crag-subscription'), false)
+  assert.equal(canViewPage('admin', 'crag-subscription'), true)
   assert.deepEqual(viewsForRole('user'), ['vm', 'keys', 'logs', 'statistics'])
   assert.deepEqual(viewsForRole('super'), ['overview', 'cluster', 'logs', 'statistics', 'vm'])
   assert.equal(canViewPage('admin', 'statistics'), true)
@@ -30,53 +32,52 @@ test('user sees owned VMs, keys, logs and statistics', () => {
   assert.equal(canViewPage('user', 'database'), false)
   assert.equal(hasCapability('super', 'vm.schedule'), true)
   assert.equal(hasCapability('user', 'vm.schedule'), false)
+  assert.equal(hasCapability('user', 'vm.schedule.self'), true)
 })
 
-test('tenant reads usage and its client keys; all management stays admin-only', () => {
-  for (const path of [
-    '/api/panel/vms',
-    '/api/panel/vms/vm-01',
-    '/api/panel/api-keys',
-    '/api/panel/api-keys/key_a/stats',
-    '/api/panel/request-logs',
-  ])
-    assert.equal(authorizePanelRoute('GET', path, 'user').ok, true, path)
-  const denied = [
-    ['GET', '/api/panel/vms/create-options'],
-    ['POST', '/api/panel/vms/create'],
-    ['POST', '/api/panel/vms/import'],
-    ['POST', '/api/panel/vms/package'],
-    ['GET', '/api/panel/vms/vm-01/package'],
-    ['PUT', '/api/panel/vms/vm-01/package'],
-    ['GET', '/api/panel/vms/vm-01/oauth/credential'],
-    ['PUT', '/api/panel/vms/vm-01/oauth/credential'],
-    ['POST', '/api/panel/vms/vm-01/oauth/refresh'],
-    ['POST', '/api/panel/vms/vm-01/start'],
-    ['POST', '/api/panel/vms/vm-01/stop'],
-    ['POST', '/api/panel/vms/vm-01/recover'],
-    ['POST', '/api/panel/vms/vm-01/schedulable'],
-    ['POST', '/api/panel/vms/vm-01/cooldown/clear'],
-    ['PATCH', '/api/panel/vms/vm-01'],
-    ['DELETE', '/api/panel/vms/vm-01'],
-    ['GET', '/api/panel/proxies'],
-    ['POST', '/api/panel/proxies/px/reveal'],
-    ['POST', '/api/panel/api-keys'],
-    ['PATCH', '/api/panel/api-keys/key_a'],
-    ['DELETE', '/api/panel/api-keys/key_a'],
-    ['POST', '/api/panel/api-keys/key_a/reset-quota'],
-    ['GET', '/api/panel/request-logs/export'],
-    ['GET', '/api/panel/users'],
-    ['GET', '/api/panel/routing'],
-    ['POST', '/api/panel/vms/vm-01/future-management-route'],
-  ]
-  for (const [method, path] of denied) {
-    assert.equal(authorizePanelRoute(method, path, 'user').ok, false, `${method} ${path}`)
-    assert.equal(authorizePanelRoute(method, path, 'admin').ok, true, `admin ${method} ${path}`)
-  }
+test('user can view owned vms and manage keys, not proxies or reauth', () => {
+  assert.equal(authorizePanelRoute('GET', '/api/panel/vms', 'user').ok, true)
+  assert.equal(authorizePanelRoute('GET', '/api/panel/vms/vm-01', 'user').ok, true)
+  assert.equal(authorizePanelRoute('POST', '/api/panel/vms/create', 'user').ok, false)
+  assert.equal(authorizePanelRoute('GET', '/api/panel/vms/create-options', 'user').ok, false)
+  assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/schedulable', 'user').ok, true)
+  assert.equal(authorizePanelRoute('POST', '/api/panel/vms/import', 'user').ok, false)
+  assert.equal(authorizePanelRoute('POST', '/api/panel/vms/package', 'user').ok, false)
+  assert.equal(authorizePanelRoute('GET', '/api/panel/vms/vm-01/package', 'user').ok, false)
+  assert.equal(authorizePanelRoute('PUT', '/api/panel/vms/vm-01/package', 'user').ok, false)
+  assert.equal(authorizePanelRoute('DELETE', '/api/panel/vms/vm-01', 'user').ok, false)
+  assert.equal(authorizePanelRoute('GET', '/api/panel/proxies', 'user').ok, false)
+  assert.equal(authorizePanelRoute('POST', '/api/panel/proxies/import', 'user').ok, false)
+  assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/oauth/generate-auth-url', 'user').ok, false)
+  assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/oauth/exchange-code', 'user').ok, false)
+  assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/credentials/sync', 'user').ok, false)
+  assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/credentials/sync', 'super').ok, false)
+  assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/credentials/sync', 'admin').ok, true)
+  assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/shell-ticket', 'user').ok, false)
+  assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/shell-ticket', 'super').ok, false)
+  assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/shell-ticket', 'admin').ok, true)
+  assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/oauth/refresh', 'user').ok, false)
+  assert.equal(authorizePanelRoute('PUT', '/api/panel/vms/vm-01/oauth/credential', 'user').ok, false)
+  assert.equal(authorizePanelRoute('GET', '/api/panel/api-keys', 'user').ok, true)
+  assert.equal(authorizePanelRoute('GET', '/api/panel/api-keys/key_a/stats', 'user').ok, true)
+  assert.equal(authorizePanelRoute('GET', '/api/panel/request-logs', 'user').ok, true)
+  assert.equal(authorizePanelRoute('GET', '/api/panel/dashboard', 'user').ok, false)
+  assert.equal(authorizePanelRoute('GET', '/api/panel/usage', 'user').ok, false)
+  assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/official-cc-bootstrap', 'user').ok, false)
+  assert.equal(authorizePanelRoute('PATCH', '/api/panel/vms/vm-01/owner', 'user').ok, false)
+  assert.equal(authorizePanelRoute('GET', '/api/panel/users', 'user').ok, false)
+  assert.equal(authorizePanelRoute('GET', '/api/panel/database/metrics', 'user').ok, false)
+  assert.equal(authorizePanelRoute('GET', '/api/panel/version', 'user').ok, false)
+  assert.equal(authorizePanelRoute('POST', '/api/panel/update', 'user').ok, false)
+  assert.equal(authorizePanelRoute('GET', '/api/panel/vms/vm-01/diagnose', 'user').ok, false)
+  assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/recover', 'user').ok, false)
+  assert.equal(authorizePanelRoute('GET', '/api/panel/vms/vm-01/recover', 'user').ok, false)
+  assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/recover', 'super').ok, false)
 })
 
 test('user can query quota and redeem reset credits on owned vms', () => {
   const allowed = [
+    '/api/panel/vms/vm-01/usage/query',
     '/api/panel/vms/vm-01/openai-quota/refresh',
     '/api/panel/vms/vm-01/openai-quota/reset',
     '/api/panel/vms/vm-01/claude-reset/query',
@@ -87,13 +88,24 @@ test('user can query quota and redeem reset credits on owned vms', () => {
     assert.equal(authorizePanelRoute('GET', p, 'user').ok, false, `user GET ${p}`)
     assert.equal(authorizePanelRoute('POST', p, 'super').ok, false, `super POST ${p}`)
   }
-  assert.equal(authorizePanelRoute('POST', '/api/panel/api-keys/key_a/reset', 'user').ok, false)
+  assert.equal(authorizePanelRoute('POST', '/api/panel/api-keys/key_a/reset-quota', 'user').ok, true)
   assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/claude-reset/other', 'user').ok, false)
 })
 
-test('only admin can rotate client keys', () => {
+test('tenant quota thresholds have a dedicated PATCH permission', () => {
+  const path = '/api/panel/vms/vm-01/quota-thresholds'
+  assert.equal(authorizePanelRoute('PATCH', path, 'user').ok, true)
+  assert.equal(authorizePanelRoute('PATCH', path, 'super').ok, false)
+  assert.equal(authorizePanelRoute('POST', path, 'user').ok, false)
+  assert.equal(hasCapability('user', 'vm.quota_thresholds'), true)
+})
+
+test('tenant client key routes allow credential management with handler-side field and owner guards', () => {
   const p = '/api/panel/api-keys/key_a/rotate'
-  assert.equal(authorizePanelRoute('POST', p, 'user').ok, false)
+  assert.equal(authorizePanelRoute('POST', p, 'user').ok, true)
+  assert.equal(authorizePanelRoute('POST', '/api/panel/api-keys', 'user').ok, true)
+  assert.equal(authorizePanelRoute('PATCH', '/api/panel/api-keys/key_a', 'user').ok, true)
+  assert.equal(authorizePanelRoute('DELETE', '/api/panel/api-keys/key_a', 'user').ok, true)
   assert.equal(authorizePanelRoute('GET', p, 'user').ok, false)
   assert.equal(authorizePanelRoute('POST', p, 'super').ok, false)
 })
@@ -133,7 +145,7 @@ test('super can schedule VMs but cannot touch credentials or delete', () => {
   assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/oauth/to-setup-token', 'super').ok, false)
   assert.equal(authorizePanelRoute('GET', '/api/panel/vms/vm-01/oauth/credential', 'super').ok, false)
   assert.equal(authorizePanelRoute('PUT', '/api/panel/vms/vm-01/oauth/credential', 'super').ok, false)
-  assert.equal(authorizePanelRoute('GET', '/api/panel/vms/vm-01/oauth/credential', 'user').ok, false)
+  assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/oauth/refresh', 'user').ok, false)
   assert.equal(authorizePanelRoute('DELETE', '/api/panel/vms/vm-01', 'super').ok, false)
   assert.equal(authorizePanelRoute('POST', '/api/panel/vms/create', 'super').ok, false)
   assert.equal(authorizePanelRoute('GET', '/api/panel/vms/create-options', 'super').ok, false)
@@ -254,4 +266,28 @@ test('ACL schedule POSTs have matching server handlers', () => {
   assert.match(serverSrc, /clearVmCooldown/)
   assert.match(serverSrc, /cooldown\\\/clear/)
   assert.match(serverSrc, /\/schedulable\$/)
+})
+
+test('tenant manual testing is allowed while background schedules and VM management stay closed', () => {
+  assert.equal(authorizePanelRoute('GET', '/api/panel/test-models', 'user').ok, true)
+  assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/test-chat', 'user').ok, true)
+  assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/schedulable', 'user').ok, true)
+  assert.equal(authorizePanelRoute('POST', '/api/panel/vms/schedule/hold', 'user').ok, false)
+  for (const [method, action] of [
+    ['POST', 'start'],
+    ['POST', 'stop'],
+    ['PUT', 'test-schedule'],
+    ['GET', 'diagnose'],
+    ['POST', 'recover'],
+  ]) {
+    assert.equal(authorizePanelRoute(method, '/api/panel/vms/vm-01/' + action, 'user').ok, false, action)
+  }
+})
+
+test('resetting another account 2FA is admin-only', () => {
+  // Self-service /api/panel/2fa runs before this gate (every role manages its
+  // own); clearing someone else's second factor is user administration.
+  assert.equal(authorizePanelRoute('DELETE', '/api/panel/users/u-1/2fa', 'admin').ok, true)
+  assert.equal(authorizePanelRoute('DELETE', '/api/panel/users/u-1/2fa', 'super').ok, false)
+  assert.equal(authorizePanelRoute('DELETE', '/api/panel/users/u-1/2fa', 'user').ok, false)
 })

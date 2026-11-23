@@ -47,7 +47,7 @@ const cases = [
     setting: '1h',
   },
   {
-    name: 'implicit caller 5m with a 1h setting',
+    name: 'caller marker without TTL retains implicit 5m under the 1h setting',
     system: [{ type: 'text', text: 'Caller policy', cache_control: { type: 'ephemeral' } }],
     usage: cacheUsage(1000, 0),
     setting: '1h',
@@ -192,7 +192,7 @@ for (const stream of [false, true]) {
         sent.system.slice(1),
         typeof fixture.system === 'string'
           ? [{ type: 'text', text: fixture.expectedSystem || fixture.system }]
-          : fixture.system,
+          : fixture.expectedSystem || fixture.system,
       )
       assert.equal(
         clientUsage.input_tokens,

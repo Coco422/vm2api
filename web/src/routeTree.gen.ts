@@ -10,15 +10,20 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as AuthenticatedRouteRouteImport } from './routes/_authenticated/route'
+import { Route as CragPreviewRouteImport } from './routes/crag-preview'
+import { Route as CragPurchaseRouteImport } from './routes/crag-purchase'
 import { Route as EmployeeRouteImport } from './routes/employee'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as WelcomeRouteImport } from './routes/welcome'
 import { Route as AuthenticatedIndexRouteImport } from './routes/_authenticated/index'
+import { Route as AuthenticatedAccountRouteImport } from './routes/_authenticated/account'
 import { Route as AuthenticatedAnthropicRouteImport } from './routes/_authenticated/anthropic'
 import { Route as AuthenticatedApiRouteImport } from './routes/_authenticated/api'
 import { Route as AuthenticatedBillingRouteImport } from './routes/_authenticated/billing'
 import { Route as AuthenticatedClusterRouteImport } from './routes/_authenticated/cluster'
+import { Route as AuthenticatedCragSubscriptionRouteImport } from './routes/_authenticated/crag-subscription'
 import { Route as AuthenticatedDatabaseRouteImport } from './routes/_authenticated/database'
+import { Route as AuthenticatedGlobalStatisticsRouteImport } from './routes/_authenticated/global-statistics'
 import { Route as AuthenticatedImportRouteImport } from './routes/_authenticated/import'
 import { Route as AuthenticatedKeysRouteImport } from './routes/_authenticated/keys'
 import { Route as AuthenticatedLogsRouteImport } from './routes/_authenticated/logs'
@@ -38,6 +43,16 @@ import { Route as AuthenticatedVmIdRouteImport } from './routes/_authenticated/v
 
 const AuthenticatedRouteRoute = AuthenticatedRouteRouteImport.update({
   id: '/_authenticated',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const CragPreviewRoute = CragPreviewRouteImport.update({
+  id: '/crag-preview',
+  path: '/crag-preview',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const CragPurchaseRoute = CragPurchaseRouteImport.update({
+  id: '/crag-purchase',
+  path: '/crag-purchase',
   getParentRoute: () => rootRouteImport,
 } as any)
 const EmployeeRoute = EmployeeRouteImport.update({
@@ -60,6 +75,11 @@ const AuthenticatedIndexRoute = AuthenticatedIndexRouteImport.update({
   path: '/',
   getParentRoute: () => AuthenticatedRouteRoute,
 } as any)
+const AuthenticatedAccountRoute = AuthenticatedAccountRouteImport.update({
+  id: '/account',
+  path: '/account',
+  getParentRoute: () => AuthenticatedRouteRoute,
+} as any)
 const AuthenticatedAnthropicRoute = AuthenticatedAnthropicRouteImport.update({
   id: '/anthropic',
   path: '/anthropic',
@@ -80,11 +100,23 @@ const AuthenticatedClusterRoute = AuthenticatedClusterRouteImport.update({
   path: '/cluster',
   getParentRoute: () => AuthenticatedRouteRoute,
 } as any)
+const AuthenticatedCragSubscriptionRoute =
+  AuthenticatedCragSubscriptionRouteImport.update({
+    id: '/crag-subscription',
+    path: '/crag-subscription',
+    getParentRoute: () => AuthenticatedRouteRoute,
+  } as any)
 const AuthenticatedDatabaseRoute = AuthenticatedDatabaseRouteImport.update({
   id: '/database',
   path: '/database',
   getParentRoute: () => AuthenticatedRouteRoute,
 } as any)
+const AuthenticatedGlobalStatisticsRoute =
+  AuthenticatedGlobalStatisticsRouteImport.update({
+    id: '/global-statistics',
+    path: '/global-statistics',
+    getParentRoute: () => AuthenticatedRouteRoute,
+  } as any)
 const AuthenticatedImportRoute = AuthenticatedImportRouteImport.update({
   id: '/import',
   path: '/import',
@@ -170,14 +202,19 @@ const AuthenticatedVmIdRoute = AuthenticatedVmIdRouteImport.update({
 
 export interface FileRoutesByFullPath {
   '/': typeof AuthenticatedIndexRoute
+  '/crag-preview': typeof CragPreviewRoute
+  '/crag-purchase': typeof CragPurchaseRoute
   '/employee': typeof EmployeeRoute
   '/login': typeof LoginRoute
   '/welcome': typeof WelcomeRoute
+  '/account': typeof AuthenticatedAccountRoute
   '/anthropic': typeof AuthenticatedAnthropicRoute
   '/api': typeof AuthenticatedApiRoute
   '/billing': typeof AuthenticatedBillingRoute
   '/cluster': typeof AuthenticatedClusterRoute
+  '/crag-subscription': typeof AuthenticatedCragSubscriptionRoute
   '/database': typeof AuthenticatedDatabaseRoute
+  '/global-statistics': typeof AuthenticatedGlobalStatisticsRoute
   '/import': typeof AuthenticatedImportRoute
   '/keys': typeof AuthenticatedKeysRoute
   '/logs': typeof AuthenticatedLogsRoute
@@ -196,14 +233,19 @@ export interface FileRoutesByFullPath {
   '/vm/': typeof AuthenticatedVmIndexRoute
 }
 export interface FileRoutesByTo {
+  '/crag-preview': typeof CragPreviewRoute
+  '/crag-purchase': typeof CragPurchaseRoute
   '/employee': typeof EmployeeRoute
   '/login': typeof LoginRoute
   '/welcome': typeof WelcomeRoute
+  '/account': typeof AuthenticatedAccountRoute
   '/anthropic': typeof AuthenticatedAnthropicRoute
   '/api': typeof AuthenticatedApiRoute
   '/billing': typeof AuthenticatedBillingRoute
   '/cluster': typeof AuthenticatedClusterRoute
+  '/crag-subscription': typeof AuthenticatedCragSubscriptionRoute
   '/database': typeof AuthenticatedDatabaseRoute
+  '/global-statistics': typeof AuthenticatedGlobalStatisticsRoute
   '/import': typeof AuthenticatedImportRoute
   '/keys': typeof AuthenticatedKeysRoute
   '/logs': typeof AuthenticatedLogsRoute
@@ -225,14 +267,19 @@ export interface FileRoutesByTo {
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/_authenticated': typeof AuthenticatedRouteRouteWithChildren
+  '/crag-preview': typeof CragPreviewRoute
+  '/crag-purchase': typeof CragPurchaseRoute
   '/employee': typeof EmployeeRoute
   '/login': typeof LoginRoute
   '/welcome': typeof WelcomeRoute
+  '/_authenticated/account': typeof AuthenticatedAccountRoute
   '/_authenticated/anthropic': typeof AuthenticatedAnthropicRoute
   '/_authenticated/api': typeof AuthenticatedApiRoute
   '/_authenticated/billing': typeof AuthenticatedBillingRoute
   '/_authenticated/cluster': typeof AuthenticatedClusterRoute
+  '/_authenticated/crag-subscription': typeof AuthenticatedCragSubscriptionRoute
   '/_authenticated/database': typeof AuthenticatedDatabaseRoute
+  '/_authenticated/global-statistics': typeof AuthenticatedGlobalStatisticsRoute
   '/_authenticated/import': typeof AuthenticatedImportRoute
   '/_authenticated/keys': typeof AuthenticatedKeysRoute
   '/_authenticated/logs': typeof AuthenticatedLogsRoute
@@ -255,14 +302,19 @@ export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
     | '/'
+    | '/crag-preview'
+    | '/crag-purchase'
     | '/employee'
     | '/login'
     | '/welcome'
+    | '/account'
     | '/anthropic'
     | '/api'
     | '/billing'
     | '/cluster'
+    | '/crag-subscription'
     | '/database'
+    | '/global-statistics'
     | '/import'
     | '/keys'
     | '/logs'
@@ -281,14 +333,19 @@ export interface FileRouteTypes {
     | '/vm/'
   fileRoutesByTo: FileRoutesByTo
   to:
+    | '/crag-preview'
+    | '/crag-purchase'
     | '/employee'
     | '/login'
     | '/welcome'
+    | '/account'
     | '/anthropic'
     | '/api'
     | '/billing'
     | '/cluster'
+    | '/crag-subscription'
     | '/database'
+    | '/global-statistics'
     | '/import'
     | '/keys'
     | '/logs'
@@ -309,14 +366,19 @@ export interface FileRouteTypes {
   id:
     | '__root__'
     | '/_authenticated'
+    | '/crag-preview'
+    | '/crag-purchase'
     | '/employee'
     | '/login'
     | '/welcome'
+    | '/_authenticated/account'
     | '/_authenticated/anthropic'
     | '/_authenticated/api'
     | '/_authenticated/billing'
     | '/_authenticated/cluster'
+    | '/_authenticated/crag-subscription'
     | '/_authenticated/database'
+    | '/_authenticated/global-statistics'
     | '/_authenticated/import'
     | '/_authenticated/keys'
     | '/_authenticated/logs'
@@ -338,6 +400,8 @@ export interface FileRouteTypes {
 }
 export interface RootRouteChildren {
   AuthenticatedRouteRoute: typeof AuthenticatedRouteRouteWithChildren
+  CragPreviewRoute: typeof CragPreviewRoute
+  CragPurchaseRoute: typeof CragPurchaseRoute
   EmployeeRoute: typeof EmployeeRoute
   LoginRoute: typeof LoginRoute
   WelcomeRoute: typeof WelcomeRoute
@@ -350,6 +414,20 @@ declare module '@tanstack/react-router' {
       path: ''
       fullPath: '/'
       preLoaderRoute: typeof AuthenticatedRouteRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/crag-preview': {
+      id: '/crag-preview'
+      path: '/crag-preview'
+      fullPath: '/crag-preview'
+      preLoaderRoute: typeof CragPreviewRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/crag-purchase': {
+      id: '/crag-purchase'
+      path: '/crag-purchase'
+      fullPath: '/crag-purchase'
+      preLoaderRoute: typeof CragPurchaseRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/employee': {
@@ -380,6 +458,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthenticatedIndexRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
+    '/_authenticated/account': {
+      id: '/_authenticated/account'
+      path: '/account'
+      fullPath: '/account'
+      preLoaderRoute: typeof AuthenticatedAccountRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
     '/_authenticated/anthropic': {
       id: '/_authenticated/anthropic'
       path: '/anthropic'
@@ -408,11 +493,25 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthenticatedClusterRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
+    '/_authenticated/crag-subscription': {
+      id: '/_authenticated/crag-subscription'
+      path: '/crag-subscription'
+      fullPath: '/crag-subscription'
+      preLoaderRoute: typeof AuthenticatedCragSubscriptionRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
     '/_authenticated/database': {
       id: '/_authenticated/database'
       path: '/database'
       fullPath: '/database'
       preLoaderRoute: typeof AuthenticatedDatabaseRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
+    '/_authenticated/global-statistics': {
+      id: '/_authenticated/global-statistics'
+      path: '/global-statistics'
+      fullPath: '/global-statistics'
+      preLoaderRoute: typeof AuthenticatedGlobalStatisticsRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
     '/_authenticated/import': {
@@ -531,11 +630,14 @@ declare module '@tanstack/react-router' {
 }
 
 interface AuthenticatedRouteRouteChildren {
+  AuthenticatedAccountRoute: typeof AuthenticatedAccountRoute
   AuthenticatedAnthropicRoute: typeof AuthenticatedAnthropicRoute
   AuthenticatedApiRoute: typeof AuthenticatedApiRoute
   AuthenticatedBillingRoute: typeof AuthenticatedBillingRoute
   AuthenticatedClusterRoute: typeof AuthenticatedClusterRoute
+  AuthenticatedCragSubscriptionRoute: typeof AuthenticatedCragSubscriptionRoute
   AuthenticatedDatabaseRoute: typeof AuthenticatedDatabaseRoute
+  AuthenticatedGlobalStatisticsRoute: typeof AuthenticatedGlobalStatisticsRoute
   AuthenticatedImportRoute: typeof AuthenticatedImportRoute
   AuthenticatedKeysRoute: typeof AuthenticatedKeysRoute
   AuthenticatedLogsRoute: typeof AuthenticatedLogsRoute
@@ -556,11 +658,14 @@ interface AuthenticatedRouteRouteChildren {
 }
 
 const AuthenticatedRouteRouteChildren: AuthenticatedRouteRouteChildren = {
+  AuthenticatedAccountRoute: AuthenticatedAccountRoute,
   AuthenticatedAnthropicRoute: AuthenticatedAnthropicRoute,
   AuthenticatedApiRoute: AuthenticatedApiRoute,
   AuthenticatedBillingRoute: AuthenticatedBillingRoute,
   AuthenticatedClusterRoute: AuthenticatedClusterRoute,
+  AuthenticatedCragSubscriptionRoute: AuthenticatedCragSubscriptionRoute,
   AuthenticatedDatabaseRoute: AuthenticatedDatabaseRoute,
+  AuthenticatedGlobalStatisticsRoute: AuthenticatedGlobalStatisticsRoute,
   AuthenticatedImportRoute: AuthenticatedImportRoute,
   AuthenticatedKeysRoute: AuthenticatedKeysRoute,
   AuthenticatedLogsRoute: AuthenticatedLogsRoute,
@@ -585,6 +690,8 @@ const AuthenticatedRouteRouteWithChildren =
 
 const rootRouteChildren: RootRouteChildren = {
   AuthenticatedRouteRoute: AuthenticatedRouteRouteWithChildren,
+  CragPreviewRoute: CragPreviewRoute,
+  CragPurchaseRoute: CragPurchaseRoute,
   EmployeeRoute: EmployeeRoute,
   LoginRoute: LoginRoute,
   WelcomeRoute: WelcomeRoute,

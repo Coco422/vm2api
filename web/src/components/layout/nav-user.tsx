@@ -1,10 +1,12 @@
 import { Link } from '@tanstack/react-router'
+import { hasPanelView } from '@/config/nav'
 import {
   ChevronsUpDown,
   Info,
   ListChecks,
   LogOut,
   Settings,
+  UserRoundCog,
   Users,
 } from 'lucide-react'
 import { getDisplayNameInitials } from '@/lib/utils'
@@ -33,10 +35,15 @@ type NavUserProps = {
     email: string
     avatar: string
   }
+  /** Role views from /api/panel/me; entries the role cannot open are hidden. */
+  views?: readonly string[] | null
+  onAccountSettings?: () => void
 }
 
-export function NavUser({ user }: NavUserProps) {
+export function NavUser({ user, views, onAccountSettings }: NavUserProps) {
   const { isMobile } = useSidebar()
+  const canSettings = hasPanelView(views, 'settings')
+  const canUsers = hasPanelView(views, 'users')
   const [open, setOpen] = useDialogState()
   return (
     <>
@@ -81,30 +88,42 @@ export function NavUser({ user }: NavUserProps) {
               </DropdownMenuLabel>
               <DropdownMenuSeparator />
               <DropdownMenuGroup>
+                {onAccountSettings && (
+                  <DropdownMenuItem onSelect={onAccountSettings}>
+                    <UserRoundCog />
+                    账号设置
+                  </DropdownMenuItem>
+                )}
                 <DropdownMenuItem asChild>
                   <Link to='/welcome'>
                     <ListChecks />
                     欢迎与引导
                   </Link>
                 </DropdownMenuItem>
-                <DropdownMenuItem asChild>
-                  <Link to='/settings/$tab' params={{ tab: 'sticky' }}>
-                    <Settings />
-                    设置
-                  </Link>
-                </DropdownMenuItem>
-                <DropdownMenuItem asChild>
-                  <Link to='/settings/$tab' params={{ tab: 'about' }}>
-                    <Info />
-                    关于 / 更新
-                  </Link>
-                </DropdownMenuItem>
-                <DropdownMenuItem asChild>
-                  <Link to='/users'>
-                    <Users />
-                    用户
-                  </Link>
-                </DropdownMenuItem>
+                {canSettings && (
+                  <>
+                    <DropdownMenuItem asChild>
+                      <Link to='/settings/$tab' params={{ tab: 'sticky' }}>
+                        <Settings />
+                        设置
+                      </Link>
+                    </DropdownMenuItem>
+                    <DropdownMenuItem asChild>
+                      <Link to='/settings/$tab' params={{ tab: 'about' }}>
+                        <Info />
+                        关于 / 更新
+                      </Link>
+                    </DropdownMenuItem>
+                  </>
+                )}
+                {canUsers && (
+                  <DropdownMenuItem asChild>
+                    <Link to='/users'>
+                      <Users />
+                      用户
+                    </Link>
+                  </DropdownMenuItem>
+                )}
               </DropdownMenuGroup>
               <DropdownMenuSeparator />
               <DropdownMenuItem onClick={() => setOpen(true)}>

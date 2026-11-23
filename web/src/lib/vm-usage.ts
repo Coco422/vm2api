@@ -248,12 +248,8 @@ export function vmWindowTokens(
   }
 }
 
-/**
- * 账号累计官方价费用。`/api/panel/vms` 不带任何费用字段，累计值只在 `/usage`
- * 账号行和 `/dashboard` 的槽位里；两边都可能缺，取较大者，和 `vmTodayView`
- * 同一取舍——累计只增不减，较小的一定是过期或缺失。
- */
 export function vmTotalCost(vm: Vm, accounts?: UsageAccountRow[]): number {
+  if (vm.lifetime_usage) return vm.lifetime_usage.cost
   return Math.max(
     num(vm.total_cost),
     num(usageAccountForVm(vm, accounts)?.total_cost)
@@ -262,6 +258,7 @@ export function vmTotalCost(vm: Vm, accounts?: UsageAccountRow[]): number {
 
 /** 累计 token，与 `vmTotalCost` 同源同取舍。 */
 export function vmTotalTokens(vm: Vm, accounts?: UsageAccountRow[]): number {
+  if (vm.lifetime_usage) return vm.lifetime_usage.tokens
   return Math.max(
     num(vm.total_tokens),
     num(usageAccountForVm(vm, accounts)?.total_tokens)
@@ -287,7 +284,7 @@ export function vmCostLedger(
     { key: '7d', label: '7D', cost: cost.d7, tokens: tok.d7 },
     {
       key: 'total',
-      label: '总计',
+      label: vm.lifetime_usage ? '账号总计' : '保留日志合计',
       cost: vmTotalCost(vm, accounts),
       tokens: vmTotalTokens(vm, accounts),
     },

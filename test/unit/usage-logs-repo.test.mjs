@@ -402,6 +402,37 @@ test('log coverage follows recorded prunes, not the oldest row or the current re
   }
 })
 
+test('lifetime usage follows the account across slots without pruning or duplicating bills', () => {
+  const { db, repo } = freshDb()
+  try {
+    const old = new Date(Date.now() - 30 * 86400_000).toISOString()
+    seed(repo, [
+      { created_at: old, vm_id: 'vm-01', final_account_id: 'claude-a', input_tokens: 10, total_cost: 1 },
+      { vm_id: 'vm-02', account_id: 'claude-a', cache_read_tokens: 20, total_cost: 2 },
+      { vm_id: 'vm-02', account_id: 'claude-b', output_tokens: 15, total_cost: 4 },
+      { created_at: old, vm_id: 'vm-01', usage_account_id: 'openai:a', cache_creation_tokens: 7, total_cost: 1 },
+      { vm_id: 'vm-03', usage_account_id: 'openai:a', output_tokens: 3, total_cost: 2 },
+      { created_at: old, vm_id: 'vm-03', account_id: 'vm-03', input_tokens: 20, total_cost: 4 },
+    ])
+    const lifetime = () =>
+      repo
+        .billingStats({ now: Date.now() })
+        .lifetime_accounts.sort((left, right) => left.account_id.localeCompare(right.account_id))
+    const expected = [
+      { account_id: 'claude-a', total_cost: 0.000036, total_tokens: 30 },
+      { account_id: 'claude-b', total_cost: 0.000225, total_tokens: 15 },
+      { account_id: 'openai:a', total_cost: 0.00007125, total_tokens: 10 },
+    ]
+    assert.deepEqual(lifetime(), expected)
+    assert.equal(repo.cleanup({ retainDays: 7 }).usage_logs, 0)
+    assert.deepEqual(lifetime(), expected)
+    assert.equal(repo.cleanup({ retainDays: 7 }).usage_logs, 0)
+    assert.deepEqual(lifetime(), expected)
+  } finally {
+    db.close()
+  }
+})
+
 test('window_fable only counts fable rows since reset_7d_oi', () => {
   const { db, repo } = freshDb()
   try {
@@ -479,5 +510,153 @@ test('unpricedModels lists unpriced rows', () => {
     assert.equal(rows[0].requests, 2)
   } finally {
     db.close()
+  }
+})
+
+test('healthBuckets counts SLA success / errors per 30-minute slot and skips idle slots', () => {
+  const { dir, db, repo } = freshDb()
+  try {
+    const now = Date.parse('2026-11-15T12:00:00.000Z')
+    const at = (minAgo) => new Date(now - minAgo * 60_000).toISOString()
+    seed(repo, [
+      { vm_id: 'vm-a', account_id: 'acc-a', created_at: at(5), status: 200 },
+      { vm_id: 'vm-a', account_id: 'acc-a', created_at: at(10), status: 500, error_code: 'api_error' },
+      { vm_id: 'vm-a', account_id: 'acc-a', created_at: at(31), status: 200 },
+      { vm_id: 'vm-a', account_id: 'acc-a', created_at: at(61), status: 200 },
+      { vm_id: 'vm-a', account_id: 'acc-a', created_at: at(24 * 60 - 1), status: 200 },
+      { vm_id: 'vm-a', account_id: 'acc-a', created_at: at(24 * 60 + 1), status: 200 },
+      { vm_id: 'vm-b', account_id: 'acc-b', created_at: at(40), status: 502 },
+    ])
+    const all = repo.healthBuckets({ now })
+    const a = all.get('acc-a\0vm-a')
+    assert.equal(a.length, 48)
+    assert.deepEqual(a[47], [1, 1], 'last slot holds the two newest rows')
+    assert.deepEqual(a[46], [1, 0], '31 minutes ago falls in the previous slot')
+    assert.deepEqual(a[45], [1, 0], '61 minutes ago falls two slots back')
+    assert.deepEqual(a[0], [1, 0], 'oldest in-range row lands in slot 0')
+    assert.equal(
+      a.reduce((n, [ok, err]) => n + ok + err, 0),
+      5,
+      'rows older than 24h are excluded',
+    )
+    assert.deepEqual(all.get('acc-b\0vm-b')[46], [0, 1], 'all-failure slot')
+    assert.equal(all.has('acc-c\0vm-c'), false, 'idle slot has no entry')
+
+    const byVm = repo.healthBuckets({ now, vmId: 'vm-b', slots: 84, slotMin: 120 })
+    assert.equal(byVm.get('vm-b').length, 84)
+    assert.deepEqual(byVm.get('vm-b')[83], [0, 1])
+
+    const top = repo.topErrors({ vmId: 'vm-a', since: at(60) })
+    assert.deepEqual(
+      top.map((r) => [r.code, r.count]),
+      [['api_error', 1]],
+    )
+  } finally {
+    db.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('billingStats attaches health_24h per account row', () => {
+  const { dir, db, repo } = freshDb()
+  try {
+    const now = Date.now()
+    seed(repo, [{ vm_id: 'vm-a', account_id: 'acc-a', created_at: new Date(now - 60_000).toISOString(), status: 200 }])
+    const row = repo.billingStats({ now }).accounts.find((r) => r.account_id === 'acc-a')
+    assert.equal(row.health_24h.length, 48)
+    assert.deepEqual(row.health_24h[47], [1, 0])
+  } finally {
+    db.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// Locks the arithmetic of the per-window accumulator (#1497): it sums rows in a
+// single pass instead of building an intermediate row object per event, and the
+// edges below are where a rewrite would silently change a number.
+test('aligned windows keep boundary, sign, unpriced and Fable rules per row', () => {
+  const { dir, db, repo } = freshDb()
+  try {
+    const now = Date.parse('2026-11-20T12:00:00.000Z')
+    const H = 3600_000
+    const DAY = 24 * H
+    const at = (ms) => new Date(now - ms).toISOString()
+    const row = (created_at, extra) => ({
+      vm_id: 'vm-a',
+      account_id: 'acc-1',
+      created_at,
+      output_tokens: 0,
+      cache_read_tokens: 0,
+      cache_creation_tokens: 0,
+      // An explicit pricing_model keeps the maintenance backfill, which repairs
+      // rows with pricing_model IS NULL, from rewriting the costs seeded below.
+      pricing_model: 'claude-sonnet-4',
+      ...extra,
+    })
+    seed(repo, [
+      // exactly on the 5h window start: inside
+      row(at(4 * H), { input_tokens: 10, total_cost: 0.01 }),
+      // one millisecond earlier: outside the 5h window, inside 7d
+      row(at(4 * H + 1), { input_tokens: 20, total_cost: 0.02 }),
+      // a negative cost contributes nothing to cost but still counts its tokens
+      row(at(H), { input_tokens: 7, total_cost: -5 }),
+      // unpriced with tokens counts; unpriced without tokens does not
+      row(at(2 * H), { input_tokens: 5, pricing_model: 'unpriced' }),
+      row(at(3 * H), { input_tokens: 0, pricing_model: 'unpriced' }),
+      // Fable rows: one inside the 7d_oi window, one a millisecond before it
+      row(at(2 * DAY), { input_tokens: 100, total_cost: 0.5, upstream_model: 'claude-fable-5-2' }),
+      row(at(4 * DAY + 1), { input_tokens: 1000, total_cost: 9, upstream_model: 'claude-fable-5-2' }),
+    ])
+    // An unparseable timestamp must drop out of every window, not land in all of them.
+    db.prepare(
+      `INSERT INTO usage_logs (id, request_id, created_at, account_id, vm_id, status, input_tokens, total_cost)
+       VALUES ('log_bad', 'req-bad', 'not-a-date', 'acc-1', 'vm-a', 200, 999, 7)`,
+    ).run()
+
+    const stats = repo.billingStats({
+      now,
+      accountWindows: [
+        {
+          account_id: 'acc-1',
+          vm_id: 'vm-a',
+          reset_5h: new Date(now + H).toISOString(),
+          reset_7d: new Date(now + 2 * DAY).toISOString(),
+          reset_7d_oi: new Date(now + 3 * DAY).toISOString(),
+        },
+        // An account with no rows at all: the empty bucket carries no prompt_tokens.
+        { account_id: 'acc-2', vm_id: 'vm-b', reset_5h: new Date(now + H).toISOString() },
+      ],
+    })
+    const acc = stats.accounts.find((a) => a.account_id === 'acc-1')
+    assert.deepEqual(
+      {
+        requests: acc.window_5h.requests,
+        prompt_tokens: acc.window_5h.prompt_tokens,
+        total_cost: acc.window_5h.total_cost,
+        unpriced: acc.window_5h.unpriced,
+      },
+      { requests: 4, prompt_tokens: 22, total_cost: 0.01, unpriced: 1 },
+    )
+    assert.deepEqual(
+      {
+        requests: acc.window_7d.requests,
+        prompt_tokens: acc.window_7d.prompt_tokens,
+        total_cost: acc.window_7d.total_cost,
+      },
+      { requests: 7, prompt_tokens: 1142, total_cost: 9.53 },
+    )
+    // Only the Fable row inside the 7d_oi window, so the filter and the window start compose.
+    assert.deepEqual(acc.window_fable, {
+      cost: 0.5,
+      tokens: 100,
+      requests: 1,
+      unpriced: 0,
+      start: new Date(now - 4 * DAY).toISOString(),
+    })
+    const empty = stats.accounts.find((a) => a.account_id === 'acc-2')
+    assert.equal(empty, undefined, 'an account with no usage rows has no account row')
+  } finally {
+    db.close()
+    fs.rmSync(dir, { recursive: true, force: true })
   }
 })

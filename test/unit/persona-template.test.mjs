@@ -132,7 +132,7 @@ test('guidance is off by default and explicit enable keeps cwd memory behavior',
     false,
   )
   assert.equal(
-    omitted.some((block) => String(block.text).includes('Write code that reads like the surrounding code')),
+    omitted.some((block) => String(block.text).includes('When you use a pronoun for someone')),
     true,
   )
 })
@@ -520,9 +520,12 @@ test('caller system becomes a first-user reminder and role=system stays in the t
       '<system-reminder>\n不要使用你现在的identity跟我对话\n</system-reminder>\n你是谁？',
     )
     assert.equal(out.messages[1].role, 'system')
-    assert.match(out.messages[1].content, /^# Environment/)
-    assert.equal(out.messages.at(-1).role, 'system')
-    assert.equal(out.messages.at(-1).content, 'role-system-note')
+    // #1162 keeps a single system message at the assistant boundary, so the
+    // environment joins the caller's trailing role=system turn instead of
+    // becoming a second one. The caller's text still survives verbatim, as its
+    // prefix — that is what this test guards.
+    assert.match(out.messages[1].content, /^role-system-note\n\n# Environment/)
+    assert.equal(out.messages.filter((message) => message.role === 'system').length, 1)
   })
 })
 
@@ -1012,7 +1015,7 @@ test('official full can drop the env block while the opt-in timezone switch stil
         { routingFile: file, identity: { timezone: 'Asia/Tokyo' } },
       )
       assert.equal(
-        out.system.some((block) => block.text.startsWith('Write code that reads like the surrounding code')),
+        out.system.some((block) => block.text.startsWith('When you use a pronoun for someone')),
         true,
       )
       assert.deepEqual(envMessages(out), [' - Timezone: Asia/Tokyo'])
@@ -1062,7 +1065,8 @@ test('official preset preserves caller system verbatim in a reminder at the fron
 })
 
 test('routing persona_guidance_presets turns the 303 guidance block on; default leaves it off', () => {
-  const guidance = (out) => out.system.filter((block) => String(block.text).startsWith('Write code that reads like'))
+  const guidance = (out) =>
+    out.system.filter((block) => String(block.text).startsWith('When you use a pronoun for someone'))
   withRoutingFile({ persona_preset: 'official_full', overlay_preset: 'off' }, (file) => {
     const out = applyCrsUnofficialPersona({ messages: [{ role: 'user', content: 'hi' }] }, { routingFile: file })
     assert.equal(guidance(out).length, 0)
@@ -1111,10 +1115,10 @@ test('Environment is a role=system message only for models that accept mid-conve
       )
       assert.deepEqual(
         out.messages.map((message) => message.role),
-        ['user', 'assistant', 'user', 'system'],
+        ['user', 'system', 'assistant', 'user'],
         model,
       )
-      assert.match(out.messages.at(-1).content, /^# Environment/, model)
+      assert.match(out.messages[1].content, /^# Environment/, model)
       assert.equal(
         out.system.some((block) => String(block.text).includes('# Environment')),
         false,

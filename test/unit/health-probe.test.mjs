@@ -121,10 +121,10 @@ test('cache_model overrides the cached response model', () => {
   assert.equal(msg.id, cachedBody.id)
 })
 
-test('NewAPI-shaped hi + 16 tokens matches', () => {
+test('hi + 16 tokens matches', () => {
   assert.equal(isHealthShape(unofficial, hiBody, cfg), true)
   assert.equal(isHealthShape(unofficial, { ...hiBody, max_tokens: 64 }, cfg), false)
-  // NewAPI omits stream (Go omitempty) and Accept; must replay JSON, not SSE.
+  // Omitted stream (Go omitempty) and Accept must replay JSON, not SSE.
   assert.equal(isClientStream(hiBody, unofficial), false)
   assert.equal('stream' in hiBody, false)
 })
@@ -356,6 +356,29 @@ test('selectHealthProbeTargets skips slots outside their working window', () => 
   )
 })
 
+for (const dataplane of ['crag', 'wrap']) {
+  test(`${dataplane} setup-token import recovers from an empty probe snapshot without another probe`, async () => {
+    const vm = { id: 'vm-01', status: 'running', dataplane, platform: 'anthropic', claude: {} }
+    let probeCalls = 0
+    const monitor = createHealthProbeMonitor({
+      config: { enabled: true, fail_closed: true, real: { vm_ids: [vm.id] } },
+      listTargets: () => [vm],
+      runChat: async () => {
+        probeCalls += 1
+      },
+    })
+    await monitor.runRealProbe()
+    assert.equal(monitor.rawSnapshot().error, 'no_schedulable_credential')
+    assert.equal(monitor.decide(unofficial, hiBody).action, 'fail')
+
+    vm.claude = { mode: 'setup-token', has_access: true, has_refresh: true }
+    assert.equal(monitor.decide(unofficial, hiBody).action, 'pass')
+    vm.schedulable = false
+    assert.equal(monitor.decide(unofficial, hiBody).action, 'fail')
+    assert.equal(probeCalls, 0)
+  })
+}
+
 test('probe_all_slots probes every target but snapshot uses first list success', async () => {
   const probed = []
   const monitor = createHealthProbeMonitor({
@@ -510,7 +533,7 @@ test('default match tokens stay below default real probe budget', () => {
 
 const cc = "You are Claude Code, Anthropic's official CLI for Claude."
 
-test('sub2api account test shape matches even with a claude-cli UA', () => {
+test('account probe matches even with a claude-cli UA', () => {
   const body = {
     model: 'claude-sonnet-4-5-20250929',
     max_tokens: 1024,
@@ -537,7 +560,7 @@ test('sub2api account test shape matches even with a claude-cli UA', () => {
   assert.equal(isHealthShape(headers, body, off, 'anthropic.messages'), false)
 })
 
-test('new-api and sub2api chat / responses tests without max_tokens match', () => {
+test('chat and responses probes match without max_tokens', () => {
   const chat = { model: 'claude-haiku-4-5', stream: true, messages: [{ role: 'user', content: 'hi' }] }
   assert.equal(isHealthShape(unofficial, chat, cfg, 'openai.chat'), true)
   const responses = {
@@ -601,7 +624,7 @@ test('no openai_model leaves GPT probes to the pool', async () => {
   monitor.stop()
 })
 
-test('streamed shapes satisfy sub2api and new-api stream checks', () => {
+test('health probe streams include protocol-specific completion markers', () => {
   const snap = cachedSnap()
   const chat = formatHealthSse('openai.chat', { model: 'claude-haiku-4-5' }, snap, cfg)
   const chatData = chat.split('\n').filter((l) => l.startsWith('data: '))

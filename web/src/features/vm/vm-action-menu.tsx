@@ -59,6 +59,20 @@ export function VmActionMenu({
   const restricted = restrictionTitle(vm)
   const admin = me.data?.role === 'admin'
   const perms = useVmPerms()
+  if (vm.gemini) {
+    return (
+      <Button
+        type='button'
+        size='sm'
+        variant='ghost'
+        className={className}
+        aria-label={`管理 ${vm.name || vm.id}`}
+        onClick={() => actions.openDetail(vm)}
+      >
+        <MoreHorizontal />
+      </Button>
+    )
+  }
   return (
     <>
       <DropdownMenu>
@@ -133,17 +147,22 @@ export function VmActionMenu({
               {actions.activate ? (
                 <DropdownMenuItem
                   disabled={
-                    isActiveVmPointer(vm) || actions.activatingId === vm.id
+                    actions.activatingId === vm.id ||
+                    (isActiveVmPointer(vm) && !actions.deactivate)
                   }
                   title={
                     isActiveVmPointer(vm)
-                      ? '已是当前活跃槽'
+                      ? '清空面板默认槽位，不影响调度'
                       : '写入 vms/active.json，面板默认接口指向此槽'
                   }
-                  onSelect={() => actions.activate?.(vm)}
+                  onSelect={() =>
+                    isActiveVmPointer(vm)
+                      ? actions.deactivate?.(vm)
+                      : actions.activate?.(vm)
+                  }
                 >
                   <Star />
-                  设为活跃
+                  {isActiveVmPointer(vm) ? '取消活跃' : '设为活跃'}
                 </DropdownMenuItem>
               ) : null}
               <DropdownMenuSeparator />

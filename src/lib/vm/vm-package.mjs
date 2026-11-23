@@ -35,8 +35,10 @@ import { normalizeVmConfig, resolveMachineSpec } from './machine-spec.mjs'
 import {
   SESSION_SLOT_MAX,
   SESSION_SLOT_MIN,
+  normalizeCragKernelVersion,
   normalizeKernelDataplane,
   normalizeSlotPersonaPreset,
+  parseCragKernelVersionPatch,
   parseKernelDataplanePatch,
 } from './slot-engine.mjs'
 export const VM_PACKAGE_TYPE = 'vm2api-vm-package'
@@ -174,6 +176,7 @@ export function buildVmPackage({
       persona_preset: personaOf(vm.persona_preset) || '',
       inference_engine: engineOf(vm.inference_engine) || '',
       dataplane: normalizeKernelDataplane(vm.dataplane, { inherit: true }) || '',
+      crag_kernel_version: normalizeCragKernelVersion(vm.crag_kernel_version, { inherit: true }) || '',
       auth_scheme: codex ? '' : normalizeAuthScheme(vm.claude?.auth_scheme || vm.auth_scheme),
       proxy_cli_enabled: hasBoundExit(proxy || vm.proxy),
       schedulable: operatorSchedulable(vm),
@@ -343,6 +346,8 @@ export function parseVmPackage(doc) {
   if (persona == null) return fail('invalid_package', 'persona_preset 无效')
   const dataplane = parseKernelDataplanePatch(vm.dataplane)
   if (!dataplane.ok) return fail('invalid_package', dataplane.error || 'dataplane 无效')
+  const cragVersion = parseCragKernelVersionPatch(vm.crag_kernel_version)
+  if (!cragVersion.ok) return fail('invalid_package', cragVersion.error || 'crag_kernel_version 无效')
   const policy = parsePolicy(vm.policy, codex)
   if (!policy.ok) return policy
   const proxy = parseProxy(doc.proxy)
@@ -369,6 +374,7 @@ export function parseVmPackage(doc) {
         persona_preset: persona,
         inference_engine: engine,
         dataplane: dataplane.value,
+        crag_kernel_version: cragVersion.value,
         auth_scheme: auth,
         proxy_cli_enabled: vm.proxy_cli_enabled === true,
         schedulable: vm.schedulable !== false,
@@ -445,6 +451,8 @@ function applyTraits(vm, spec) {
   else delete vm.inference_engine
   if (traits.dataplane) vm.dataplane = traits.dataplane
   else delete vm.dataplane
+  if (traits.crag_kernel_version) vm.crag_kernel_version = traits.crag_kernel_version
+  else delete vm.crag_kernel_version
   if (!spec.codex) {
     vm.claude = vm.claude && typeof vm.claude === 'object' ? vm.claude : {}
     if (traits.auth_scheme) vm.claude.auth_scheme = traits.auth_scheme
@@ -547,10 +555,13 @@ async function attachProxy(projectRoot, id, spec, proxyPool, ownerUserId) {
   return { ok: true }
 }
 
-function finishControl(projectRoot, id, spec, status) {
+function finishControl(projectRoot, id, spec, status, { telemetryDefaultEnabled = false } = {}) {
   const file = path.join(projectRoot, 'vms', `${id}.json`)
   const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
   applyTraits(vm, spec)
+  if (telemetryDefaultEnabled === true && !isCodexVm(vm)) {
+    vm.seed_policy = standardSeedPolicy(vm.seed_policy || {}, { defaultEnabled: true })
+  }
   applySchedule(vm, spec, credentialPresent(spec, vm))
   vm.status = status
   // Do not reset proxy_cli_enabled: attachProxy/bindVmProxy owns it.
@@ -587,6 +598,7 @@ export async function commitVmPackage({
   owner = { role: 'admin', userId: null },
   proxyPool,
   occupied = [],
+  telemetryDefaultEnabled = false,
 }) {
   if (!parsed?.ok)
     return { ok: false, status: 400, error: parsed?.error || { code: 'invalid_package', message: '包无效' } }
@@ -638,7 +650,7 @@ export async function commitVmPackage({
       unschedulable: { reason: 'no_credential', detail: null, at: new Date().toISOString() },
       proxy_cli_enabled: false,
       proxy_required: false,
-      seed_policy: standardSeedPolicy(),
+      seed_policy: standardSeedPolicy({}, { defaultEnabled: telemetryDefaultEnabled === true }),
       runtime: { type: 'docker' },
       machine: resolveMachineSpec({ config: normalizeVmConfig(), runtime: 'docker' }),
       owner_user_id: owner.role === 'user' ? normalizeOwnerId(owner.userId) : null,
@@ -667,6 +679,9 @@ export async function commitVmPackage({
     return { ok: false, status: 403, error: { code: 'proxy_forbidden', message: '无权绑定这个出口' } }
   }
   applyTraits(vm, spec)
+  if (create && telemetryDefaultEnabled === true && !isCodexVm(vm)) {
+    vm.seed_policy = standardSeedPolicy(vm.seed_policy || {}, { defaultEnabled: true })
+  }
   applySchedule(vm, spec, false)
   atomicWriteJson(file, vm, { mode: 0o600 })
   if (create) {
@@ -680,7 +695,7 @@ export async function commitVmPackage({
 
   const written = writeCredential(projectRoot, id, spec)
   if (!written.ok) return { ok: false, status: 400, error: written.error }
-  let saved = finishControl(projectRoot, id, spec, status)
+  let saved = finishControl(projectRoot, id, spec, status, { telemetryDefaultEnabled })
   if (written.account) {
     mirrorCodex(saved, written.account)
     saved.updated_at = new Date().toISOString()
@@ -688,7 +703,7 @@ export async function commitVmPackage({
   }
   const attached = await attachProxy(projectRoot, id, spec, proxyPool, saved.owner_user_id || null)
   if (!attached.ok) return { ok: false, status: 400, error: attached.error }
-  saved = finishControl(projectRoot, id, spec, status)
+  saved = finishControl(projectRoot, id, spec, status, { telemetryDefaultEnabled })
   if (written.account) mirrorCodex(saved, written.account)
   // Flag already follows the bound exit from attachProxy.
   saved.updated_at = new Date().toISOString()

@@ -4,10 +4,10 @@
  *
  * Telemetry has one read: `telemetry_disabled === false` means on
  * (`isTelemetryEnabled`). Everything else is a mirror of that bit.
- *   on  → delete kill-switch keys; sidecar on
+ *   on  → delete managed kill-switch keys; native 1P policy on
  *         CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1"
  *         do_not_track = false
- *   off → kill-switch keys = "1"; sidecar off
+ *   off → kill-switch keys = "1"; native collection/sending off and queue cleared
  *         CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "0"
  *         do_not_track = true (DO_NOT_TRACK=1)
  * grove_enabled is always false (Help improve Claude off).
@@ -60,6 +60,7 @@ export const TELEMETRY_KILL_ENV_KEYS = Object.freeze([...Object.keys(TELEMETRY_K
  */
 export const LEGACY_SCRIPT_ENV_KEYS = Object.freeze([
   ...TELEMETRY_KILL_ENV_KEYS,
+  'CLAUDE_CODE_DISABLE_TELEMETRY',
   ...Object.keys(CLOUD_PROVIDER_OFF_ENV),
   NONESSENTIAL_TRAFFIC_ENV_KEY,
   'ANTHROPIC_BASE_URL',
@@ -67,9 +68,6 @@ export const LEGACY_SCRIPT_ENV_KEYS = Object.freeze([
   'ANTHROPIC_AUTH_TOKEN',
   'ANTHROPIC_UNIX_SOCKET',
 ])
-
-/** @deprecated use TELEMETRY_KILL_ENV; kept for panel payloads when telemetry is off */
-export const REQUIRED_SEED_ENV = TELEMETRY_KILL_ENV
 
 export function stripLegacyScriptEnv(env = {}) {
   const next = { ...(env && typeof env === 'object' ? env : {}) }
@@ -171,13 +169,13 @@ export function defaultSeedPolicy(partial = {}) {
 }
 
 /**
- * New slots default to telemetry off. Only an explicit override enables uploads.
+ * New slots follow `routing.telemetry.default_enabled`. Missing or false keeps telemetry off.
+ * When `defaultEnabled` is true it overrides a packaged `telemetry_disabled`.
+ * When it is false, an explicit `telemetry_disabled` in `partial` still wins.
  */
-export function standardSeedPolicy(partial = {}) {
-  return defaultSeedPolicy({
-    telemetry_disabled: true,
-    ...partial,
-  })
+export function standardSeedPolicy(partial = {}, { defaultEnabled = false } = {}) {
+  const telemetryDisabled = defaultEnabled === true ? false : !isTelemetryEnabled(partial)
+  return defaultSeedPolicy({ ...partial, telemetry_disabled: telemetryDisabled })
 }
 
 /**
@@ -187,6 +185,7 @@ export function standardSeedPolicy(partial = {}) {
 export function sanitizeInboundBody(body, seedPolicy = {}) {
   if (!body || typeof body !== 'object') return body || {}
   const out = { ...body }
+  delete out.caller_cwd // Internal worker envelope field, never a public body field.
   const rejectMeta = seedPolicy.reject_client_metadata_identity !== false
   const rejectSettings = seedPolicy.reject_client_settings !== false
   if (rejectMeta && out.metadata && typeof out.metadata === 'object') {

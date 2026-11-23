@@ -7,6 +7,7 @@ import {
   effectiveRateWindow,
   headerHardBlocked,
   headerWindowOrEmpty,
+  noResetRejectUntilMs,
   parseResetMs,
   WINDOW_5H_MS,
   WINDOW_7D_MS,
@@ -196,7 +197,8 @@ function policyOf(input = {}) {
   return {
     limit_5h: Number(p.limit_5h ?? p.safety_ratio ?? fallback.limit_5h),
     limit_7d: Number(p.limit_7d ?? p.weekly_safety_ratio ?? fallback.limit_7d),
-    gate: quotaGateOf(p),
+    gate5: quotaGateOf(p, '5h'),
+    gate7: quotaGateOf(p, '7d'),
   }
 }
 
@@ -334,7 +336,7 @@ export function evaluateAccount({
     )
   }
 
-  // sub2api IsSchedulable: live rate_limit_reset_at / overload_until win over passive Extra.
+  // Live rate_limit_reset_at / overload_until take precedence over passive usage data.
   if (hardBlock?.until > now) {
     const overloaded = hardBlock.reason === 'overloaded'
     return finish(base, {
@@ -355,7 +357,10 @@ export function evaluateAccount({
       usable: true,
       reason: 'quota_5h_header',
       window: '5h',
-      until: quotaUntilMs({ ...quota, reset_5h: quota.reset_5h || account.unified?.headers?.['5h']?.reset }, '5h', now),
+      until:
+        quotaUntilMs({ ...quota, reset_5h: quota.reset_5h || account.unified?.headers?.['5h']?.reset }, '5h', now) ||
+        noResetRejectUntilMs(account.unified || {}, '5h') ||
+        null,
     })
   }
   if (headerHardBlocked(account.unified || {}, '7d', now) || headerHardBlocked(quota, '7d', now)) {
@@ -366,7 +371,10 @@ export function evaluateAccount({
       usable: true,
       reason: 'quota_7d_header',
       window: '7d',
-      until: quotaUntilMs({ ...quota, reset_7d: quota.reset_7d || account.unified?.headers?.['7d']?.reset }, '7d', now),
+      until:
+        quotaUntilMs({ ...quota, reset_7d: quota.reset_7d || account.unified?.headers?.['7d']?.reset }, '7d', now) ||
+        noResetRejectUntilMs(account.unified || {}, '7d') ||
+        null,
     })
   }
 
@@ -395,8 +403,8 @@ export function evaluateAccount({
     })
   }
 
-  const z5 = gateZone(u5, pol.limit_5h, pol.gate)
-  const z7 = gateZone(u7, pol.limit_7d, pol.gate)
+  const z5 = gateZone(u5, pol.limit_5h, pol.gate5)
+  const z7 = gateZone(u7, pol.limit_7d, pol.gate7)
   if (z5 === GATE_GATED) {
     return finish(base, {
       key: 'quota',
@@ -525,6 +533,7 @@ export function resolveScheduleState({
   availability = {},
   restrictionUntil = null,
   restrictionReason = null,
+  kernelFaulted = false,
   circuit = null,
   seats = null,
   sessions = null,
@@ -539,6 +548,7 @@ export function resolveScheduleState({
     vm: record,
     availability,
     restrictionReason,
+    kernelFaulted,
     restrictionUntil,
     circuit,
     seats,

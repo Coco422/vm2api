@@ -292,6 +292,26 @@ export function seatTitle(vm: Vm): string {
   return parts.join(' · ')
 }
 
+/**
+ * 这台 VM 正在处理的请求数。
+ * 有逐席 session 时只加总正在请求的席位（`active`，或 `inflight > 0`）。
+ * 重启交接的 `held` 不算。`inflight` 为 0 但状态已是 active 时记 1。
+ * 没有逐席明细（Codex）才回退 VM 级 `inflight`。
+ * `session_active` 是空闲对话窗口，不能当成请求中。
+ */
+export function vmRequestingCount(
+  vm: Pick<Vm, 'seat_sessions' | 'inflight'>
+): number {
+  if (!Array.isArray(vm.seat_sessions)) return Number(vm.inflight) || 0
+  let total = 0
+  for (const seat of vm.seat_sessions) {
+    const inflight = Number(seat.inflight) || 0
+    if (inflight > 0) total += inflight
+    else if (seat.state === 'active') total += 1
+  }
+  return total
+}
+
 export function vmCooldownTitle(vm: Vm): string {
   const cool = vmCooldown(vm)
   if (!cool) return '无冷却'
@@ -531,6 +551,15 @@ function restrictionTone(vm: Vm | undefined): StatusTone | null {
         cls: 'bad',
       }
     }
+    // 内核故障（自动恢复预算耗尽）不是额度问题：用红色与「额度限制」区分，
+    // 提示运维去详情页诊断，而不是等窗口重置。
+    if (/^kernel_faulted$/.test(reason)) {
+      return {
+        key: 'kernel_fault',
+        text: restrictionLabel(vm, '内核故障'),
+        cls: 'bad',
+      }
+    }
     // 休息时段是操作员排班，不是上游冷却：单独成态，别引人去点「清冷却」。
     if (vm.availability?.key === 'rest' || /rest_period/.test(reason)) {
       return {
@@ -721,22 +750,49 @@ export function claudeTier(vm: Vm | undefined): StatusTone {
     return { key: 'codex', label: plan, cls: 'codex', text: plan }
   }
   if (!vm?.has_token) return { key: 'none', label: '—', cls: 'none', text: '—' }
-  if (vm.usage_has_fable === false)
-    return { key: 'pro', label: 'Pro', cls: 'pro', text: 'Pro' }
-  const raw = String(vm.account_tier || '').toLowerCase()
-  const oi = vm.utilization_7d_oi
-  const oiN =
-    oi == null ? null : Number(oi) > 1.5 ? Number(oi) / 100 : Number(oi)
-  const realFable =
-    vm.usage_has_fable === true ||
-    (oiN != null && Boolean(vm.reset_7d_oi || oiN < 1))
-  // Usage 里有 Fable 就是 Max。落盘 pro / hop 403 不能盖掉。
-  // 没有套餐证据时不要画成 Pro，否则 Max 探测未完成的槽会一直显示 Pro。
-  if (realFable || raw === 'max')
-    return { key: 'max', label: 'Max', cls: 'max', text: 'Max' }
-  if (raw === 'pro')
-    return { key: 'pro', label: 'Pro', cls: 'pro', text: 'Pro' }
-  return { key: 'pro', label: 'Pro', cls: 'pro', text: 'Pro' }
+  // Legacy account_tier may come from Fable usage or a default Pro policy.
+  let raw = String(vm.subscription_type || '')
+    .trim()
+    .toLowerCase()
+  const profileTier = String(vm.account_tier || '')
+    .trim()
+    .toLowerCase()
+  if (
+    vm.account_tier_source === 'profile' &&
+    (profileTier === 'pro' || profileTier === 'max')
+  ) {
+    raw = profileTier
+  } else if (
+    (!raw || raw === 'free' || raw === 'pro') &&
+    /(?:^|_)claude_max(?:_|$)/i.test(String(vm.rate_limit_tier || ''))
+  ) {
+    // Imported credentials may carry a default Pro subscription.
+    raw = 'max'
+  }
+  const labels: Record<string, string> = {
+    free: 'Free',
+    pro: 'Pro',
+    max: 'Max',
+    team: 'Team',
+    enterprise: 'Enterprise',
+  }
+  let label = Object.prototype.hasOwnProperty.call(labels, raw)
+    ? labels[raw]
+    : ''
+  if (!label)
+    return { key: 'unknown', label: '未识别', cls: 'none', text: '未识别' }
+  if (raw === 'max') {
+    const multiplier = String(vm.rate_limit_tier || '').match(
+      /(?:^|_)claude_max_(5x|20x)(?:_|$)/i
+    )?.[1]
+    if (multiplier) label += ` ${multiplier.toLowerCase()}`
+  }
+  return {
+    key: raw,
+    label,
+    cls: raw === 'max' || raw === 'pro' ? raw : 'none',
+    text: label,
+  }
 }
 
 export function vmBuckets(vms: Vm[]) {

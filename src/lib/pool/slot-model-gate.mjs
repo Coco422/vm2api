@@ -1,7 +1,7 @@
 import { inferClaudeTier } from './claude-tier.mjs'
 import { isFableModel } from './upstream-error-policy.mjs'
 import { getModelEntry, getPolicyCatalogIds, resolvePolicyModelId } from '../protocol/model-policy.mjs'
-import { getGptPolicyCatalogIds } from '../protocol/gpt-model-policy.mjs'
+import { getGptPolicyCatalogIds, listImageToolModels, resolveGptFastAlias } from '../protocol/gpt-model-policy.mjs'
 import { isCodexCatalogModel } from '../protocol/models.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 
@@ -61,9 +61,13 @@ export function parseAllowedModelsPatch(raw, opts = {}) {
   if (!Array.isArray(raw)) return { ok: false, error: 'allowed_models must be an array' }
   const gpt = opts.platform === 'openai' || opts.platform === 'gpt' || opts.platform === 'codex' || isCodexVm(opts.vm)
   const catalog = new Set(
-    (gpt ? getGptPolicyCatalogIds({ enabledOnly: false }) : getPolicyCatalogIds({ enabledOnly: false })).map((id) =>
-      id.toLowerCase(),
-    ),
+    (gpt
+      ? [
+          ...getGptPolicyCatalogIds({ enabledOnly: false }),
+          ...listImageToolModels().flatMap((model) => [model.id, ...(model.snapshots || [])]),
+        ]
+      : getPolicyCatalogIds({ enabledOnly: false })
+    ).map((id) => id.toLowerCase()),
   )
   const ids = []
   for (const item of raw) {
@@ -98,12 +102,22 @@ function quotaView(vm, account) {
     status_7d_oi: unified.status_7d_oi || unified['7d_oi']?.status || vm?.status_7d_oi,
     '7d_oi': unified['7d_oi'],
     account_tier: unified.account_tier || vm?.claude?.account_tier || vm?.account_tier,
+    account_tier_source: unified.account_tier
+      ? unified.account_tier_source
+      : vm?.claude?.account_tier
+        ? vm.claude.account_tier_source
+        : vm?.account_tier_source,
+    rate_limit_tier: vm?.claude?.rate_limit_tier || vm?.rate_limit_tier || unified.rate_limit_tier || null,
     usage_has_fable: unified.usage_has_fable ?? vm?.usage_has_fable ?? null,
   }
 }
 
 export function resolveSlotTier(vm, account = null) {
+  const vmPlan = vm?.claude?.account_tier ? vm.claude : vm
+  if (vmPlan?.account_tier_source === 'profile' && ['pro', 'max'].includes(vmPlan.account_tier))
+    return vmPlan.account_tier
   const quota = quotaView(vm, account)
+  if (quota.account_tier_source === 'profile' && ['pro', 'max'].includes(quota.account_tier)) return quota.account_tier
   // An explicit Pro classification must veto stale Max usage evidence. The
   // latter can survive a credential change or a Fable entitlement rejection.
   if (
@@ -116,6 +130,7 @@ export function resolveSlotTier(vm, account = null) {
     {
       has_token: true,
       account_tier: quota.account_tier,
+      rate_limit_tier: quota.rate_limit_tier,
       fable: quota.fable,
       utilization_7d_oi: quota.utilization_7d_oi,
       reset_7d_oi: quota.reset_7d_oi,
@@ -126,8 +141,11 @@ export function resolveSlotTier(vm, account = null) {
   ).key
 }
 
-export function slotAllowsModel({ vm, account = null, model } = {}) {
-  const modelKey = String(model || '').trim()
+export function slotAllowsModel({ vm, account = null, model, fableRequiresMax = false } = {}) {
+  const requestedModel = String(model || '').trim()
+  const fast = resolveGptFastAlias(requestedModel)
+  if (fast.kind === 'unavailable') return { ok: false, reason: 'model_fast_unavailable' }
+  const modelKey = fast.kind === 'fast' ? fast.base : requestedModel
   if (!modelKey) return { ok: true }
   if (isCodexVm(vm)) {
     if (!isCodexCatalogModel(modelKey)) return { ok: false, reason: 'codex_model_required' }
@@ -135,11 +153,13 @@ export function slotAllowsModel({ vm, account = null, model } = {}) {
     return { ok: false, reason: 'claude_model_required' }
   }
   const canonical = resolvePolicyModelId(modelKey) || modelKey
-  const deniedUntil = Number(account?.unified?.model_denied_until?.[canonical]) || 0
-  if (deniedUntil > Date.now()) return { ok: false, reason: 'model_not_supported' }
-  if (isFableModel(modelKey) && resolveSlotTier(vm, account) !== 'max') {
+  // Before the per-account denial: a Pro slot is out for the plan, which is
+  // what the caller should hear, whatever else was recorded on it.
+  if (fableRequiresMax && isFableModel(modelKey) && resolveSlotTier(vm, account) !== 'max') {
     return { ok: false, reason: 'fable_requires_max' }
   }
+  const deniedUntil = Number(account?.unified?.model_denied_until?.[canonical]) || 0
+  if (deniedUntil > Date.now()) return { ok: false, reason: 'model_not_supported' }
   const allowed = normalizeAllowedModels(vm?.policy?.allowed_models)
   if (allowed && !modelMatchesAllowlist(modelKey, allowed)) {
     return { ok: false, reason: 'model_not_allowed' }

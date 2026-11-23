@@ -1,4 +1,5 @@
 import { getDb } from '../database.mjs'
+import { enqueueWrite, writeBehindArmed } from '../write-behind.mjs'
 
 function parse(value, fallback = null) {
   if (value == null) return fallback
@@ -46,6 +47,7 @@ export class RequestAttemptsRepo {
         cooldown_until, downstream_committed, terminal_state, usage_json,
         wait_ms, ttft_ms, latency_ms, queue_wait_ms, scheduling_ms
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(request_id, attempt_no) DO NOTHING
     `)
     this._complete = db.prepare(`
       UPDATE request_attempts SET
@@ -74,46 +76,61 @@ export class RequestAttemptsRepo {
     schedulingMs = null,
   }) {
     const startedAt = new Date().toISOString()
-    this._insert.run(
-      requestId,
-      attemptNo,
-      vmId ?? null,
-      accountId ?? null,
-      model ?? null,
-      selectionReason ?? null,
-      startedAt,
-      null,
-      null,
-      null,
-      null,
-      null,
-      0,
-      'started',
-      null,
-      waitMs ?? 0,
-      null,
-      null,
-      queueWaitMs,
-      schedulingMs,
-    )
+    const write = () => {
+      this._insert.run(
+        requestId,
+        attemptNo,
+        vmId ?? null,
+        accountId ?? null,
+        model ?? null,
+        selectionReason ?? null,
+        startedAt,
+        null,
+        null,
+        null,
+        null,
+        null,
+        0,
+        'started',
+        null,
+        waitMs ?? 0,
+        null,
+        null,
+        queueWaitMs,
+        schedulingMs,
+      )
+    }
+    if (writeBehindArmed()) {
+      enqueueWrite(write)
+      return null
+    }
+    write()
     return this.list(requestId).find((item) => item.attempt_no === attemptNo) || null
   }
 
   complete(requestId, attemptNo, result = {}) {
-    this._complete.run(
-      new Date().toISOString(),
-      result.upstreamStatus ?? null,
-      result.errorScope ?? null,
-      result.action ?? null,
-      result.cooldownUntil ?? null,
-      result.downstreamCommitted ? 1 : 0,
-      result.terminalState ?? null,
-      result.usage != null ? JSON.stringify(result.usage) : null,
-      result.ttftMs ?? null,
-      result.latencyMs ?? null,
-      requestId,
-      attemptNo,
-    )
+    const completedAt = new Date().toISOString()
+    const write = () => {
+      this._complete.run(
+        completedAt,
+        result.upstreamStatus ?? null,
+        result.errorScope ?? null,
+        result.action ?? null,
+        result.cooldownUntil ?? null,
+        result.downstreamCommitted ? 1 : 0,
+        result.terminalState ?? null,
+        result.usage != null ? JSON.stringify(result.usage) : null,
+        result.ttftMs ?? null,
+        result.latencyMs ?? null,
+        requestId,
+        attemptNo,
+      )
+    }
+    if (writeBehindArmed()) {
+      enqueueWrite(write)
+      return null
+    }
+    write()
     return this.list(requestId).find((item) => item.attempt_no === attemptNo) || null
   }
 

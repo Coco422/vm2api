@@ -8,6 +8,7 @@ import { cn } from '@/lib/utils'
 import { PageHeader } from '@/components/page-header'
 import { QueryGate } from '@/components/query-gate'
 import { meQueryOptions } from '@/features/auth/queries'
+import { VmBatchStatistics } from '@/features/company/vm-batch-statistics'
 import { BentoGrid } from './bento'
 import { LeaderboardCard } from './leaderboard-card'
 import { LeaderboardSection } from './leaderboard-section'
@@ -18,42 +19,67 @@ import { StatisticsChartCard } from './statistics-chart-card'
 import { browserTimeZone, percentChange } from './stats-format'
 
 const ADMIN_DIMENSIONS: StatsDimension[] = ['user', 'key', 'model', 'vm']
-// user 角色只能看本人数据，后端对 user / vm 维度回 400。
+// 个人趋势按本人归属过滤，租户全局趋势只按模型分组。
 const USER_DIMENSIONS: StatsDimension[] = ['key', 'model']
 
 const ADMIN_CARDS: { scope: LeaderboardScope; title: string }[] = [
   { scope: 'user', title: '用户排行' },
-  { scope: 'vm', title: '供应商排行' },
+  { scope: 'vm', title: '虚拟机排行' },
   { scope: 'model', title: '模型排行' },
 ]
 const USER_CARDS: { scope: LeaderboardScope; title: string }[] = [
   { scope: 'key', title: '密钥排行' },
   { scope: 'model', title: '模型排行' },
 ]
+const GLOBAL_CARDS = ADMIN_CARDS.filter(
+  (card) => card.scope === 'user' || card.scope === 'model'
+)
 const CARD_ACCENTS = ['primary', 'purple', 'blue'] as const
 
-export function StatisticsPage() {
+export function StatisticsPage({ global = false }: { global?: boolean }) {
   const me = useQuery(meQueryOptions())
+  const isUser = me.data?.role === 'user'
   return (
     <PageHeader
-      title={VIEW_TITLES.statistics}
-      description={VIEW_DESCRIPTIONS.statistics}
+      title={global ? '全局统计' : isUser ? '个人统计' : VIEW_TITLES.statistics}
+      description={
+        global
+          ? '全站请求、Token、消费与耗时汇总，以及模型趋势、用户和模型排行'
+          : isUser
+            ? '自己的请求、消费与耗时趋势，以及密钥和模型排行'
+            : VIEW_DESCRIPTIONS.statistics
+      }
     >
       <QueryGate loading={me.isLoading} error={me.error}>
-        <StatisticsDashboard isUser={me.data?.role === 'user'} />
+        <StatisticsDashboard
+          key={`${isUser}-${global}`}
+          isUser={isUser}
+          global={global}
+        />
       </QueryGate>
     </PageHeader>
   )
 }
 
-function StatisticsDashboard({ isUser }: { isUser: boolean }) {
+function StatisticsDashboard({
+  isUser,
+  global,
+}: {
+  isUser: boolean
+  global: boolean
+}) {
   const [tz] = useState(browserTimeZone)
-  const dimensions = isUser ? USER_DIMENSIONS : ADMIN_DIMENSIONS
-  const cards = isUser ? USER_CARDS : ADMIN_CARDS
+  const dimensions: StatsDimension[] = global
+    ? ['model']
+    : isUser
+      ? USER_DIMENSIONS
+      : ADMIN_DIMENSIONS
+  const cards = global ? GLOBAL_CARDS : isUser ? USER_CARDS : ADMIN_CARDS
   const boardScopes = cards.map((card) => card.scope)
   const [boardScope, setBoardScope] = useState<LeaderboardScope>(boardScopes[0])
   const boardRef = useRef<HTMLDivElement>(null)
-  const overview = useQuery(usageOverviewQueryOptions(tz)).data
+  const overviewQuery = useQuery(usageOverviewQueryOptions(tz, global))
+  const overview = overviewQuery.data
 
   const openBoard = (scope: LeaderboardScope) => {
     setBoardScope(scope)
@@ -72,18 +98,20 @@ function StatisticsDashboard({ isUser }: { isUser: boolean }) {
       <BentoGrid>
         <BentoMetricCard
           title='活跃 Session'
-          value={overview?.activeSessions ?? 0}
+          value={overview ? overview.activeSessions : null}
           formatter={(v) => Math.round(v).toLocaleString()}
           icon={Activity}
           accentColor='emerald'
           className='min-h-[120px]'
-          comparisons={[
-            { value: overview?.rpm ?? 0, label: 'RPM', isPercentage: false },
-          ]}
+          comparisons={
+            overview?.rpm == null
+              ? undefined
+              : [{ value: overview.rpm, label: 'RPM', isPercentage: false }]
+          }
         />
         <BentoMetricCard
           title='今日请求'
-          value={overview?.todayRequests ?? 0}
+          value={overview ? overview.todayRequests : null}
           formatter={(v) => Math.round(v).toLocaleString()}
           icon={TrendingUp}
           accentColor='blue'
@@ -93,8 +121,8 @@ function StatisticsDashboard({ isUser }: { isUser: boolean }) {
           )}
         />
         <BentoMetricCard
-          title='今日消费'
-          value={overview?.todayCost ?? 0}
+          title='今日消费 · 官方价'
+          value={overview ? overview.todayCost : null}
           formatter={(v) => formatCurrency(v)}
           icon={DollarSign}
           accentColor='amber'
@@ -105,26 +133,28 @@ function StatisticsDashboard({ isUser }: { isUser: boolean }) {
         />
         <BentoMetricCard
           title='平均响应时间'
-          value={overview?.todayAvgDurationMs ?? 0}
+          value={overview?.todayAvgDurationMs ?? null}
           formatter={(v) => formatDuration(Math.round(v))}
           icon={Clock}
           accentColor='purple'
           className='min-h-[120px]'
-          // 响应时间变短是好事：取反让下降显示为绿色上箭头（与 hub 一致）。
-          comparisons={vsYesterday(
-            durationChange == null ? null : -durationChange
-          )}
+          // 响应时间变短是好事：保留下降箭头，只把颜色反过来。
+          comparisons={vsYesterday(durationChange)}
+          invertSentiment
         />
       </BentoGrid>
 
-      <StatisticsChartCard dimensions={dimensions} tz={tz} />
+      {global && <VmBatchStatistics />}
+
+      <StatisticsChartCard dimensions={dimensions} tz={tz} global={global} />
 
       <div
         className={cn(
           'grid grid-cols-1 gap-6 sm:grid-cols-2',
-          isUser
-            ? 'lg:grid-cols-[1fr_1fr_280px]'
-            : 'lg:grid-cols-[1fr_1fr_1fr_280px]'
+          !global &&
+            (isUser
+              ? 'lg:grid-cols-[1fr_1fr_280px]'
+              : 'lg:grid-cols-[1fr_1fr_1fr_280px]')
         )}
       >
         {cards.map((card, index) => (
@@ -133,17 +163,19 @@ function StatisticsDashboard({ isUser }: { isUser: boolean }) {
             title={card.title}
             scope={card.scope}
             tz={tz}
+            global={global}
             accentColor={CARD_ACCENTS[index]}
             onViewAll={() => openBoard(card.scope)}
           />
         ))}
-        <LiveSessionsPanel className='min-h-[280px]' />
+        {!global && <LiveSessionsPanel className='min-h-[280px]' />}
       </div>
 
       <div ref={boardRef} className='scroll-mt-20'>
         <LeaderboardSection
           scopes={boardScopes}
           tz={tz}
+          global={global}
           scope={boardScope}
           onScopeChange={setBoardScope}
         />

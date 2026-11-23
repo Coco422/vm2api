@@ -34,6 +34,7 @@ function serverPanelHandlers(src) {
 const PANEL_ROUTE_SAMPLES = [
   ['POST', '/api/panel/login'],
   ['POST', '/api/panel/logout'],
+  ['PATCH', '/api/panel/me'],
   ['GET', '/api/panel/dashboard'],
   ['GET', '/api/panel/database/metrics'],
   ['GET', '/api/panel/version'],
@@ -42,6 +43,7 @@ const PANEL_ROUTE_SAMPLES = [
   ['GET', '/api/panel/vms'],
   ['GET', '/api/panel/vms/vm-01'],
   ['PATCH', '/api/panel/vms/vm-01'],
+  ['PATCH', '/api/panel/vms/vm-01/quota-thresholds'],
   ['DELETE', '/api/panel/vms/vm-01'],
   ['POST', '/api/panel/vms/vm-01/schedulable'],
   ['POST', '/api/panel/vms/vm-01/cooldown/clear'],
@@ -72,6 +74,7 @@ const PANEL_ROUTE_SAMPLES = [
   ['POST', '/api/panel/vms/vm-01/start'],
   ['POST', '/api/panel/vms/vm-01/stop'],
   ['POST', '/api/panel/vms/vm-01/activate'],
+  ['POST', '/api/panel/vms/vm-01/deactivate'],
   ['POST', '/api/panel/vms/vm-01/reset'],
   ['POST', '/api/panel/vms/vm-01/reset-fingerprint'],
   ['POST', '/api/panel/vms/vm-01/allocate-proxy'],
@@ -132,6 +135,7 @@ const PANEL_ROUTE_SAMPLES = [
   ['POST', '/api/panel/api-endpoints/e1/keys'],
   ['DELETE', '/api/panel/api-endpoints/e1/keys/k1'],
   ['POST', '/api/panel/anthropic/messages'],
+  ['POST', '/api/panel/api/messages'],
   ['GET', '/api/panel/proxies'],
   ['POST', '/api/panel/proxies/import'],
   ['POST', '/api/panel/proxies/probe'],
@@ -156,6 +160,7 @@ const PANEL_ROUTE_SAMPLES = [
   ['GET', '/api/panel/usage-logs/overview'],
   ['GET', '/api/panel/statistics'],
   ['GET', '/api/panel/statistics/leaderboard'],
+  ['GET', '/api/panel/statistics/vm-batches'],
 ]
 
 test('panel route samples all have server handlers', () => {
@@ -185,5 +190,8 @@ test('settings save imports public routing notify helpers', () => {
 
 test('PUT proxy restarts kin-egress when connection or domain_forward changes', () => {
   const routes = fs.readFileSync(path.join(root, 'src/lib/admin/panel-routes.mjs'), 'utf8')
-  assert.match(routes, /result\.domain_forward_changed \|\| result\.connection_changed/)
+  // Both flags have to reach the same restart guard. Other change flags may sit
+  // between them -- `dns_disable_svcb_https_changed` already does -- so match the
+  // disjunction rather than pinning the two to be neighbours.
+  assert.match(routes, /result\.domain_forward_changed(?:\s*\|\|\s*result\.\w+)*\s*\|\|\s*result\.connection_changed/)
 })

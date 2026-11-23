@@ -4,6 +4,9 @@
  * Request/usage shapes follow codex-proxy-rs (system→developer, extract_usage).
  */
 import { extractOpenaiUsage, openaiAnthropicUsageFromExtract, openaiChatUsageFromExtract } from './openai-usage.mjs'
+import { resolveGptFastAlias } from './gpt-model-policy.mjs'
+import { buildAnthropicSseError } from './stream-truncation.mjs'
+import { claudeStopReasonToOpenAIFinish } from './convert.mjs'
 
 const IDENTITY_KEYS = [
   'base_url',
@@ -29,6 +32,19 @@ export function stripCodexIdentity(body = {}) {
   return next
 }
 
+function normalizeFastAliasBody(body = {}) {
+  if (!body || typeof body !== 'object') return { ok: true, body }
+  const fast = resolveGptFastAlias(body.model)
+  if (fast.kind === 'unavailable') {
+    return { ok: false, code: fast.reason === 'base_disabled' ? 'model_disabled' : 'model_fast_unavailable' }
+  }
+  if (fast.kind !== 'fast') return { ok: true, body }
+  const model = String(body.model || '').trim()
+  const parts = model.split('/').filter(Boolean)
+  if (parts.length) parts[parts.length - 1] = fast.base
+  return { ok: true, body: { ...body, model: parts.join('/'), service_tier: fast.service_tier } }
+}
+
 function textParts(content) {
   if (typeof content === 'string') return content
   if (!Array.isArray(content)) return content?.text || ''
@@ -46,6 +62,13 @@ function imageUrlOf(part) {
   if (typeof part?.image_url === 'string') return part.image_url
   if (typeof part?.image_url?.url === 'string') return part.image_url.url
   if (typeof part?.url === 'string') return part.url
+  const source = part?.source
+  if (source && typeof source === 'object') {
+    if (source.type === 'base64' && typeof source.data === 'string' && typeof source.media_type === 'string') {
+      return `data:${source.media_type};base64,${source.data}`
+    }
+    if (source.type === 'url' && typeof source.url === 'string') return source.url
+  }
   return ''
 }
 
@@ -144,7 +167,9 @@ export function responsesToolChoice(choice) {
         if (!tool || typeof tool !== 'object') return null
         const toolName = String(tool.name || tool.function?.name || '').trim()
         if (tool.type === 'function' || tool.function) {
-          return toolName ? { type: 'function', name: toolName } : null
+          return toolName
+            ? { type: 'function', name: toolName, ...(tool.namespace ? { namespace: tool.namespace } : {}) }
+            : null
         }
         return tool
       })
@@ -155,7 +180,11 @@ export function responsesToolChoice(choice) {
 
   if (type === 'function' || type === 'tool' || type === 'custom') {
     if (!name) return type === 'custom' ? undefined : 'required'
-    return { type: type === 'tool' ? 'function' : type, name }
+    return {
+      type: type === 'tool' ? 'function' : type,
+      name,
+      ...(choice.namespace ? { namespace: choice.namespace } : {}),
+    }
   }
 
   if (type === 'mcp') {
@@ -211,6 +240,7 @@ export function chatToCodexResponses(body = {}) {
     out.max_output_tokens = body.max_tokens || body.max_completion_tokens
   }
   if (body.prompt_cache_key) out.prompt_cache_key = body.prompt_cache_key
+  if (body.service_tier != null) out.service_tier = body.service_tier
   return out
 }
 
@@ -222,7 +252,10 @@ export function completionsToCodexResponses(body = {}) {
     stream: body.stream !== false,
     store: false,
   }
+  if (body.reasoning) out.reasoning = body.reasoning
+  if (body.reasoning_effort) out.reasoning_effort = body.reasoning_effort
   if (body.prompt_cache_key) out.prompt_cache_key = body.prompt_cache_key
+  if (body.service_tier != null) out.service_tier = body.service_tier
   return out
 }
 
@@ -237,7 +270,7 @@ export function codexTextInput(text) {
   ]
 }
 
-export const CODEX_REASONING_EFFORTS = Object.freeze(['none', 'low', 'medium', 'high', 'xhigh', 'max'])
+export const CODEX_REASONING_EFFORTS = Object.freeze(['none', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
 export const DEFAULT_CODEX_REASONING_EFFORT = 'medium'
 
 export function normalizeCodexReasoningEffort(raw) {
@@ -256,6 +289,7 @@ function stripUnsupportedCodexFields(body = {}) {
     next.service_tier = 'priority'
   }
   delete next.max_output_tokens
+  delete next.max_completion_tokens
   delete next.max_tokens
   delete next.temperature
   delete next.prompt_cache_retention
@@ -294,9 +328,44 @@ export function normalizeCodexResponsesInput(body = {}) {
   return stripUnsupportedCodexFields(next)
 }
 
+function anthropicMessageToChat(message) {
+  if (!Array.isArray(message?.content)) return [message]
+  const messages = []
+  let content = []
+  // Flush at each tool boundary so mixed text and parallel tool results keep their order.
+  const flush = () => {
+    if (content.length) messages.push({ ...message, content })
+    content = []
+  }
+  for (const block of message.content) {
+    if (message.role === 'assistant' && block?.type === 'tool_use') {
+      flush()
+      messages.push({
+        role: 'assistant',
+        tool_calls: [
+          {
+            id: block.id,
+            type: 'function',
+            function: { name: block.name, arguments: JSON.stringify(block.input ?? {}) },
+          },
+        ],
+      })
+      continue
+    }
+    if (message.role === 'user' && block?.type === 'tool_result') {
+      flush()
+      messages.push({ role: 'tool', tool_call_id: block.tool_use_id, content: block.content })
+      continue
+    }
+    content.push(block)
+  }
+  flush()
+  return messages
+}
+
 export function anthropicToCodexResponses(body = {}) {
-  const messages = Array.isArray(body.messages) ? body.messages : []
-  const system = typeof body.system === 'string' ? [{ role: 'system', content: body.system }] : []
+  const messages = Array.isArray(body.messages) ? body.messages.flatMap(anthropicMessageToChat) : []
+  const system = body.system == null || body.system === '' ? [] : [{ role: 'system', content: body.system }]
   return chatToCodexResponses({
     model: body.model,
     messages: [...system, ...messages],
@@ -309,21 +378,24 @@ export function anthropicToCodexResponses(body = {}) {
 
 export function toCodexResponses(protocol, body, convert = {}) {
   const stripped = stripCodexIdentity(body)
+  const fast = normalizeFastAliasBody(stripped)
+  if (!fast.ok) return fast
+  const normalized = fast.body
   if (protocol === 'openai.responses') {
     return {
       ok: true,
-      body: normalizeCodexResponsesInput(stripped),
-      converted: typeof stripped.input === 'string',
+      body: normalizeCodexResponsesInput(normalized),
+      converted: typeof normalized.input === 'string',
     }
   }
   if (protocol === 'openai.chat' && convert.chat_to_codex !== false) {
-    return { ok: true, body: stripUnsupportedCodexFields(chatToCodexResponses(stripped)), converted: true }
+    return { ok: true, body: stripUnsupportedCodexFields(chatToCodexResponses(normalized)), converted: true }
   }
   if (protocol === 'openai.completions' && convert.completions_to_codex !== false) {
-    return { ok: true, body: stripUnsupportedCodexFields(completionsToCodexResponses(stripped)), converted: true }
+    return { ok: true, body: stripUnsupportedCodexFields(completionsToCodexResponses(normalized)), converted: true }
   }
   if (protocol === 'anthropic.messages' && convert.anthropic_to_codex === true) {
-    return { ok: true, body: stripUnsupportedCodexFields(anthropicToCodexResponses(stripped)), converted: true }
+    return { ok: true, body: stripUnsupportedCodexFields(anthropicToCodexResponses(normalized)), converted: true }
   }
   return { ok: false, code: 'protocol_not_allowed' }
 }
@@ -379,6 +451,21 @@ function toolDoneDeltas(slot, full) {
   return calls
 }
 
+function incompleteStopReason(response) {
+  if (response?.status !== 'incomplete') return null
+  const reason = response.incomplete_details?.reason
+  if (reason === 'max_output_tokens') return 'max_tokens'
+  if (reason === 'content_filter') return 'refusal'
+  return null
+}
+
+function responsesSseError(event) {
+  if (event.type !== 'response.failed' && event.type !== 'error') return null
+  return (
+    event.error || event.response?.error || { type: 'upstream_error', message: 'Upstream returned a Responses error' }
+  )
+}
+
 export function responsesSseToChatChunk(line, id = 'codex', state = null) {
   const session = state || createChatSseState(id)
   if (session.finished) return null
@@ -390,6 +477,11 @@ export function responsesSseToChatChunk(line, id = 'codex', state = null) {
   }
   const event = parsed.event || {}
   const type = event.type || ''
+  const error = responsesSseError(event)
+  if (error) {
+    session.finished = true
+    return `data: ${JSON.stringify({ error })}\n\ndata: [DONE]\n\n`
+  }
   if (
     (type === 'response.output_item.added' || type === 'response.output_item.done') &&
     (event.item?.type === 'function_call' || event.item?.type === 'custom_tool_call')
@@ -427,7 +519,7 @@ export function responsesSseToChatChunk(line, id = 'codex', state = null) {
   ) {
     return chatChunk(session.id, { content: event.delta || event.text || '' })
   }
-  if (type === 'response.completed' || type === 'response.done') {
+  if (type === 'response.completed' || type === 'response.done' || type === 'response.incomplete') {
     const calls = []
     for (const [index, item] of (event.response?.output || []).entries()) {
       if (item?.type !== 'function_call' && item?.type !== 'custom_tool_call') continue
@@ -436,8 +528,10 @@ export function responsesSseToChatChunk(line, id = 'codex', state = null) {
     }
     const usage = openaiChatUsageFromExtract(extractOpenaiUsage(event.response?.usage || event.usage))
     const repaired = calls.length ? chatChunk(session.id, { tool_calls: calls }) : ''
+    const stop = incompleteStopReason(event.response)
+    const finish = stop ? claudeStopReasonToOpenAIFinish(stop) : session.sawTool ? 'tool_calls' : 'stop'
     session.finished = true
-    return `${repaired}${chatChunk(session.id, {}, session.sawTool ? 'tool_calls' : 'stop', usage ? { usage } : {})}data: [DONE]\n\n`
+    return `${repaired}${chatChunk(session.id, {}, finish, usage ? { usage } : {})}data: [DONE]\n\n`
   }
   return null
 }
@@ -515,6 +609,11 @@ export function responsesSseToAnthropicEvents(line, state = createAnthropicSseSt
   if (parsed.skip || state.finished) return null
   const event = parsed.event || {}
   const type = event.type || ''
+  const error = responsesSseError(event)
+  if (error) {
+    state.finished = true
+    return buildAnthropicSseError(error)
+  }
   if (event.response?.id) state.id = event.response.id
   if (event.response?.model) state.model = event.response.model
   const frames = []
@@ -632,14 +731,14 @@ export function responsesSseToAnthropicEvents(line, state = createAnthropicSseSt
     )
     return frames.join('')
   }
-  if (type === 'response.completed' || type === 'response.done' || parsed.done) {
+  if (type === 'response.completed' || type === 'response.done' || type === 'response.incomplete' || parsed.done) {
     ensureStart()
     for (const [index, item] of (event.response?.output || []).entries()) fullItem(item, index)
     for (const slot of new Set(state.tools.values())) closeTool(slot)
     if (state.textIndex != null) frames.push(anthropicEvent('content_block_stop', { index: state.textIndex }))
     frames.push(
       anthropicEvent('message_delta', {
-        delta: { stop_reason: state.sawTool ? 'tool_use' : 'end_turn' },
+        delta: { stop_reason: incompleteStopReason(event.response) || (state.sawTool ? 'tool_use' : 'end_turn') },
         usage: openaiAnthropicUsageFromExtract(extractOpenaiUsage(event.response?.usage || event.usage)),
       }),
     )
@@ -752,7 +851,8 @@ export function codexBodyToAnthropicMessage(body = {}, model = '') {
     role: 'assistant',
     model: resp?.model || model || 'gpt',
     content,
-    stop_reason: content.some((block) => block.type === 'tool_use') ? 'tool_use' : 'end_turn',
+    stop_reason:
+      incompleteStopReason(resp) || (content.some((block) => block.type === 'tool_use') ? 'tool_use' : 'end_turn'),
     usage: openaiAnthropicUsageFromExtract(extractOpenaiUsage(resp?.usage || body?.usage || {})),
   }
 }

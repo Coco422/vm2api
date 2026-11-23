@@ -6,15 +6,31 @@ import os from 'node:os'
 import path from 'node:path'
 import { createPanelHandler } from '../../src/lib/admin/panel-routes.mjs'
 import { ProxyPool } from '../../src/lib/vm/proxy-pool.mjs'
+import { verifyCragV2Tree } from '../../src/lib/vm/wrap-cli-runtime.mjs'
+import { seedEncryptedPackage } from '../fixtures/crag-license.mjs'
 
 function makeCreateHandler(project, body, proxyPool, accountQuota, extra = {}) {
+  if (extra.missing !== 'crag') seedEncryptedPackage(project)
+  if (extra.missing !== 'wrap') {
+    const template = path.join(project, 'share/wrap-cli')
+    fs.mkdirSync(template, { recursive: true })
+    for (const name of ['kin-kernel.bin', 'cli-node']) fs.writeFileSync(path.join(template, name), 'fixture')
+  }
   const response = {}
   const handlePanel = createPanelHandler({
     cfg: { paths: { project } },
     ...(accountQuota ? { accountQuota } : {}),
     ...(extra.routingConfig ? { routingConfig: extra.routingConfig } : {}),
     ...(extra.probeLocalKvm ? { probeLocalKvm: extra.probeLocalKvm } : {}),
+    ...(extra.panelUsers ? { panelUsers: extra.panelUsers } : {}),
     requireAuth(req) {
+      if (extra.role && extra.role !== 'admin') {
+        req.panelUser = 'tenant'
+        req.apiKeyKind = 'session'
+        req.panelRole = extra.role
+        req.panelUserId = 'u-1'
+        return true
+      }
       req.apiKeyKind = 'master'
       req.panelRole = 'admin'
       return true
@@ -334,9 +350,10 @@ test('create kvm returns 409 when local probe is unavailable', async () => {
   }
 })
 
-test('create kvm persists runtime and machine when probe succeeds', async () => {
+test('create kvm persists runtime and preinstalls original Claude Code when probe succeeds', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-create-kvm-ok-'))
   try {
+    const factory = seedEncryptedPackage(root)
     const { handlePanel, response } = makeCreateHandler(
       root,
       {
@@ -361,8 +378,81 @@ test('create kvm persists runtime and machine when probe succeeds', async () => 
     assert.match(saved.machine.mac, /^52:54:00:/)
     assert.ok(saved.machine.smbios.uuid)
     assert.equal(response.body.data.vm.runtime_type, 'kvm')
+    assert.equal(response.body.data.start_error, undefined)
+    const home = path.join(root, 'vms', id, 'cli-home')
+    const claude = 'claude-code-2.1.321/claude'
+    assert.deepEqual(
+      fs.readFileSync(path.join(home, '.kin/crag-v2', claude)),
+      fs.readFileSync(path.join(factory, claude)),
+    )
+    assert.doesNotMatch(fs.readFileSync(path.join(home, '.kin/kin-kernel'), 'utf8'), /crag-v2/)
+    assert.ok(fs.existsSync(path.join(home, '.claude/settings.json')))
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('both Anthropic choices install both packages with a cold standard wrapper', async (t) => {
+  for (const dataplane of [undefined, 'crag']) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-create-crag-'))
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+    const { handlePanel, response } = makeCreateHandler(
+      root,
+      { runtime_type: 'docker', start: dataplane === 'crag', ...(dataplane ? { dataplane } : {}) },
+      undefined,
+      undefined,
+      { routingConfig: { inference: { dataplane: 'crag' } } },
+    )
+    await handlePanel({ method: 'POST' }, {}, new URL('http://localhost/api/panel/vms/create'))
+    assert.equal(response.status, 200, JSON.stringify(response.body))
+    const { vm, start_error } = response.body.data
+    assert.equal(vm.status, 'stopped')
+    const saved = JSON.parse(fs.readFileSync(path.join(root, 'vms', `${vm.id}.json`), 'utf8'))
+    assert.equal(saved.dataplane, dataplane || 'wrap')
+    assert.equal(saved.crag_kernel_version, dataplane === 'crag' ? 'v2' : undefined)
+    if (dataplane) {
+      assert.equal(vm.schedulable, false)
+      assert.equal(start_error, undefined)
+    } else assert.equal(start_error, undefined)
+    const kin = path.join(root, 'vms', vm.id, 'cli-home', '.kin')
+    assert.equal(fs.readFileSync(path.join(kin, 'kin-kernel.bin'), 'utf8'), 'fixture')
+    assert.equal(fs.readFileSync(path.join(kin, 'cli-node'), 'utf8'), 'fixture')
+    assert.doesNotMatch(fs.readFileSync(path.join(kin, 'kin-kernel'), 'utf8'), /crag-v2/)
+    assert.equal(verifyCragV2Tree(path.join(kin, 'crag-v2')).ok, true)
+  }
+})
+
+test('create rejects missing required packages before persisting a slot', async (t) => {
+  for (const [missing, code] of [
+    ['wrap', 'kernel_package_missing'],
+    ['crag', 'crag_v2_package_missing'],
+  ]) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-create-package-'))
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+    const { handlePanel, response } = makeCreateHandler(root, { start: false }, undefined, undefined, { missing })
+    await handlePanel({ method: 'POST' }, {}, new URL('http://localhost/api/panel/vms/create'))
+    assert.equal(response.status, 409)
+    assert.equal(response.body.error.code, code)
+    assert.deepEqual(
+      fs.readdirSync(path.join(root, 'vms')).filter((name) => name.endsWith('.json')),
+      [],
+    )
+  }
+})
+
+test('create rejects explicit invalid or OpenAI inference selections', async (t) => {
+  for (const body of [
+    { dataplane: '' },
+    { dataplane: null },
+    { dataplane: 'cc' },
+    { platform: 'openai', dataplane: 'wrap' },
+  ]) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-create-dataplane-'))
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+    const { handlePanel, response } = makeCreateHandler(root, body)
+    await handlePanel({ method: 'POST' }, {}, new URL('http://localhost/api/panel/vms/create'))
+    assert.equal(response.status, 400)
+    assert.equal(response.body.error.code, 'invalid_create_dataplane')
   }
 })
 
@@ -413,7 +503,7 @@ test('create rejects an unknown locale before writing the slot', async () => {
   }
 })
 
-test('GET /vms/create-options is available to a tenant user', async () => {
+test('GET /vms/create-options remains administrator-only for company tenants', async () => {
   const response = {}
   const handlePanel = createPanelHandler({
     cfg: { paths: { project: os.tmpdir() } },
@@ -435,9 +525,37 @@ test('GET /vms/create-options is available to a tenant user', async () => {
   })
   const handled = await handlePanel({ method: 'GET' }, {}, new URL('http://localhost/api/panel/vms/create-options'))
   assert.equal(handled, true)
-  assert.equal(response.status, 200, response.body?.error?.message || JSON.stringify(response.body))
-  assert.equal(response.body?.ok, true)
-  assert.equal(response.body.data.vm.memory, '4g')
-  assert.equal(response.body.data.vm.default_runtime, 'kvm')
-  assert.deepEqual(response.body.data.kvm, { ok: true, accel: 'tcg', error: null })
+  assert.equal(response.status, 403)
+  assert.equal(response.body?.error?.code, 'forbidden')
+  assert.equal(response.body?.data, undefined)
+})
+
+test('create enables the browser desktop only for an admin docker slot', async () => {
+  const cases = [
+    { role: 'admin', expect: true },
+    { role: 'user', expect: false },
+  ]
+  for (const { role, expect } of cases) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-create-desktop-'))
+    try {
+      const { handlePanel, response } = makeCreateHandler(
+        root,
+        { runtime_type: 'docker', start: false, auto_allocate_proxy: false, desktop: true },
+        null,
+        null,
+        { role, panelUsers: { getById: () => ({ vm_create_quota: 5 }), getByUsername: () => null } },
+      )
+      await handlePanel({ method: 'POST' }, {}, new URL('http://localhost/api/panel/vms/create'))
+      assert.equal(response.status, expect ? 200 : 403, `${role}: ${JSON.stringify(response.body)}`)
+      if (!expect) {
+        assert.equal(response.body.error.code, 'forbidden')
+        continue
+      }
+      const vm = response.body.data.vm
+      const saved = JSON.parse(fs.readFileSync(path.join(root, 'vms', `${vm.id}.json`), 'utf8'))
+      assert.equal(saved.desktop?.enabled, true)
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  }
 })

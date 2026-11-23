@@ -2,10 +2,12 @@ import crypto from 'node:crypto'
 import {
   anthropicContentIsEmpty,
   dropEmptySystemControlTurns,
+  isSmallTextTurn,
   liftMidConversationSystemMessages,
   mergeConsecutiveAnthropicMessages,
   messageHasTurnControls,
   stripIllegalContentFields,
+  sanitizeAnthropicBody,
 } from './sanitize.mjs'
 import { isAnthropicServerTool } from './web-search.mjs'
 import {
@@ -20,10 +22,12 @@ import {
   getCapabilities,
   isHaiku55Model,
   isOpus55Model,
+  validateBetweenToolsThinking,
 } from './model-policy.mjs'
 import { ensureOutputConfigSchema, rectifyUnofficialRequest } from './request-rectifier.mjs'
 import { DEFAULT_CACHE_TTL, applyCacheBreakpoints, stripCacheScopeFields } from './cache-ttl.mjs'
 import { normalizeImageContentBlocks } from './images.mjs'
+import { normalizeToolInputSchemas } from './tool-input-schema.mjs'
 
 const TOOL_NAME = /^[A-Za-z0-9_-]{1,64}$/
 
@@ -110,7 +114,7 @@ const DUMMY_THINKING_SIGNATURES = new Set(['', 'skip_thought_signature_validator
 
 export function hasUsableThinkingSignature(signature) {
   const value = String(signature || '').trim()
-  // Truncated SSE signatures look present but fail Anthropic checksum (sub2api pre-filter).
+  // Truncated SSE signatures look present but fail the Anthropic checksum.
   if (!value || value.length < 24) return false
   return !DUMMY_THINKING_SIGNATURES.has(value)
 }
@@ -157,13 +161,79 @@ function thinkingModeEnabled(body) {
   return type === 'enabled' || type === 'adaptive'
 }
 
+/** Anthropic accepts temperature / top_p in [0,1]; top_k is a positive integer. */
+const SAMPLING_RANGES = { temperature: [0, 1], top_p: [0, 1] }
+
 /**
- * Anthropic: thinking enabled/adaptive only accepts temperature=1.
- * top_p / top_k are also rejected. Real Claude Code sends temperature: 1.
+ * Clean the caller's sampling values before any thinking rule looks at them:
+ * out-of-range numbers are clamped into the legal interval, numeric strings
+ * become numbers, and anything that is not a finite number is dropped so the
+ * OAuth defaults can refill it. Upstream 400s on each of those shapes.
  */
-export function alignSamplingWithThinking(body = {}) {
-  if (!thinkingModeEnabled(body)) return body
-  const out = body
+function normalizeSamplingRanges(body) {
+  for (const [key, [low, high]] of Object.entries(SAMPLING_RANGES)) {
+    if (!Object.prototype.hasOwnProperty.call(body, key)) continue
+    const raw = body[key]
+    if (raw === null || raw === undefined || raw === '' || typeof raw === 'boolean') {
+      delete body[key]
+      continue
+    }
+    const value = Number(raw)
+    if (!Number.isFinite(value)) {
+      delete body[key]
+      continue
+    }
+    body[key] = Math.min(high, Math.max(low, value))
+  }
+  if (Object.prototype.hasOwnProperty.call(body, 'top_k')) {
+    const value = Number(body.top_k)
+    if (!Number.isFinite(value) || value < 1) delete body.top_k
+    else body.top_k = Math.floor(value)
+  }
+  return body
+}
+
+/** Thinking types upstream reads as "reasoning is on", so sampling is locked. */
+const SAMPLING_LOCKED_THINKING = new Set(['enabled', 'adaptive', 'between_tools'])
+
+/**
+ * `between_tools` is a thinking mode too: `responsesToClaude` injects it when a
+ * caller asks for effort `off`, and upstream then rejects the caller's own
+ * temperature. A `requires_adaptive` model reasons even when the body carries
+ * no thinking at all, so its sampling is locked on shape alone.
+ */
+function thinkingLocksSampling(body) {
+  const type = String(body?.thinking?.type || '').toLowerCase()
+  if (SAMPLING_LOCKED_THINKING.has(type)) return true
+  try {
+    return getCapabilities(body?.model).requires_adaptive === true
+  } catch {
+    return false
+  }
+}
+
+/** Remove every sampling field; `drop` retries send none of them at all. */
+function stripSampling(body) {
+  for (const key of ['temperature', 'top_p', 'top_k']) {
+    if (Object.prototype.hasOwnProperty.call(body, key)) delete body[key]
+  }
+  return body
+}
+
+/**
+ * Anthropic: a thinking request only accepts temperature=1 and rejects
+ * top_p / top_k. Real Claude Code sends temperature: 1, so the value is
+ * pinned rather than omitted. Illegal values are corrected, never forwarded.
+ *
+ * `drop` is the retry after an upstream refused the sampling fields themselves
+ * rather than their values: pinning temperature=1 would be refused again, so
+ * the mimicry value gives way and the request carries no sampling at all.
+ */
+export function alignSamplingWithThinking(body = {}, { drop = false } = {}) {
+  if (!body || typeof body !== 'object') return body
+  if (drop) return stripSampling(body)
+  const out = normalizeSamplingRanges(body)
+  if (!thinkingLocksSampling(out)) return out
   if (out.temperature !== 1) out.temperature = 1
   if (Object.prototype.hasOwnProperty.call(out, 'top_p')) delete out.top_p
   if (Object.prototype.hasOwnProperty.call(out, 'top_k')) delete out.top_k
@@ -172,7 +242,7 @@ export function alignSamplingWithThinking(body = {}) {
 
 /**
  * Drop history thinking blocks Anthropic would reject.
- * Opus / Sonnet / Haiku 5.5 follow sub2api: one invalid block drops the whole
+ * For Opus / Sonnet / Haiku 5.5, one invalid block drops the whole
  * signed chain, including later valid thinking and redacted_thinking. Turns
  * left with no content are dropped. redacted_thinking stays when it carries
  * data on 5.5, otherwise when its signature is usable. The preserve path
@@ -183,8 +253,9 @@ export function alignSamplingWithThinking(body = {}) {
  */
 export function stripInvalidThinkingBlocks(body = {}, { preserveThinkingBlocks = false } = {}) {
   if (!Array.isArray(body.messages)) return body
-  const keepSigned = thinkingModeEnabled(body)
-  const chainModel = !preserveThinkingBlocks && signedThinkingModel(body.model)
+  const betweenTools = body.thinking?.type === 'between_tools'
+  const keepSigned = thinkingModeEnabled(body) || betweenTools
+  const chainModel = !preserveThinkingBlocks && (betweenTools || signedThinkingModel(body.model))
   let changed = false
   let chainBroken = false
   const messages = body.messages.map((message) => {
@@ -405,10 +476,11 @@ export function sanitizeAnthropicBodyForBetaTokens(body = {}, anthropicBetaHeade
   return downgradeUngatedThinkingDisplay(out, anthropicBetaHeader)
 }
 
-/** sub2api normalizeClaudeOAuthRequestBody defaults (temperature / empty tools). */
-export function ensureClaudeOAuthBodyDefaults(body = {}) {
+/** Fill missing Claude OAuth body defaults for temperature and tools. */
+export function ensureClaudeOAuthBodyDefaults(body = {}, { dropSampling = false } = {}) {
   const out = body && typeof body === 'object' ? body : {}
-  if (out.temperature == null) out.temperature = 1
+  // A drop retry must not refill what the upstream just refused.
+  if (!dropSampling && out.temperature == null) out.temperature = 1
   if (!Array.isArray(out.tools)) out.tools = []
   if (out.tools.length === 0 && out.tool_choice) delete out.tool_choice
   return out
@@ -428,6 +500,7 @@ export function prepareAnthropicRequest(
     cacheTtl = DEFAULT_CACHE_TTL,
     inbound = null,
     preserveThinkingBlocks = false,
+    dropSampling = false,
   } = {},
 ) {
   let out = clone(body)
@@ -438,6 +511,7 @@ export function prepareAnthropicRequest(
   if (unofficial) {
     out = ensureUnofficialAdaptiveThinking(out)
     out = ensureUnofficialEffortHigh(out)
+    validateBetweenToolsThinking(out)
     out = rectifyUnofficialRequest(out)
   } else out = ensureOutputConfigSchema(out)
   if (Array.isArray(out.system)) {
@@ -452,8 +526,8 @@ export function prepareAnthropicRequest(
   const stripped = stripInvalidThinkingBlocks(out, { preserveThinkingBlocks })
   if (stripped.messages) out.messages = stripped.messages
   out = ensureClearThinkingContextManagement(out)
-  out = alignSamplingWithThinking(out)
-  out = ensureClaudeOAuthBodyDefaults(out)
+  out = alignSamplingWithThinking(out, { drop: dropSampling })
+  out = ensureClaudeOAuthBodyDefaults(out, { dropSampling })
   if (cacheBreakpoints) {
     out = applyCacheBreakpoints(out, { ttl: cacheTtl, config: cacheBreakpoints, inbound })
   }
@@ -551,14 +625,46 @@ export function rewriteToolNames(body = {}, { enabled = true } = {}) {
   return { body: out, reverse }
 }
 
+function restoreToolReferenceName(toolName, reverse) {
+  return typeof toolName === 'string' && reverse[toolName] ? reverse[toolName] : toolName
+}
+
+function restoreToolNameBlock(block, reverse) {
+  if (!block || typeof block !== 'object') return block
+  if (block.type === 'tool_use' && reverse[block.name]) {
+    return { ...block, name: reverse[block.name] }
+  }
+  if (block.type === 'tool_search_tool_result' && Array.isArray(block.tool_references)) {
+    let changed = false
+    const tool_references = block.tool_references.map((ref) => {
+      if (!ref || typeof ref !== 'object' || typeof ref.tool_name !== 'string') return ref
+      const tool_name = restoreToolReferenceName(ref.tool_name, reverse)
+      if (tool_name === ref.tool_name) return ref
+      changed = true
+      return { ...ref, tool_name }
+    })
+    return changed ? { ...block, tool_references } : block
+  }
+  if (block.type === 'tool_result' && Array.isArray(block.content)) {
+    let changed = false
+    const content = block.content.map((inner) => {
+      if (inner?.type !== 'tool_reference' || typeof inner.tool_name !== 'string') return inner
+      const tool_name = restoreToolReferenceName(inner.tool_name, reverse)
+      if (tool_name === inner.tool_name) return inner
+      changed = true
+      return { ...inner, tool_name }
+    })
+    return changed ? { ...block, content } : block
+  }
+  return block
+}
+
 export function restoreToolNames(response, reverse = {}) {
   if (!response || typeof response !== 'object' || Object.keys(reverse).length === 0) return response
   const out = clone(response)
   const restoreBlocks = (content) => {
     if (!Array.isArray(content)) return content
-    return content.map((block) =>
-      block?.type === 'tool_use' && reverse[block.name] ? { ...block, name: reverse[block.name] } : block,
-    )
+    return content.map((block) => restoreToolNameBlock(block, reverse))
   }
   out.content = restoreBlocks(out.content)
   if (out.message) out.message.content = restoreBlocks(out.message.content)
@@ -585,4 +691,226 @@ export function restoreToolNamesInSSELine(line, reverse = {}) {
   }
   if (payload?.message) payload.message = restoreToolNames(payload.message, reverse)
   return `${prefix} ${JSON.stringify(payload)}`
+}
+
+const CLIENT_PROSE = [
+  ['Hermes Agent', 'Claude Code'],
+  ['Hermes agent', 'Claude Code'],
+  ['Nous Research', 'Anthropic'],
+]
+const CLIENT_SLUG = /(?<![\w./:@'"`-])hermes-agent(?![\w/@-]|\.\w)/g
+
+function scrubClientProse(text) {
+  let out = String(text ?? '')
+  for (const [from, to] of CLIENT_PROSE) {
+    if (out.includes(from)) out = out.split(from).join(to)
+  }
+  return out.replace(CLIENT_SLUG, 'claude-code')
+}
+
+/** Third-party tool names Anthropic bills as extra usage. Official CC names stay. */
+export function wireToolName(name, { official = false, rewriteTools = true } = {}) {
+  const raw = String(name || '')
+  if (!raw || raw.startsWith('mcp__')) return raw
+  if (raw.startsWith('mcp_')) return `mcp__${raw.slice(4)}`
+  if (official || rewriteTools === false) return raw
+  return `mcp__${raw}`
+}
+
+/**
+ * Hermes calls this gateway as a third-party Messages client and does not apply
+ * its own OAuth identity transform. Rewrite the outbound body before either hop:
+ * product strings leave system and tool text, and tool names land on mcp__.
+ * Official Claude Code keeps its own tool names; a stray mcp_ name is still fixed.
+ */
+export function scrubUpstreamClientBody(
+  body,
+  { official = false, rewriteTools = true, preserveToolNames = false, shareUnchanged = false } = {},
+) {
+  if (!body || typeof body !== 'object') return { body, reverse: {} }
+  const out = shareUnchanged && !isSmallTextTurn(body) ? { ...body } : clone(body)
+  const reverse = {}
+  const used = new Set()
+  const assigned = new Map()
+  const declared = new Set(
+    !preserveToolNames && Array.isArray(out.tools) ? out.tools.map((tool) => tool?.name).filter(Boolean) : [],
+  )
+  const rename = (name) => {
+    if (preserveToolNames) return name
+    if (assigned.has(name)) return assigned.get(name)
+    let wire = wireToolName(name, { official, rewriteTools })
+    if (!wire) return name
+    if (wire !== name) {
+      const base = wireToolName(name, { official, rewriteTools })
+      let suffix = 2
+      while (used.has(wire) || declared.has(wire)) {
+        const tail = `_${suffix++}`
+        wire = `${base.slice(0, 64 - tail.length)}${tail}`
+      }
+      reverse[wire] = name
+    }
+    used.add(wire)
+    assigned.set(name, wire)
+    return wire
+  }
+  if (typeof out.system === 'string') out.system = scrubClientProse(out.system)
+  else if (Array.isArray(out.system)) out.system = out.system.map((block) => scrubTextBlock(block))
+  if (Array.isArray(out.tools)) {
+    out.tools = out.tools.map((tool) => {
+      if (!tool || typeof tool !== 'object' || isAnthropicServerTool(tool)) return tool
+      const next = { ...tool }
+      if (typeof next.name === 'string') next.name = rename(next.name)
+      if (typeof next.description === 'string') next.description = scrubClientProse(next.description)
+      return next
+    })
+  }
+  if (out.tool_choice && typeof out.tool_choice === 'object' && typeof out.tool_choice.name === 'string') {
+    const name = assigned.get(out.tool_choice.name)
+    if (name !== undefined && name !== out.tool_choice.name) out.tool_choice = { ...out.tool_choice, name }
+  }
+  if (Array.isArray(out.messages)) {
+    out.messages = out.messages.map((message) =>
+      preserveToolNames && message?.role !== 'system' ? message : scrubMessage(message, rename),
+    )
+  }
+  return { body: out, reverse }
+}
+
+function scrubTextBlock(block) {
+  if (typeof block === 'string') {
+    const text = scrubClientProse(block)
+    return text === block ? block : text
+  }
+  if (!block || typeof block !== 'object' || typeof block.text !== 'string') return block
+  const text = scrubClientProse(block.text)
+  return text === block.text ? block : { ...block, text }
+}
+
+function scrubToolReferenceFields(block, rename) {
+  if (!block || typeof block !== 'object') return { block, changed: false }
+  if (
+    (block.type === 'tool_addition' || block.type === 'tool_removal') &&
+    block.tool?.type === 'tool_reference' &&
+    typeof block.tool.name === 'string'
+  ) {
+    const name = rename(block.tool.name)
+    if (name !== block.tool.name) return { block: { ...block, tool: { ...block.tool, name } }, changed: true }
+  }
+  if (block.type === 'tool_result' && Array.isArray(block.content)) {
+    let changed = false
+    const content = block.content.map((inner) => {
+      if (inner?.type !== 'tool_reference' || typeof inner.tool_name !== 'string') return inner
+      const tool_name = rename(inner.tool_name)
+      if (tool_name === inner.tool_name) return inner
+      changed = true
+      return { ...inner, tool_name }
+    })
+    return changed ? { block: { ...block, content }, changed: true } : { block, changed: false }
+  }
+  if (block.type === 'tool_search_tool_result' && Array.isArray(block.tool_references)) {
+    let changed = false
+    const tool_references = block.tool_references.map((ref) => {
+      if (!ref || typeof ref !== 'object' || typeof ref.tool_name !== 'string') return ref
+      const tool_name = rename(ref.tool_name)
+      if (tool_name === ref.tool_name) return ref
+      changed = true
+      return { ...ref, tool_name }
+    })
+    return changed ? { block: { ...block, tool_references }, changed: true } : { block, changed: false }
+  }
+  return { block, changed: false }
+}
+
+function scrubMessage(message, rename) {
+  if (!message || typeof message !== 'object') return message
+  const systemTurn = message.role === 'system'
+  if (typeof message.content === 'string') {
+    if (!systemTurn) return message
+    const content = scrubClientProse(message.content)
+    return content === message.content ? message : { ...message, content }
+  }
+  if (!Array.isArray(message.content)) return message
+  let changed = false
+  const content = message.content.map((block) => {
+    if (!block || typeof block !== 'object') return block
+    if (block.type === 'tool_use' && typeof block.name === 'string') {
+      const name = rename(block.name)
+      if (name !== block.name) {
+        changed = true
+        return { ...block, name }
+      }
+    }
+    const refs = scrubToolReferenceFields(block, rename)
+    if (refs.changed) {
+      changed = true
+      return refs.block
+    }
+    if (systemTurn) {
+      const next = scrubTextBlock(block)
+      if (next !== block) changed = true
+      return next
+    }
+    return block
+  })
+  return changed ? { ...message, content } : message
+}
+
+/** Map a hop tool-name table through the front rewrite so the client still sees its names. */
+export function composeToolNames(front = {}, hop = {}) {
+  const out = { ...front }
+  for (const [wire, mid] of Object.entries(hop || {})) {
+    if (!wire || wire === mid) continue
+    const client = front[mid] || mid
+    if (client !== wire) out[wire] = client
+    delete out[mid]
+  }
+  for (const [wire, client] of Object.entries(out)) {
+    if (client === wire) delete out[wire]
+  }
+  return out
+}
+
+/**
+ * Front gate: every non-classifier Messages body becomes standard Anthropic
+ * blocks before persona or either hop. Caller billing is removed here unless
+ * official passthrough is on; the project template writes its own.
+ */
+export function toStandardAnthropicBody(body, options = {}) {
+  const shaped = sanitizeAnthropicBody(stripCallerBilling(body), {
+    reuseCanonicalHistory: options.reuseCanonicalHistory === true && !isSmallTextTurn(body),
+  })
+  if (Array.isArray(shaped.tools)) shaped.tools = normalizeToolInputSchemas(shaped.tools)
+  applyMaxTokensCap(shaped)
+  return scrubUpstreamClientBody(shaped, options)
+}
+
+function stripBillingText(text) {
+  return String(text || '').replace(/^[ \t]*x-anthropic-billing-header:[^\n]*(?:\n|$)/gim, '')
+}
+
+function stripCallerBilling(body) {
+  if (!body || typeof body !== 'object' || body.system == null) return body
+  const keep = (block) => {
+    const raw = typeof block === 'string' ? block : block?.text
+    if (typeof raw !== 'string' || !/x-anthropic-billing-header:/i.test(raw)) return block
+    const text = stripBillingText(raw)
+    if (!text) return null
+    if (text === raw) return block
+    return typeof block === 'string' ? text : { ...block, text }
+  }
+  if (typeof body.system === 'string') {
+    const text = keep(body.system)
+    if (text === body.system) return body
+    const next = { ...body }
+    if (text) next.system = text
+    else delete next.system
+    return next
+  }
+  if (!Array.isArray(body.system)) return body
+  const system = body.system.map(keep).filter((block) => block != null)
+  if (system.length === body.system.length && system.every((block, index) => block === body.system[index])) return body
+  const next = { ...body }
+  if (system.length) next.system = system
+  else delete next.system
+  return next
 }

@@ -1,3 +1,5 @@
+import type { FileRoutesById } from '@/routeTree.gen'
+
 export type ViewId =
   | 'overview'
   | 'cluster'
@@ -5,6 +7,7 @@ export type ViewId =
   | 'import'
   | 'specs'
   | 'billing'
+  | 'crag-subscription'
   | 'proxies'
   | 'models'
   | 'risk'
@@ -26,6 +29,7 @@ export const VIEW_TITLES: Record<ViewId, string> = {
   import: '导入',
   specs: '规格',
   billing: '计费',
+  'crag-subscription': '订阅 CRAG',
   proxies: '代理池',
   models: '模型',
   risk: '风险审计',
@@ -44,6 +48,71 @@ export const VIEW_TITLES: Record<ViewId, string> = {
 // 监控组四页的职责边界，避免同一块数据在多页重复出现。
 export const VIEW_DESCRIPTIONS: Partial<Record<ViewId, string>> = {
   overview: '集群健康、账号可用性与近 1 小时服务质量',
-  statistics: '请求、消费与耗时趋势，以及用户 / 供应商 / 模型排行',
+  statistics: '今日与历史的请求、费用、Token 和缓存；租户按个人归属查看',
   logs: '逐条请求记录，支持筛选、导出与查看详情',
+}
+
+type AuthenticatedPath<T = keyof FileRoutesById> =
+  T extends `/_authenticated/${infer Head}/${string}`
+    ? `/${Head}`
+    : T extends `/_authenticated/${infer Head}`
+      ? `/${Head}`
+      : never
+
+/**
+ * Console page → panel view (`ROLE_VIEWS` in src/lib/admin/panel-acl.mjs).
+ * Keyed by the first path segment, so nested pages (`/vm/$id`,
+ * `/settings/$tab`) follow their parent. `null` = any signed-in user.
+ * The sidebar and the route guard both read this table.
+ */
+export const ROUTE_VIEWS = {
+  '/': null,
+  // 账号安全（两步验证）对任何已登录账号开放，不受角色视图限制。
+  '/account': null,
+  '/overview': 'overview',
+  '/statistics': 'statistics',
+  '/global-statistics': 'statistics',
+  '/logs': 'logs',
+  '/cluster': 'cluster',
+  '/vm': 'vm',
+  '/import': 'import',
+  '/specs': 'specs',
+  '/proxies': 'proxies',
+  '/billing': 'billing',
+  '/crag-subscription': 'crag-subscription',
+  '/models': 'models',
+  '/risk': 'risk',
+  '/system': 'system',
+  '/api': 'api',
+  '/anthropic': 'anthropic',
+  '/keys': 'keys',
+  '/settings': 'settings',
+  '/wrap': 'wrap',
+  '/database': 'database',
+  '/users': 'users',
+} as const satisfies Record<AuthenticatedPath, ViewId | null>
+
+/** `undefined` = not a console page (left to the not-found route). */
+export function viewForPath(path: string): ViewId | null | undefined {
+  const head = `/${path.split(/[?#]/)[0].split('/').find(Boolean) ?? ''}`
+  return head in ROUTE_VIEWS
+    ? ROUTE_VIEWS[head as keyof typeof ROUTE_VIEWS]
+    : undefined
+}
+
+/** Missing views list = server without panel roles (show everything). */
+export function hasPanelView(
+  views: readonly string[] | null | undefined,
+  view: ViewId
+): boolean {
+  if (views == null) return true
+  return views.includes(view) || views.includes(`/${view}`)
+}
+
+export function canOpenPath(
+  views: readonly string[] | null | undefined,
+  path: string
+): boolean {
+  const view = viewForPath(path)
+  return view == null || hasPanelView(views, view)
 }

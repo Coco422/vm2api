@@ -1,7 +1,7 @@
 /**
  * Commit an imported OAuth / API-key / setup-token grant onto a slot.
- * Reloads the active slot service (and eager Rust kernel when routing says so)
- * before the slot-service credential import; official CC bootstrap is scheduled after persist.
+ * Reuses the ready native slot for credential installation. Starts an unavailable
+ * slot, or reloads a genuinely changed proxy binding; bootstrap follows persist.
  */
 import fs from 'node:fs'
 import path from 'node:path'
@@ -11,25 +11,29 @@ import {
   bindVmProxy,
   getVm,
   persistAccountTier,
+  persistVmSubscription,
   isCodexVm,
   patchVmRecord,
 } from '../vm/vm-registry.mjs'
 import { isSlotProxyDesynced } from '../vm/vm-runtime.mjs'
-import { reloadSlotReady } from '../vm/slot-runtime.mjs'
+import { reloadSlotReady, startSlotReady } from '../vm/slot-runtime.mjs'
 import { resolveImportProxy } from '../vm/proxy-resolve.mjs'
 import { collectSlotIdentity } from '../vm/guest-identity.mjs'
-import { importWorkerCredential } from '../transport/go-worker-client.mjs'
-import { credentialModeFromOauth, canOfficialCc } from './credential-mode.mjs'
+import { importWorkerCredential, syncClaudeClientCredentials } from '../transport/go-worker-client.mjs'
+import { rustKernelHealth, rustKernelReachable, rustKernelBusy } from '../transport/rust-kernel-client.mjs'
+import {
+  credentialModeFromOauth,
+  canOfficialCc,
+  isOfficialSetupTokenMode,
+  isSetupTokenMode,
+} from './credential-mode.mjs'
 import { resolveAuthScheme } from './auth-scheme.mjs'
 import { flattenOauthIdentity, normalizeSubscriptionType } from './oauth-identity.mjs'
-import { persistOauthToVm, writeWorkerCredentialFile } from './oauth-credentials.mjs'
-import {
-  officialCcUidGid,
-  scheduleOfficialCcBootstrap,
-  materializeOfficialClaudeCredentials,
-} from './official-cc-bootstrap.mjs'
+import { persistOauthToVm } from './oauth-credentials.mjs'
+import { scheduleOfficialCcBootstrap } from './official-cc-bootstrap.mjs'
 import { normalizeTiers } from '../pool/quota-tiers.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
+import { finishOAuthImport } from './guest-oauth-helper.mjs'
 
 export function createImportCommit(ctx) {
   function routing() {
@@ -98,8 +102,8 @@ export function createImportCommit(ctx) {
       email: identity.email || existing.claude?.email || null,
       account_uuid: identity.account_uuid || existing.claude?.account_uuid || null,
       org_uuid: identity.org_uuid || existing.claude?.org_uuid || null,
-      subscription_type:
-        identity.subscription_type || normalizeSubscriptionType(existing?.claude?.account_tier) || 'pro',
+      subscription_type: identity.subscription_type,
+      rate_limit_tier: identity.rate_limit_tier,
       account_tier: normalizeSubscriptionType(existing?.claude?.account_tier) || 'pro',
       scopes: Array.isArray(oauth.scopes)
         ? oauth.scopes
@@ -112,14 +116,18 @@ export function createImportCommit(ctx) {
 
   function officialCcStatsHandler(vmId, accountUuid = null) {
     return (stats) => {
+      if (stats?.subscription_type) persistVmSubscription(ctx.cfg.paths.project, vmId, stats, { accountUuid })
       const accountId = accountUuid || getVm(ctx.cfg.paths.project, vmId)?.claude?.account_uuid || vmId
       if (stats?.five_hour || stats?.seven_day || stats?.seven_day_oi || stats?.extra_usage) {
         try {
           ctx.accountQuota.ingestOAuthUsage(accountId, { usage_status: 200, ok: true, ...stats })
         } catch {}
       }
-      if ((stats?.account_tier === 'pro' || stats?.account_tier === 'max') && stats?.limits_present === true) {
-        const source = 'usage'
+      if (
+        (stats?.account_tier === 'pro' || stats?.account_tier === 'max') &&
+        (stats?.limits_present === true || stats?.account_tier_source === 'profile')
+      ) {
+        const source = stats.account_tier_source === 'profile' ? 'profile' : 'usage'
         try {
           ctx.accountQuota.setAccountTier(accountId, stats.account_tier, { source })
         } catch {}
@@ -143,7 +151,16 @@ export function createImportCommit(ctx) {
     }
   }
 
-  async function commitImportedOauth({ vmId, vmPath, existing, oauth, source, name, skipOfficialCc = false }) {
+  async function commitImportedOauthGrant({
+    vmId,
+    vmPath,
+    existing,
+    oauth,
+    source,
+    name,
+    skipOfficialCc = false,
+    fromNativeLogin = false,
+  }) {
     const importedCredential = importedCredentialFromOauth(oauth, existing)
     const workerExec = {
       vmId,
@@ -157,11 +174,21 @@ export function createImportCommit(ctx) {
       bindVmProxy(ctx.cfg.paths.project, vmId, bound)
       adoptVmProxyBinding(existing, getVm(ctx.cfg.paths.project, vmId))
     }
-    if (process.env.KIN_CRS_MOCK !== '1') {
-      const socket = existing.runtime?.worker_socket
-      const needReload = !socket || !fs.existsSync(socket) || isSlotProxyDesynced(existing, ctx.cfg.paths.project)
-      if (needReload) {
-        const boot = await reloadSlotReady(existing, ctx.cfg.paths.project, { routing: routing() })
+    // The native login terminal has already authenticated in the live guest. Saving its grant
+    // must not depend on (or restart) an inference worker that may still be waiting for credentials.
+    if (!fromNativeLogin && process.env.KIN_CRS_MOCK !== '1') {
+      const desynced = isSlotProxyDesynced(existing, ctx.cfg.paths.project)
+      const legacy = slotHost(existing).native || isCodexVm(existing)
+      const health = legacy ? null : await rustKernelHealth(workerExec)
+      const ready = legacy
+        ? !!existing.runtime?.worker_socket && fs.existsSync(existing.runtime.worker_socket)
+        : rustKernelReachable(health) || rustKernelBusy(health)
+      if (desynced || !ready) {
+        const prepare = desynced || legacy ? reloadSlotReady : startSlotReady
+        const boot = await prepare(existing, ctx.cfg.paths.project, {
+          routing: routing(),
+          allowMissingCredential: true,
+        })
         if (!boot.ok) {
           return { ok: false, status: 502, error: { code: 'worker_start_failed', message: boot.error } }
         }
@@ -199,13 +226,18 @@ export function createImportCommit(ctx) {
       }
     }
     await withVmLock(vmPath, () => {
+      const mode = importedCredential.mode || credentialModeFromOauth(oauth)
+      const setupRegistration =
+        isOfficialSetupTokenMode(mode) ||
+        (isSetupTokenMode(mode) && (oauth.oauth_registration === 'console' || oauth.flavor === 'setup_token'))
       persistOauthToVm(
         vmPath,
         {
           ...importedCredential,
           source: source || oauth.source || 'sessionKey-cookie-auth',
-          mode: importedCredential.mode || credentialModeFromOauth(oauth),
+          mode,
           type: importedCredential.type || importedCredential.mode,
+          oauth_registration: setupRegistration ? 'console' : 'oauth',
         },
         { acceptLiveGrant: true, operatorImport: true },
       )
@@ -226,13 +258,8 @@ export function createImportCommit(ctx) {
         Object.assign(existing, refreshed)
       }
     })
-    try {
-      writeWorkerCredentialFile(workerExec.homeDir, importedCredential)
-    } catch {}
-    try {
-      const ids = officialCcUidGid(vmId)
-      materializeOfficialClaudeCredentials(workerExec.homeDir, ids)
-    } catch {}
+    const clientSync = await syncClaudeClientCredentials(workerExec)
+    if (!clientSync.ok) return clientSync
     const mode = importedCredential.mode || credentialModeFromOauth(oauth)
     const ccUnsupported = !slotHost(existing).supports('official_cc')
     const skipCc = skipOfficialCc || ccUnsupported || isCodexVm(existing) || !canOfficialCc(mode)
@@ -262,7 +289,17 @@ export function createImportCommit(ctx) {
             email: importedCredential.email,
           },
         })
-    return { ok: true, existing, official_cc_bootstrap: officialCc }
+    return { ok: true, existing, client_sync: clientSync, official_cc_bootstrap: officialCc }
+  }
+  async function commitImportedOauth(options) {
+    let result
+    try {
+      result = await commitImportedOauthGrant(options)
+      return result
+    } finally {
+      const observerError = await finishOAuthImport(options.oauth, result?.ok === true)
+      if (observerError && result) result.telemetry_error = observerError
+    }
   }
 
   return {

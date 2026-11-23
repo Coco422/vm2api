@@ -11,9 +11,9 @@ import { normalizeOauth } from '../../src/lib/oauth/oauth-credentials.mjs'
 import { liveOauthToSetupToken } from '../../src/lib/oauth/credential-mode.mjs'
 import { createImportCommit } from '../../src/lib/oauth/import-commit.mjs'
 
-test('bootstrap URL uses claude-code entrypoint without vscode fields', () => {
-  assert.match(CLAUDE_CLI_BOOTSTRAP_URL, /\/api\/claude_cli\/bootstrap\?entrypoint=claude-code&model=claude-opus-5-5$/)
-  assert.doesNotMatch(CLAUDE_CLI_BOOTSTRAP_URL, /vscode/)
+test('bootstrap URL uses the captured sdk-cli entrypoint without vscode fields', () => {
+  assert.match(CLAUDE_CLI_BOOTSTRAP_URL, /\/api\/claude_cli\/bootstrap\?entrypoint=sdk-cli&model=claude-opus-5-5$/)
+  assert.doesNotMatch(CLAUDE_CLI_BOOTSTRAP_URL, /vscode|claude-code/)
 })
 test('flattenOauthIdentity reads oauth_account bootstrap shape', () => {
   assert.deepEqual(
@@ -24,7 +24,15 @@ test('flattenOauthIdentity reads oauth_account bootstrap shape', () => {
         organization_uuid: 'org-1',
       },
     }),
-    { email: 'user@example.com', account_uuid: 'acct-1', org_uuid: 'org-1', subscription_type: null },
+    {
+      email: 'user@example.com',
+      account_uuid: 'acct-1',
+      org_uuid: 'org-1',
+      subscription_type: null,
+      rate_limit_tier: null,
+      organization_role: null,
+      subscription_created_at: null,
+    },
   )
 })
 
@@ -34,7 +42,15 @@ test('flattenOauthIdentity reads token account/organization objects', () => {
       account: { uuid: 'acct-2', email_address: 'two@example.com' },
       organization: { uuid: 'org-2' },
     }),
-    { email: 'two@example.com', account_uuid: 'acct-2', org_uuid: 'org-2', subscription_type: null },
+    {
+      email: 'two@example.com',
+      account_uuid: 'acct-2',
+      org_uuid: 'org-2',
+      subscription_type: null,
+      rate_limit_tier: null,
+      organization_role: null,
+      subscription_created_at: null,
+    },
   )
 })
 
@@ -44,6 +60,9 @@ test('flattenOauthIdentity ignores empty strings', () => {
     account_uuid: null,
     org_uuid: null,
     subscription_type: null,
+    rate_limit_tier: null,
+    organization_role: null,
+    subscription_created_at: null,
   })
 })
 
@@ -54,6 +73,35 @@ test('flattenOauthIdentity keeps the plan from the exchange profile and text', (
   )
   assert.equal(flattenOauthIdentity({ account: { has_claude_pro: true, uuid: 'acct-p' } }).subscription_type, 'pro')
   assert.equal(flattenOauthIdentity({ text: 'Plan: Claude Max 20x' }).subscription_type, 'max')
+})
+
+test('OAuth plan uses organization entitlement before broad account flags', () => {
+  assert.equal(
+    flattenOauthIdentity({
+      account: { has_claude_pro: true },
+      organization: { organization_type: 'claude_team' },
+    }).subscription_type,
+    'team',
+  )
+  assert.equal(
+    flattenOauthIdentity({ organization: { rate_limit_tier: 'default_claude_max_5x' } }).subscription_type,
+    'max',
+  )
+  assert.equal(flattenOauthIdentity({ subscriptionType: 'free' }).subscription_type, 'free')
+  assert.equal(
+    flattenOauthIdentity({
+      account: { has_claude_max: true },
+      organization: { organization_type: 'claude_pro' },
+    }).subscription_type,
+    'max',
+  )
+  assert.equal(flattenOauthIdentity({ usage_has_fable: true, fable: { ok: true } }).subscription_type, null)
+})
+
+test('import does not manufacture subscription metadata from a scheduling tier', () => {
+  const { importedCredentialFromOauth } = createImportCommit({})
+  const imported = importedCredentialFromOauth({ access_token: 'access' }, { claude: { account_tier: 'max' } })
+  assert.equal(imported.subscription_type, null)
 })
 
 test('enrichOauthIdentity skips fetch when identity is already complete', async () => {

@@ -6,9 +6,9 @@ import { officialMessagesBody } from './anthropic-messages.mjs'
 import {
   prepareAnthropicRequest,
   rewriteToolNames,
+  scrubUpstreamClientBody,
   sanitizeAnthropicBodyForBetaTokens,
   ensureFastModeBeta,
-  ensureClearThinkingContextManagement,
   stripInvalidThinkingBlocks,
   alignSamplingWithThinking,
   modelSupportsMidConversationSystem,
@@ -23,6 +23,7 @@ import {
   sessionIdFromOutboundBody,
 } from '../identity/identity-rewrite.mjs'
 import { resolveCrsHeaders } from '../identity/crs-headers.mjs'
+import { officialClaudeCliUa } from '../identity/vm-identity.mjs'
 import { hasClaudeCode1mSuffix } from './context-1m.mjs'
 import { withRequestProtocolBetas } from './claude-code-betas.mjs'
 import {
@@ -34,6 +35,7 @@ import {
   CRS_OFFICIAL_SYSTEM,
   CRS_OFFICIAL_CLI_SYSTEM,
   CRS_COMPACT_IDENTITY,
+  ccEntrypointFromRouting,
 } from '../identity/crs-persona.mjs'
 import { sealClaudeCodeCch } from '../identity/cch.mjs'
 import {
@@ -42,13 +44,12 @@ import {
   CRS_OFFICIAL_AGENT_IDENTITY,
 } from '../identity/official-cc-system-2.1.241.mjs'
 import {
-  applyCacheTtlToBody,
   applyMessageBreakpoints,
   DEFAULT_CACHE_TTL,
   enforceCacheTtlOrder,
   normalizeCacheTtl,
   listCacheMarkers,
-  removeCacheControlFields,
+  materializeAutomaticCache,
   stripIllegalCacheControlFields,
   validateCacheBreakpoints,
 } from './cache-ttl.mjs'
@@ -56,6 +57,8 @@ import { apiKeyBetaHeader, setupTokenBetaHeader } from './claude-code-betas.mjs'
 
 import { isApiKeyMode, isAnySetupTokenMode } from '../oauth/credential-mode.mjs'
 import { prepareClassifierBody } from './request-purpose.mjs'
+import { validateBetweenToolsThinking } from './model-policy.mjs'
+import { applyEagerToolStreaming } from './eager-tool-streaming.mjs'
 
 export const INFERENCE_UA = 'kin-inference/1.0'
 
@@ -245,25 +248,17 @@ function stampMessageTail(messages, index, ttl) {
     return
   }
 }
-/** Official Claude Code omits eager streaming and tool cache markers. A caller TTL here makes CLI fill the omitted system and message markers. */
-function stripEagerInputStreaming(tools, { preserveCacheControl = false } = {}) {
+/** Tool-cache cleanup must not remove caller or panel-controlled eager streaming. */
+function stripToolCacheControl(tools, { preserveCacheControl = false } = {}) {
   if (!Array.isArray(tools)) return tools
   let changed = false
   const next = tools.map((tool) => {
     if (!tool || typeof tool !== 'object') return tool
-    const hasOwn = Object.prototype.hasOwnProperty.call(tool, 'eager_input_streaming')
     const hasCache = !preserveCacheControl && Object.prototype.hasOwnProperty.call(tool, 'cache_control')
-    const fn = tool.function
-    const fnHas = fn && typeof fn === 'object' && Object.prototype.hasOwnProperty.call(fn, 'eager_input_streaming')
-    if (!hasOwn && !hasCache && !fnHas) return tool
+    if (!hasCache) return tool
     changed = true
     const copy = { ...tool }
-    delete copy.eager_input_streaming
-    if (!preserveCacheControl) delete copy.cache_control
-    if (fnHas) {
-      copy.function = { ...fn }
-      delete copy.function.eager_input_streaming
-    }
+    delete copy.cache_control
     return copy
   })
   return changed ? next : tools
@@ -273,34 +268,7 @@ function stripEagerInputStreaming(tools, { preserveCacheControl = false } = {}) 
 export function prepareCliPersonaInput(body, preset) {
   if (preset === 'zero') return body
   const { cache_control: _automatic, ...out } = body
-  if (Array.isArray(out.tools)) out.tools = stripEagerInputStreaming(out.tools)
-  return out
-}
-
-/** CLI needs a block marker: project automatic caching onto the current message tail. */
-function materializeAutomaticCache(body) {
-  validateCacheBreakpoints(body)
-  const { cache_control: control, ...out } = body
-  const messages = Array.isArray(body.messages) ? body.messages : []
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const message = messages[i]
-    if (!message || typeof message !== 'object') continue
-    // Supported mid-conversation system turns are also in the cache prefix.
-    // Skipping them could put this 5m marker before their explicit 1h marker.
-    const content = typeof message.content === 'string' ? [{ type: 'text', text: message.content }] : message.content
-    if (!Array.isArray(content)) continue
-    for (let j = content.length - 1; j >= 0; j--) {
-      const block = content[j]
-      if (!block || ['thinking', 'redacted_thinking'].includes(block.type)) continue
-      // An explicit tail policy already caches the entire eligible prefix.
-      if (block.cache_control != null) return out
-      const next = content.slice()
-      next[j] = { ...block, cache_control: { ...control } }
-      out.messages = messages.slice()
-      out.messages[i] = { ...message, content: next }
-      return out
-    }
-  }
+  if (Array.isArray(out.tools)) out.tools = stripToolCacheControl(out.tools)
   return out
 }
 
@@ -328,13 +296,11 @@ export function prepareCliHopBody(
     preserveCallerEnvironment = false,
     autoCompactWindow = null,
     routing = null,
-    outboundShape = null,
     personaPreset = null,
   } = {},
 ) {
   if (requestContext?.purpose === 'auto_mode_classifier') return prepareClassifierBody(canonicalBody, { stream })
-  // official_303 lean: renderOfficial303Body owns system, role=system placement and markers.
-  const lean = outboundShape === 'lean' && !requestContext
+  validateBetweenToolsThinking(canonicalBody)
   if (preserveSystem) validateCacheBreakpoints(canonicalBody)
   let body = officialMessagesBody(canonicalBody, { stream, preserveContentShape: true })
   const windowTokens = Number(autoCompactWindow)
@@ -360,7 +326,7 @@ export function prepareCliHopBody(
       (Array.isArray(body.system) &&
         body.system.some((block) => textOf(block).trim() === '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__')))
   if (!preserveSystem) {
-    if (!lean && !shaped && !preparedZero) {
+    if (!shaped && !preparedZero) {
       const leftover = stripCliOwnedSystem(body.system, { preserveCallerEnvironment })
       if (leftover == null) delete body.system
       else body.system = leftover
@@ -369,8 +335,8 @@ export function prepareCliHopBody(
     body = stabilizeMessageBudgets(body)
   }
   // cli-node sends mid-conversation-system. Only models that reject the role need the lift.
-  if (!lean && !modelSupportsMidConversationSystem(body.model)) body = liftMidConversationSystemMessages(body)
-  if (!preserveSystem && !lean) body = collapseSystemBudgetReminders(body)
+  if (!modelSupportsMidConversationSystem(body.model)) body = liftMidConversationSystemMessages(body)
+  if (!preserveSystem) body = collapseSystemBudgetReminders(body)
 
   // Native cli-node applies model policy and the medium effort default.
   // Explicit sampling fields stay omitted or present exactly as the caller sent them.
@@ -379,20 +345,22 @@ export function prepareCliHopBody(
   body = stripInvalidThinkingBlocks(body, { preserveThinkingBlocks })
   body = ensureOutputConfigSchema(body)
 
-  if (preparedZero && !lean && !preserveSystem && !requestContext && body.cache_control != null) {
+  if (preparedZero && !preserveSystem && !requestContext && body.cache_control != null) {
+    // Native passthrough judges the caller's markers before rewriting them.
+    validateCacheBreakpoints(body)
     body = materializeAutomaticCache(body)
   } else if (Object.prototype.hasOwnProperty.call(body, 'cache_control')) {
     delete body.cache_control
   }
   if (!requestContext) {
-    if (!lean && !shaped && !preparedZero) {
+    if (!shaped && !preparedZero) {
       body = { ...body, system: officialSystemTemplate(body.system, cacheTtl) }
       body.messages = officialMessageMarker(body.messages, cacheTtl)
     }
     // Zero owns its system layout, but does not assemble message breakpoints.
     // Only supply a fallback when the caller has no explicit cache policy:
     // preserving existing markers also preserves their budget and TTL order.
-    const zeroFallback = preparedZero && !lean && !shaped && !preserveSystem
+    const zeroFallback = preparedZero && !shaped && !preserveSystem
     if (zeroFallback) {
       const hasMarker = (node) => node?.cache_control != null
       const hasCallerMarkers =
@@ -405,11 +373,11 @@ export function prepareCliHopBody(
     // Keep official tool-marker cleanup before counting available slots. A
     // caller's 5m tool marker must not precede a template-owned 1h system marker.
     if (Array.isArray(body.tools)) {
-      body = { ...body, tools: stripEagerInputStreaming(body.tools, { preserveCacheControl: zeroFallback }) }
+      body = { ...body, tools: stripToolCacheControl(body.tools, { preserveCacheControl: zeroFallback }) }
     }
     // Assembled official templates own their system markers, not the growing
     // conversation. Fill missing message anchors without moving caller markers.
-    const shapedFallback = shaped && !lean && !preserveSystem
+    const shapedFallback = shaped && !preserveSystem
     if (shapedFallback) {
       const markers = listCacheMarkers(body)
       if (!markers.some((marker) => marker.section === 'messages')) {
@@ -419,9 +387,31 @@ export function prepareCliHopBody(
         const ttl = markers.some((marker) => marker.ttl !== '1h') ? '5m' : cacheTtl
         body.messages = officialMessageMarker(body.messages, ttl, Math.min(2, available))
       }
+      // These CLI presets always stamp both system boundaries, including one
+      // Node may have unmarked while preserving interpolated caller anchors.
+      // Budget the final wire shape, retaining the newest message anchors.
+      if (personaPreset === 'official' || personaPreset === 'official_full') {
+        const markers = listCacheMarkers(body)
+        const prefixCount = markers.filter((marker) => marker.section !== 'messages').length
+        const messages = markers.filter((marker) => marker.section === 'messages')
+        const excess = messages.length - Math.max(0, 4 - Math.max(2, prefixCount))
+        if (excess > 0) {
+          const drop = new Set(messages.slice(0, excess).map((marker) => `${marker.index}:${marker.blockIndex}`))
+          body.messages = body.messages.map((message, index) => {
+            if (!Array.isArray(message?.content)) return message
+            const content = message.content.map((block, blockIndex) => {
+              if (!drop.has(`${index}:${blockIndex}`)) return block
+              const { cache_control, ...rest } = block
+              return rest
+            })
+            return { ...message, content }
+          })
+        }
+      }
     }
   }
-  return body
+  const prepared = applyEagerToolStreaming(body, routing)
+  return preserveSystem ? prepared : enforceCacheTtlOrder(prepared, cacheTtl)
 }
 
 export function prepareOutboundAttempt({
@@ -456,6 +446,7 @@ export function prepareOutboundAttempt({
   firstUserIdentity = '',
   authScheme,
   credentialMode,
+  dropSampling = false,
 } = {}) {
   const inferenceOnly = isAnySetupTokenMode(credentialMode) || isApiKeyMode(credentialMode)
   const keepCallerSession = officialClient === true || (officialClient == null && !unofficial)
@@ -508,15 +499,24 @@ export function prepareOutboundAttempt({
     cacheTtl: cacheTtl || undefined,
     inbound,
     preserveThinkingBlocks,
+    dropSampling,
   })
   cleaned = stripIllegalCacheControlFields(cleaned)
-  if (cacheTtl) cleaned = applyCacheTtlToBody(cleaned, cacheTtl)
-  cleaned = enforceCacheTtlOrder(cleaned)
-  const tools = rewriteToolNames(cleaned, { enabled: toolNameRewrite !== false })
-  return { body: tools.body, toolNames: tools.reverse }
+  cleaned = enforceCacheTtlOrder(cleaned, cacheTtl || DEFAULT_CACHE_TTL)
+  const scrubbed = scrubUpstreamClientBody(cleaned, {
+    official: !unofficial,
+    rewriteTools: toolNameRewrite !== false,
+  })
+  const tools = rewriteToolNames(scrubbed.body, { enabled: toolNameRewrite !== false })
+  const toolNames = {}
+  for (const [wire, mid] of Object.entries(tools.reverse)) {
+    const client = scrubbed.reverse[mid] || mid
+    if (client !== wire) toolNames[wire] = client
+  }
+  return { body: tools.body, toolNames }
 }
 
-export function prepareOutboundHeaders(reqHeaders, homeDir, identity, model, { credentialMode, want1m } = {}) {
+export function prepareOutboundHeaders(reqHeaders, homeDir, identity, model, { credentialMode, want1m, routing } = {}) {
   if (isAnySetupTokenMode(credentialMode) || isApiKeyMode(credentialMode)) {
     return {
       'user-agent': INFERENCE_UA,
@@ -524,7 +524,10 @@ export function prepareOutboundHeaders(reqHeaders, homeDir, identity, model, { c
       'anthropic-beta': isApiKeyMode(credentialMode) ? apiKeyBetaHeader('') : setupTokenBetaHeader(model),
     }
   }
-  return resolveCrsHeaders(reqHeaders, homeDir, identity, model, { want1m: want1m === true })
+  const headers = resolveCrsHeaders(reqHeaders, homeDir, identity, model, { want1m: want1m === true })
+  // Slot identity supplies the version; the saved protocol setting owns the entrypoint.
+  headers['user-agent'] = officialClaudeCliUa(headers['user-agent'], ccEntrypointFromRouting(routing))
+  return headers
 }
 
 /** Body + headers after the context_management ↔ context-management beta gate. */
@@ -562,6 +565,7 @@ export function prepareOutboundEnvelope({
   authScheme,
   credentialMode,
   want1m,
+  dropSampling = false,
 } = {}) {
   const prepared = prepareOutboundAttempt({
     requestContext,
@@ -595,6 +599,7 @@ export function prepareOutboundEnvelope({
     firstUserIdentity,
     authScheme,
     credentialMode,
+    dropSampling,
   })
   const headers = {
     ...prepareOutboundHeaders(
@@ -604,6 +609,7 @@ export function prepareOutboundEnvelope({
       prepared.body?.model || inbound?.model || canonicalBody?.model,
       {
         credentialMode,
+        routing,
         want1m: want1m === true || hasClaudeCode1mSuffix(inbound?.model) || hasClaudeCode1mSuffix(canonicalBody?.model),
       },
     ),

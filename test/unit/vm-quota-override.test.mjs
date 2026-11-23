@@ -4,7 +4,9 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { AccountQuota } from '../../src/lib/pool/account-quota.mjs'
-import { parseVmQuotaOverride, vmQuotaOverrideOf } from '../../src/lib/pool/vm-quota-override.mjs'
+import { evaluateAccount } from '../../src/lib/pool/availability.mjs'
+import { keepTenantExactGates, parseVmQuotaOverride, vmQuotaOverrideOf } from '../../src/lib/pool/vm-quota-override.mjs'
+import { mergeTenantVmQuotaThresholds } from '../../src/company/tenant-vm-quota.mjs'
 
 function quota() {
   return new AccountQuota({
@@ -48,6 +50,38 @@ test('VM block switch off lets the slot run past its threshold; clearing restore
   assert.equal(q.canAccept('acc-a').ok, true)
   q.setVmQuotaOverride('vm-a', null)
   assert.equal(q.canAccept('acc-a').reason, 'quota_5h_safety')
+})
+
+test('tenant activation enforces each selected limit at 95% with global switches off and 5% overshoot', () => {
+  const q = quota()
+  Object.assign(q.config, { block_on_5h: false, block_on_7d: false, gate_overshoot: 0.05 })
+  const stored = mergeTenantVmQuotaThresholds({ limit_5h: 0.95 }, { block_on_5h: true, limit_7d: 0.95 }).value
+  const read = vmQuotaOverrideOf({ policy: { quota: stored } })
+  assert.deepEqual(read, stored)
+  q.setVmQuotaOverride('vm-a', read)
+  setUtil(q, 'acc-a', 0.949, 0.949)
+  assert.equal(q.canAccept('acc-a').ok, true)
+  assert.equal(q.gateZoneOf('acc-a'), 'draining')
+  setUtil(q, 'acc-a', 0.95, 0.1)
+  assert.equal(q.canAccept('acc-a').reason, 'quota_5h_safety')
+  const view = (u5, u7) => evaluateAccount({
+    hasRefresh: true,
+    schedulable: true,
+    policy: q.policyFor({ vm_id: 'vm-a' }),
+    quota: { utilization_5h: u5, utilization_7d: u7 },
+  })
+  assert.equal(view(0.95, 0.1).reason, 'quota_5h_safety')
+  setUtil(q, 'acc-a', 0.1, 0.95)
+  assert.equal(q.canAccept('acc-a').reason, 'quota_7d_safety')
+  assert.equal(view(0.1, 0.95).reason, 'quota_7d_safety')
+  assert.equal(q.gateZoneOf('acc-a'), 'gated')
+  setUtil(q, 'acc-b', 0.95, 0.95)
+  assert.equal(q.canAccept('acc-b').ok, true)
+  const edited = keepTenantExactGates(stored, { limit_5h: 0.95, block_on_5h: true, block_on_7d: false })
+  assert.equal(edited.tenant_exact_5h, true)
+  assert.equal(edited.tenant_exact_7d, undefined)
+  q.setVmQuotaOverride('vm-a', edited)
+  assert.equal(q.canAccept('acc-a').ok, true)
 })
 
 test('parseVmQuotaOverride rejects out-of-range and unknown fields, null field follows global', () => {

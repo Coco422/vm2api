@@ -14,7 +14,7 @@ import {
 import { mergeGuestFingerprint } from '../../src/lib/vm/guest-identity.mjs'
 import { loadVmIdentity } from '../../src/lib/identity/vm-identity.mjs'
 
-test('sub2api-style prefix treats vscode / cowork / desktop as official UA', () => {
+test('claude-cli prefix treats vscode / cowork / desktop as official UA', () => {
   assert.equal(isOfficialClaudeUa('claude-cli/2.1.234 (external, cli)'), true)
   assert.equal(isOfficialClaudeUa('claude-cli/2.1.234 (external, sdk-cli)'), true)
   assert.equal(isOfficialClaudeUa('claude-cli/2.1.241 (external, claude-vscode, agent-sdk/0.3.241)'), true)
@@ -142,7 +142,7 @@ test('official sonnet-5 keeps context-1m; others and unofficial drop it', () => 
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
-test('official empty beta uses sub2api DefaultBetaHeader; unofficial uses full mimicry set', () => {
+test('empty beta uses the default header for official clients and the full set for unofficial clients', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cc-def-'))
   const official = resolveCrsHeaders(
     {
@@ -178,7 +178,7 @@ test('official empty beta uses sub2api DefaultBetaHeader; unofficial uses full m
   assert.match(String(unofficial['anthropic-beta'] || ''), /context-management-2025-06-27/)
   assert.doesNotMatch(String(unofficial['anthropic-beta'] || ''), /context-1m-2025-08-07/)
   assert.equal(unofficial['anthropic-dangerous-direct-browser-access'], 'true')
-  assert.equal(unofficial['x-stainless-runtime-version'], 'v26.3.0')
+  assert.equal(unofficial['x-stainless-runtime-version'], 'v26.12.1')
   assert.equal(unofficial['x-stainless-retry-count'], '0')
   assert.equal(unofficial['x-stainless-timeout'], '600')
   assert.match(unofficial['user-agent'], /\(external, sdk-cli\)$/)
@@ -212,7 +212,7 @@ test('unofficial inbound two-token beta does not leak; UA is Claude Code', () =>
   assert.match(out['user-agent'], /^claude-cli\//)
   assert.doesNotMatch(out['user-agent'], /Go-http-client/)
   assert.equal(out['x-stainless-os'], 'Linux')
-  assert.equal(out['x-stainless-runtime-version'], 'v26.3.0')
+  assert.equal(out['x-stainless-runtime-version'], 'v26.12.1')
   assert.match(String(out['anthropic-beta'] || ''), /oauth-2025-04-20/)
   assert.match(String(out['anthropic-beta'] || ''), /context-management-2025-06-27/)
   const tokens = String(out['anthropic-beta'] || '')
@@ -401,7 +401,7 @@ test('guest locale and amd64 arch map onto outbound /v1 headers', () => {
   )
   assert.equal(out['x-stainless-arch'], 'x64')
   assert.equal(out['x-stainless-os'], 'Linux')
-  assert.equal(out['x-stainless-runtime-version'], 'v26.3.0')
+  assert.equal(out['x-stainless-runtime-version'], 'v26.12.1')
   assert.equal(out['x-stainless-retry-count'], '0')
   assert.equal(out['x-stainless-timeout'], '600')
   assert.equal(out['accept-language'], 'en-US')

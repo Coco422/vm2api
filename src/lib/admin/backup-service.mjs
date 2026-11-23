@@ -1,5 +1,5 @@
 /**
- * Local backup service — sub2api BackupService counterpart (no S3, per user).
+ * Local backup service for the database, VM files, and configuration.
  *
  * Backup artifact: data/backups/kin-backup-<stamp>.tar.gz (0600) containing
  *   manifest.json   {version, created_at, kind, includes, sha256s}
@@ -348,7 +348,9 @@ export class BackupService {
       if (this.configDir && fs.existsSync(cfgDirSrc)) {
         fs.mkdirSync(this.configDir, { recursive: true })
         for (const f of fs.readdirSync(cfgDirSrc)) {
-          fs.copyFileSync(path.join(cfgDirSrc, f), path.join(this.configDir, f))
+          const dest = path.join(this.configDir, f)
+          fs.copyFileSync(path.join(cfgDirSrc, f), dest)
+          invalidateReadCache(dest)
         }
       }
 

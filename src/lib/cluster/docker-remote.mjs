@@ -115,6 +115,166 @@ export async function dockerJson(connect, opts, okStatuses = [200]) {
   return JSON.parse(res.body.toString('utf8'))
 }
 
+/** Bound new short operations, including SSH channel creation (dockerRequest's
+ * own timer starts after connect). A late connection must never send a request.
+ */
+export async function withDockerDeadline(connect, operation, timeoutMs = 15_000) {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new RangeError('invalid Docker deadline')
+  const timeout = new ClusterError(504, 'docker_timeout', 'Docker API 操作超时（含连接建立）')
+  const streams = new Set()
+  let active = true
+  let timer
+  const scopedConnect = async () => {
+    if (!active) throw timeout
+    const stream = await connect()
+    if (!active) {
+      stream.destroy()
+      throw timeout
+    }
+    streams.add(stream)
+    stream.once('close', () => streams.delete(stream))
+    return stream
+  }
+  try {
+    return await Promise.race([
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          active = false
+          reject(timeout)
+          for (const stream of streams) stream.destroy()
+        }, timeoutMs)
+      }),
+      Promise.resolve().then(() => operation(scopedConnect)),
+    ])
+  } finally {
+    active = false
+    clearTimeout(timer)
+    for (const stream of streams) stream.destroy()
+  }
+}
+
+/** Update only the two memory limits; callers still verify HostConfig/cgroup. */
+export async function updateContainerMemory(connect, id, { memory, memorySwap }, { timeoutMs = 15_000 } = {}) {
+  if (!Number.isSafeInteger(memory) || memory <= 0 || !Number.isSafeInteger(memorySwap) || memorySwap < -1) {
+    throw new ClusterError(400, 'invalid_memory', 'Docker 内存上限不合法')
+  }
+  return withDockerDeadline(
+    connect,
+    async (scopedConnect) => {
+      const result = await dockerJson(scopedConnect, {
+        method: 'POST',
+        path: `${containerPath(id)}/update`,
+        body: { Memory: memory, MemorySwap: memorySwap },
+        timeoutMs,
+      })
+      return { warnings: Array.isArray(result?.Warnings) ? result.Warnings : [] }
+    },
+    timeoutMs,
+  )
+}
+
+/** Live `docker update --pids-limit`; the cgroup pids.max follows without a restart. */
+export async function updateContainerPids(connect, id, pidsLimit, { timeoutMs = 15_000 } = {}) {
+  if (!Number.isSafeInteger(pidsLimit) || pidsLimit <= 0) {
+    throw new ClusterError(400, 'invalid_pids_limit', 'Docker pids 上限不合法')
+  }
+  return withDockerDeadline(
+    connect,
+    async (scopedConnect) => {
+      const result = await dockerJson(scopedConnect, {
+        method: 'POST',
+        path: `${containerPath(id)}/update`,
+        body: { PidsLimit: pidsLimit },
+        timeoutMs,
+      })
+      return { warnings: Array.isArray(result?.Warnings) ? result.Warnings : [] }
+    },
+    timeoutMs,
+  )
+}
+
+function captureDockerOutput(buf, maxOutputBytes) {
+  const stdout = []
+  const stderr = []
+  let off = 0
+  let size = 0
+  while (off < buf.length) {
+    if (off + 8 > buf.length || ![1, 2].includes(buf[off]) || buf.subarray(off + 1, off + 4).some((v) => v !== 0)) {
+      throw new ClusterError(502, 'docker_exec_invalid_output', 'Docker exec 输出帧不完整或不合法')
+    }
+    const length = buf.readUInt32BE(off + 4)
+    if (off + 8 + length > buf.length) {
+      throw new ClusterError(502, 'docker_exec_invalid_output', 'Docker exec 输出帧不完整或不合法')
+    }
+    size += length
+    if (size > maxOutputBytes) throw new ClusterError(502, 'docker_exec_output_limit', 'Docker exec 输出超过上限')
+    ;(buf[off] === 2 ? stderr : stdout).push(buf.subarray(off + 8, off + 8 + length))
+    off += 8 + length
+  }
+  // Decode once per stream: UTF-8 characters can cross Docker frame boundaries.
+  return { stdout: Buffer.concat(stdout).toString('utf8'), stderr: Buffer.concat(stderr).toString('utf8') }
+}
+
+/** Finite non-TTY commands only. Closing a timed-out stream is not a process kill. */
+export async function execCapture(connect, id, cmd, { user, timeoutMs = 10_000, maxOutputBytes = 65_536 } = {}) {
+  if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes <= 0 || maxOutputBytes > MAX_RESPONSE_BYTES / 2 - 8) {
+    throw new RangeError('invalid Docker exec output limit')
+  }
+  return withDockerDeadline(
+    connect,
+    async (scopedConnect) => {
+      const created = await dockerJson(
+        scopedConnect,
+        {
+          method: 'POST',
+          path: `${containerPath(id)}/exec`,
+          body: { Cmd: cmd, Tty: false, AttachStdout: true, AttachStderr: true, ...(user ? { User: user } : {}) },
+          timeoutMs,
+        },
+        [201],
+      )
+      let wireBytes = 0
+      let overflow = false
+      let startStream
+      const startConnect = async () => (startStream = await scopedConnect())
+      let res
+      try {
+        res = await dockerRequest(startConnect, {
+          method: 'POST',
+          path: `${execPath(created.Id)}/start`,
+          body: { Detach: false, Tty: false },
+          timeoutMs,
+          onChunk: (chunk) => {
+            wireBytes += chunk.length
+            // Bound framing overhead too, including a stream of empty frames.
+            if (wireBytes > maxOutputBytes * 2 + 8) {
+              overflow = true
+              startStream.destroy()
+            }
+          },
+        })
+      } catch (error) {
+        if (!overflow) throw error
+      }
+      if (overflow) throw new ClusterError(502, 'docker_exec_output_limit', 'Docker exec 输出超过上限')
+      if (res.status !== 200) {
+        throw new ClusterError(
+          res.status === 404 ? 404 : res.status === 409 ? 409 : 502,
+          'docker_api_error',
+          dockerMessage(res),
+        )
+      }
+      const output = captureDockerOutput(res.body, maxOutputBytes)
+      const inspected = await inspectExec(scopedConnect, created.Id)
+      if (inspected?.Running !== false || !Number.isInteger(inspected.ExitCode) || inspected.ExitCode < 0) {
+        throw new ClusterError(502, 'docker_exec_unverified', '无法确认 Docker exec 已结束及退出码')
+      }
+      return { ...output, exitCode: inspected.ExitCode }
+    },
+    timeoutMs,
+  )
+}
+
 /**
  * Split Docker's multiplexed log stream (non-TTY containers):
  * 8-byte header [stream, 0, 0, 0, size uint32 BE] + payload.
@@ -324,6 +484,16 @@ export async function containerAction(connect, id, action, { t } = {}) {
   )
 }
 
+/** Send a signal (e.g. HUP for a config reload) to a running container. */
+export async function signalContainer(connect, id, signal) {
+  if (!/^[A-Z0-9]+$/.test(String(signal || ''))) throw new ClusterError(400, 'invalid_signal', '信号名不合法')
+  await dockerJson(
+    connect,
+    { method: 'POST', path: `${containerPath(id)}/kill?signal=${signal}`, timeoutMs: 30_000 },
+    [204],
+  )
+}
+
 export async function removeContainer(connect, id) {
   await dockerJson(connect, { method: 'DELETE', path: `${containerPath(id)}?force=1&v=1`, timeoutMs: 60_000 }, [204])
 }
@@ -397,30 +567,13 @@ function execPath(execId) {
 /**
  * `docker exec -it` over the Engine API. The start call is hijacked
  * (`Upgrade: tcp`); with Tty the stream is raw, no 8-byte frame headers.
- * No `User`: the session runs as the container's configured user.
  * @returns {Promise<{ execId: string, stream: import('node:stream').Duplex }>}
  */
-export async function openExecTty(connect, id, { cmd, env = [], workingDir, cols = 80, rows = 24 } = {}) {
-  const created = await dockerJson(
-    connect,
-    {
-      method: 'POST',
-      path: `${containerPath(id)}/exec`,
-      body: {
-        Cmd: cmd,
-        Env: env,
-        Tty: true,
-        AttachStdin: true,
-        AttachStdout: true,
-        AttachStderr: true,
-        ...(workingDir ? { WorkingDir: workingDir } : {}),
-      },
-    },
-    [201],
-  )
-  const start = `${execPath(created.Id)}/start`
+/** POST /exec/:id/start with an HTTP upgrade; resolves the raw hijacked stream. */
+async function hijackExecStart(connect, execId, startBody) {
+  const start = `${execPath(execId)}/start`
   const socket = await connect()
-  const payload = Buffer.from(JSON.stringify({ Detach: false, Tty: true, ConsoleSize: [rows, cols] }))
+  const payload = Buffer.from(JSON.stringify(startBody))
   const agent = new http.Agent({ keepAlive: false })
   agent.createConnection = () => socket
   const stream = await new Promise((resolve, reject) => {
@@ -472,7 +625,83 @@ export async function openExecTty(connect, id, { cmd, env = [], workingDir, cols
     })
     req.end(payload)
   })
+  return stream
+}
+
+export async function openExecTty(connect, id, { cmd, env = [], user, workingDir, cols = 80, rows = 24 } = {}) {
+  const created = await dockerJson(
+    connect,
+    {
+      method: 'POST',
+      path: `${containerPath(id)}/exec`,
+      body: {
+        Cmd: cmd,
+        Env: env,
+        Tty: true,
+        AttachStdin: true,
+        AttachStdout: true,
+        AttachStderr: true,
+        ...(user ? { User: user } : {}),
+        ...(workingDir ? { WorkingDir: workingDir } : {}),
+      },
+    },
+    [201],
+  )
+  const stream = await hijackExecStart(connect, created.Id, { Detach: false, Tty: true, ConsoleSize: [rows, cols] })
   return { execId: created.Id, stream }
+}
+
+/**
+ * Binary-safe exec: no TTY, so no line discipline rewrites bytes (a TTY turns
+ * 0x03 into SIGINT and CR into LF). Docker multiplexes stdout/stderr in 8-byte
+ * framed records when Tty is false; `onStdout` receives the demuxed stdout bytes,
+ * stdin is written raw to `stream`. Used by the slot desktop to pipe RFB.
+ */
+export async function openExecStream(connect, id, { cmd, env = [], user, onStdout, onStderr } = {}) {
+  const created = await dockerJson(
+    connect,
+    {
+      method: 'POST',
+      path: `${containerPath(id)}/exec`,
+      body: {
+        Cmd: cmd,
+        Env: env,
+        Tty: false,
+        AttachStdin: true,
+        AttachStdout: true,
+        AttachStderr: true,
+        ...(user ? { User: user } : {}),
+      },
+    },
+    [201],
+  )
+  const stream = await hijackExecStart(connect, created.Id, { Detach: false, Tty: false })
+  const decode = createDockerFrameDecoder((type, chunk) => {
+    if (type === 2) onStderr?.(chunk)
+    else onStdout?.(chunk)
+  })
+  stream.on('data', decode)
+  return { execId: created.Id, stream }
+}
+
+/**
+ * Decoder for Docker's multiplexed attach stream: [type, 0, 0, 0, size(u32 BE)]
+ * followed by `size` payload bytes. Frames may straddle chunk boundaries.
+ * @param {(type: number, payload: Buffer) => void} onFrame
+ */
+export function createDockerFrameDecoder(onFrame) {
+  let pending = Buffer.alloc(0)
+  return (chunk) => {
+    pending = pending.length ? Buffer.concat([pending, chunk]) : chunk
+    while (pending.length >= 8) {
+      const size = pending.readUInt32BE(4)
+      if (pending.length < 8 + size) break
+      const type = pending[0]
+      const payload = pending.subarray(8, 8 + size)
+      pending = pending.subarray(8 + size)
+      if (size > 0) onFrame(type, payload)
+    }
+  }
 }
 
 export async function resizeExec(connect, execId, { cols, rows }) {
@@ -490,11 +719,58 @@ export async function imagePresent(connect, ref) {
   return true
 }
 
+/** Local image id (`sha256:…`) for a ref, or null when the engine does not have it. */
+export async function imageIdOrNull(connect, ref) {
+  const res = await dockerRequest(connect, { path: `/images/${encodeURIComponent(ref)}/json`, timeoutMs: 15_000 })
+  if (res.status === 404) return null
+  if (res.status !== 200) throw new ClusterError(502, 'docker_api_error', dockerMessage(res))
+  return JSON.parse(res.body.toString('utf8')).Id || null
+}
+
+/** Every image on the engine (repo tags included); the caller filters. */
+export async function listImages(connect) {
+  return dockerJson(connect, { path: '/images/json', timeoutMs: 30_000 })
+}
+
+/**
+ * Untag one image reference without force. False when the engine refuses (409: a container,
+ * even a stopped one, still uses it) or the tag is already gone.
+ */
+export async function removeImageTag(connect, ref) {
+  const res = await dockerRequest(connect, {
+    method: 'DELETE',
+    path: `/images/${encodeURIComponent(ref)}`,
+    timeoutMs: 60_000,
+  })
+  if (res.status === 200) return true
+  if (res.status === 404 || res.status === 409) return false
+  throw new ClusterError(502, 'docker_api_error', dockerMessage(res))
+}
+
+/** Remove a named volume; a missing volume is not an error. */
+export async function removeVolume(connect, name) {
+  const res = await dockerRequest(connect, {
+    method: 'DELETE',
+    path: `/volumes/${encodeURIComponent(name)}?force=1`,
+    timeoutMs: 30_000,
+  })
+  if (res.status === 204 || res.status === 404) return
+  throw new ClusterError(502, 'docker_volume_remove_failed', dockerMessage(res))
+}
+
 export async function inspectNetworkOrNull(connect, name) {
   const res = await dockerRequest(connect, { path: `/networks/${encodeURIComponent(name)}`, timeoutMs: 15_000 })
   if (res.status === 404) return null
   if (res.status !== 200) throw new ClusterError(502, 'docker_api_error', dockerMessage(res))
   return JSON.parse(res.body.toString('utf8'))
+}
+
+/** Every network on the node, IPAM included, so subnet allocation can see what is taken. */
+export async function listNetworks(connect) {
+  const res = await dockerRequest(connect, { path: '/networks', timeoutMs: 20_000 })
+  if (res.status !== 200) throw new ClusterError(502, 'docker_api_error', dockerMessage(res))
+  const parsed = JSON.parse(res.body.toString('utf8'))
+  return Array.isArray(parsed) ? parsed : []
 }
 
 export async function createNetwork(connect, body) {

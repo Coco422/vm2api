@@ -29,8 +29,8 @@ const baseCli = process.env.KIN_303_BASE_CLI || ''
 const skip = !kernelBin || !cliBin || !fs.existsSync(kernelBin) || !fs.existsSync(cliBin)
 const SKELETON = JSON.parse(fs.readFileSync(path.join(root, 'test/fixtures/official-2.1.303-skeleton.json'), 'utf8'))
 
-async function harness(t, { preset = 'official_303', cacheTtl = '5m', cli = cliBin } = {}) {
-  const chain = await startRealChain({ kernelBin, cliBin: cli, preset, cacheTtl })
+async function harness(t, { preset = 'official_303', cacheTtl = '5m', cli = cliBin, guidance = false } = {}) {
+  const chain = await startRealChain({ kernelBin, cliBin: cli, preset, cacheTtl, guidance })
   t.after(chain.close)
   const send = async (body, userAgent) => {
     const wire = await chain.send({ request: { path: '/v1/messages', headers: { 'user-agent': userAgent }, body } })
@@ -106,7 +106,7 @@ function assertCch(wire) {
 }
 
 test('official_303 lean on the real chain: skeleton, rules, version, CCH', { skip, timeout: 60000 }, async (t) => {
-  const h = await harness(t, { cacheTtl: '1h' })
+  const h = await harness(t, { cacheTtl: '1h', guidance: true })
   const wire = await h.send(officialRequest(), OFFICIAL_UA)
   assert.deepEqual(checkOfficial303WireRules(wire.body), [])
   const blocking = diffShapes(SKELETON, outboundShape(wire.body)).filter((diff) => !isAllowedSkeletonDiff(diff))
@@ -131,21 +131,27 @@ test('official_303 lean on the real chain: skeleton, rules, version, CCH', { ski
     billingOf(wire),
     /^x-anthropic-billing-header: cc_version=2\.1\.303\.[0-9a-f]{3}; cc_entrypoint=cli; cch=[0-9a-f]{5}; cc_prompt_id=/,
   )
-  assert.equal(wire.raw.includes('/home/caller/'), false)
-  assert.equal(wire.body.messages[1].content.endsWith(AFTER_ENV), true)
+  // Caller context is retained; only generated harness paths belong to the slot.
+  assert.doesNotMatch(wire.body.system[2].text, /\/home\/caller\//)
+  const environment = wire.body.messages[1].content
+  const environmentText = Array.isArray(environment)
+    ? environment.map((block) => block.text || '').join('\n')
+    : environment
+  assert.match(environmentText, /Primary working directory: \/srv\/app/)
+  assert.ok(environmentText.includes(AFTER_ENV))
   assert.deepEqual(
     wire.body.system.map((block) => block.cache_control),
     [undefined, undefined, { type: 'ephemeral', ttl: '1h', scope: 'global' }, { type: 'ephemeral', ttl: '1h' }],
   )
   assertCch(wire)
-  assert.deepEqual(h.logs.at(-1).outbound_profile, { cli_version: '2.1.303', shape: 'lean' })
+  assert.deepEqual(h.logs.at(-1).outbound_profile, { cli_version: '2.1.303' })
 })
 
 test('official_303 lean: non-official caller and a second turn keep the cached prefix bytes', {
   skip,
   timeout: 60000,
 }, async (t) => {
-  const h = await harness(t, { cacheTtl: '1h' })
+  const h = await harness(t, { cacheTtl: '1h', guidance: true })
   const bot = {
     model: 'claude-opus-5-5',
     max_tokens: 1024,
@@ -190,7 +196,7 @@ test('official_303 lean: non-official caller and a second turn keep the cached p
   assert.equal(strip(second.body.tools), strip(first.body.tools))
 })
 
-test('official_303 full-prompt model keeps the existing body at 2.1.303; hot switch back to 296', {
+test('official full-prompt templates keep the current CLI identity across hot switches', {
   skip,
   timeout: 60000,
 }, async (t) => {
@@ -198,8 +204,9 @@ test('official_303 full-prompt model keeps the existing body at 2.1.303; hot swi
   const sonnet = await h.send(officialRequest('claude-sonnet-5-5'), OFFICIAL_UA)
   assert.match(sonnet.headers['user-agent'], /^claude-cli\/2\.1\.303 /)
   assert.match(billingOf(sonnet), /cc_version=2\.1\.303\./)
-  assert.equal(sonnet.body.system.length, 2)
-  assert.match(billingOf(sonnet), /prompt_version=<You are a Claude agent, built on Anthropic's Claude Agent SDK\.>/)
+  assert.equal(sonnet.body.system.length, 3)
+  assert.match(sonnet.body.system[1].text, /You are Claude Code, Anthropic's official CLI for Claude\./)
+  assert.match(billingOf(sonnet), /cc_turn_origin=sdk;/)
   assert.equal(sonnet.body.kin_outbound_shape, undefined)
   const pidBefore = JSON.parse(await h.health()).pid ?? null
   h.switchPreset('official_full')

@@ -19,7 +19,6 @@ import { TabsContent } from '@/components/ui/tabs'
 import { VmCostByModel } from '@/features/vm/detail-cost-by-model'
 import { VmStatusBoard } from '@/features/vm/detail-status-board'
 import type { VmTodayCounts } from '@/features/vm/detail-today'
-import { VmEngineEditor } from '@/features/vm/engine-editor'
 import { VmPersonaEditor } from '@/features/vm/persona-editor'
 
 type VmOverviewTabProps = {
@@ -30,7 +29,6 @@ type VmOverviewTabProps = {
   dash: { data: Dashboard | undefined }
   u5: number
   u7: number
-  tierKey: string
   now: number
   cost: VmCostSummary
   split: WeeklySplitSummary | null
@@ -39,6 +37,60 @@ type VmOverviewTabProps = {
   today: VmTodayCounts
   costByModel?: VmBillingModelRow[]
   billing?: VmDetailPayload['billing']
+  deliveryLifecycle?: VmDetailPayload['delivery_lifecycle']
+}
+
+const lifecycleDate = new Intl.DateTimeFormat('zh-CN', {
+  timeZone: 'Asia/Shanghai',
+  dateStyle: 'medium',
+  timeStyle: 'short',
+})
+
+function VmDeliveryLifecycle({
+  record,
+}: {
+  record: NonNullable<VmDetailPayload['delivery_lifecycle']>
+}) {
+  const {
+    batch,
+    firstSuccessAt,
+    shutdownAt,
+    confirmedStoppedBy,
+    survivalDays,
+  } = record
+  const rows = [
+    ['批次', batch],
+    [
+      '首笔成功',
+      firstSuccessAt ? lifecycleDate.format(new Date(firstSuccessAt)) : '—',
+    ],
+    [
+      '正式关机',
+      shutdownAt
+        ? lifecycleDate.format(new Date(shutdownAt))
+        : confirmedStoppedBy
+          ? `截至 ${lifecycleDate.format(new Date(confirmedStoppedBy))} 已关机`
+          : '在役',
+    ],
+    ['存活天数', survivalDays == null ? '—' : survivalDays.toFixed(1)],
+  ]
+  return (
+    <Card>
+      <CardHeader className='pb-2'>
+        <CardTitle className='text-sm'>交付周期（北京时间）</CardTitle>
+      </CardHeader>
+      <CardContent>
+        <dl className='grid grid-cols-2 gap-3 text-sm sm:grid-cols-4'>
+          {rows.map(([label, value]) => (
+            <div key={label}>
+              <dt className='text-xs text-muted-foreground'>{label}</dt>
+              <dd className='mt-1 tabular-nums'>{value}</dd>
+            </div>
+          ))}
+        </dl>
+      </CardContent>
+    </Card>
+  )
 }
 
 export function periodOf(
@@ -100,18 +152,15 @@ function OpenaiWindowStats({
 }
 
 export function VmOverviewTab(props: VmOverviewTabProps) {
-  const { vm, kernel, costByModel, billing, ...board } = props
+  const { vm, kernel, costByModel, billing, deliveryLifecycle, ...board } =
+    props
   return (
     <TabsContent value='overview' className='space-y-3 pt-3'>
       <VmStatusBoard vm={vm} kernel={kernel} billing={billing} {...board} />
+      {deliveryLifecycle && <VmDeliveryLifecycle record={deliveryLifecycle} />}
       {isCodexVm(vm) ? <OpenaiWindowStats billing={billing} /> : null}
       <VmCostByModel rows={costByModel} />
-      {isCodexVm(vm) ? null : (
-        <div className='grid gap-3 lg:grid-cols-2'>
-          <VmEngineEditor id={vm.id} vm={vm} kernel={kernel} />
-          <VmPersonaEditor id={vm.id} vm={vm} />
-        </div>
-      )}
+      {isCodexVm(vm) ? null : <VmPersonaEditor id={vm.id} vm={vm} />}
     </TabsContent>
   )
 }

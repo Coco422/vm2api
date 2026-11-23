@@ -8,6 +8,18 @@ import { IMAGE_TOOL_MODELS, canonicalImageToolModel } from './image-tool-models.
 
 const SETTINGS_KEY = 'gpt_model_policy'
 
+/** Generation of the static fallback catalog below. Stored policies without the field are gen 1. */
+export const GPT_SEED_VERSION = 2
+
+/**
+ * Ids each seed generation added over the previous one. The load-time migration touches only
+ * these, instead of merging the whole seed: a blanket merge would resurrect older seed models
+ * that an upstream sync legitimately dropped from the account catalog.
+ */
+const SEED_ADDITIONS = Object.freeze({
+  2: Object.freeze(['gpt-6.2-astra', 'gpt-6.2-sol']),
+})
+
 const CAP_GPT = {
   context_window: 272000,
   supports_1m: false,
@@ -29,7 +41,83 @@ function entry(id, extra = {}) {
     capabilities: extra.capabilities || { ...CAP_GPT },
     params: extra.params || { max_tokens_default: 16384, max_tokens_cap: 128000 },
     aliases: extra.aliases || [],
+    expose_fast: extra.expose_fast === true,
   }
+}
+
+function bareModelId(model) {
+  const raw = String(model || '').trim()
+  if (!raw) return ''
+  return raw.split('/').filter(Boolean).pop() || raw
+}
+
+function exactPolicyModelId(id) {
+  const lower = String(id || '')
+    .trim()
+    .toLowerCase()
+  if (!lower) return null
+  return Object.keys(policy.models || {}).find((candidate) => candidate.toLowerCase() === lower) || null
+}
+
+function hasPriorityTier(row) {
+  return (
+    Array.isArray(row?.catalog?.service_tiers) &&
+    row.catalog.service_tiers.some((tier) => tier && typeof tier === 'object' && tier.id === 'priority')
+  )
+}
+
+/** Resolve the generated `<model>-fast` alias without treating it as a catalog id. */
+export function resolveGptFastAlias(model) {
+  if (!loaded) loadGptModelPolicy()
+  const alias = bareModelId(model)
+  if (!/^gpt-/i.test(alias) || !/-fast$/i.test(alias)) return { kind: 'normal', model: alias }
+
+  const actualId = exactPolicyModelId(alias)
+  if (actualId) return { kind: 'actual', model: actualId }
+
+  const baseId = alias.replace(/-fast$/i, '')
+  const baseIdExact = exactPolicyModelId(baseId)
+  const base = baseIdExact ? policy.models?.[baseIdExact] : null
+  if (!baseIdExact || !base) {
+    return { kind: 'unavailable', alias, reason: 'base_missing' }
+  }
+  if (base.enabled === false) return { kind: 'unavailable', alias, reason: 'base_disabled', base: baseIdExact }
+  if (base.expose_fast !== true) return { kind: 'unavailable', alias, reason: 'not_exposed', base: baseIdExact }
+  if (!hasPriorityTier(base)) return { kind: 'unavailable', alias, reason: 'priority_missing', base: baseIdExact }
+  return { kind: 'fast', alias, base: baseIdExact, service_tier: 'priority' }
+}
+
+export function isGptFastAliasAvailable(model) {
+  return resolveGptFastAlias(model).kind === 'fast'
+}
+
+export function listGptFastAliases({ mappingKeys = [] } = {}) {
+  if (!loaded) loadGptModelPolicy()
+  const actualIds = new Set(Object.keys(policy.models || {}).map((id) => id.toLowerCase()))
+  const mapped = new Set(
+    (Array.isArray(mappingKeys) ? mappingKeys : []).map((id) => bareModelId(id).toLowerCase()).filter(Boolean),
+  )
+  return Object.entries(policy.models || {})
+    .filter(([id, row]) => {
+      const alias = `${id}-fast`.toLowerCase()
+      return (
+        /^gpt-/i.test(id) &&
+        row?.enabled !== false &&
+        row?.expose_fast === true &&
+        hasPriorityTier(row) &&
+        !actualIds.has(alias) &&
+        !mapped.has(alias)
+      )
+    })
+    .map(([id, row]) => ({
+      id: `${id}-fast`,
+      display_name: `${row.display_name || id} Fast`,
+      family: 'codex',
+      enabled: true,
+      source: 'gpt-model-policy',
+      alias_of: id,
+      service_tier: 'priority',
+    }))
 }
 
 /** Known image model ids only; `enabled` must be a boolean. Unlisted ids keep `base`. */
@@ -49,9 +137,19 @@ function normalizeImageTools(raw, base = null) {
 export function seedGptPolicy() {
   const models = {}
   for (const [id, extra] of [
+    ['gpt-6.2-astra', { display_name: 'GPT-6.2 Astra', sort: 62 }],
+    ['gpt-6.2-sol', { display_name: 'GPT-6.2 Sol', sort: 63 }],
+    ['gpt-6-astra', { display_name: 'GPT-6 Astra', sort: 66 }],
+    ['gpt-6.1-sol', { display_name: 'GPT-6.1 Sol', sort: 67 }],
+    [
+      'gpt-6.1-terra',
+      { display_name: 'GPT-6.1 Terra', sort: 68, capabilities: { ...CAP_GPT, context_window: 500000 } },
+    ],
     ['gpt-6-sol', { display_name: 'GPT-6 Sol', sort: 70 }],
     ['gpt-6-luna', { display_name: 'GPT-6 Luna', sort: 71 }],
-    ['gpt-5.6', { display_name: 'GPT-5.6', sort: 76 }],
+    ['gpt-5.6-sol', { display_name: 'GPT-5.6 Sol', sort: 73 }],
+    ['gpt-5.6-terra', { display_name: 'GPT-5.6 Terra', sort: 74 }],
+    ['gpt-5.6-luna', { display_name: 'GPT-5.6 Luna', sort: 75 }],
     ['gpt-5.5', { display_name: 'GPT-5.5', sort: 77 }],
     ['gpt-5.4', { display_name: 'GPT-5.4', sort: 80, aliases: ['codex'] }],
     ['gpt-5.4-mini', { display_name: 'GPT-5.4 Mini', sort: 81 }],
@@ -61,12 +159,22 @@ export function seedGptPolicy() {
   }
   return {
     version: 1,
+    seed_version: GPT_SEED_VERSION,
     updated_at: new Date().toISOString(),
     source: 'seed',
     platform: 'openai',
     models,
     image_tools: normalizeImageTools(null),
   }
+}
+
+/** Seed ids that ship enabled. Computed from the seed so the two never drift apart. */
+function seedDefaultEnabledIds() {
+  const out = new Set()
+  for (const [id, row] of Object.entries(seedGptPolicy().models || {})) {
+    if (row?.enabled !== false) out.add(id.toLowerCase())
+  }
+  return out
 }
 
 let policy = seedGptPolicy()
@@ -80,6 +188,33 @@ function persist() {
   }
 }
 
+/**
+ * One-shot backfill of the ids a newer seed generation introduced, guarded by `seed_version`.
+ * A policy already synced from the account catalog (`source: 'codex'`) never merges the seed,
+ * so without this a shipped seed addition would stay invisible on every live instance.
+ * An id the stored policy already carries keeps its upstream `catalog` facts and only has its
+ * `enabled` corrected: before this generation that `false` was the system default for a freshly
+ * synced id, not an admin decision, and the two are indistinguishable in the stored data.
+ * @returns {boolean} true when the policy changed and must be persisted
+ */
+function applySeedAdditions(stored) {
+  const storedVersion = Number.isSafeInteger(stored?.seed_version) ? stored.seed_version : 1
+  // Only reachable with an explicit marker at or past this generation, which the policy spread
+  // already carried over. Leave it alone so a rollback/forward cycle cannot re-run the backfill.
+  if (storedVersion >= GPT_SEED_VERSION) return false
+  const seed = seedGptPolicy()
+  for (let version = storedVersion + 1; version <= GPT_SEED_VERSION; version++) {
+    for (const id of SEED_ADDITIONS[version] || []) {
+      const seedRow = seed.models[id]
+      if (!seedRow) continue
+      if (policy.models[id]) policy.models[id].enabled = seedRow.enabled !== false
+      else policy.models[id] = { ...seedRow }
+    }
+  }
+  policy.seed_version = GPT_SEED_VERSION
+  return true
+}
+
 export function loadGptModelPolicy({ force = false } = {}) {
   if (loaded && !force) return policy
   try {
@@ -90,8 +225,20 @@ export function loadGptModelPolicy({ force = false } = {}) {
         ...(live ? stored : { ...seedGptPolicy(), ...stored, models: { ...seedGptPolicy().models, ...stored.models } }),
         platform: 'openai',
       }
+      policy.models = Object.fromEntries(
+        Object.entries(policy.models || {}).map(([id, row]) => [
+          id,
+          {
+            ...(row && typeof row === 'object' ? row : {}),
+            id,
+            family: 'codex',
+            expose_fast: row?.expose_fast === true,
+          },
+        ]),
+      )
       policy.image_tools = normalizeImageTools(stored.image_tools)
       policy.source = policy.source || 'settings'
+      if (applySeedAdditions(stored)) persist()
     } else {
       policy = seedGptPolicy()
       persist()
@@ -117,7 +264,13 @@ export function saveGptModelPolicy(next) {
       // Catalog facts come from the upstream sync only; a stale panel draft must not overwrite them.
       const { catalog: _drop, ...edits } = row
       const catalog = policy.models?.[id]?.catalog
-      models[id] = { ...models[id], ...edits, id, family: 'codex' }
+      models[id] = {
+        ...models[id],
+        ...edits,
+        id,
+        family: 'codex',
+        expose_fast: typeof edits.expose_fast === 'boolean' ? edits.expose_fast : models[id]?.expose_fast === true,
+      }
       if (catalog) models[id].catalog = catalog
     }
   }
@@ -128,6 +281,8 @@ export function saveGptModelPolicy(next) {
     models,
     image_tools: normalizeImageTools(next?.image_tools, currentImageTools),
     platform: 'openai',
+    // The panel body may carry a stale marker; a save never un-applies a seed generation.
+    seed_version: GPT_SEED_VERSION,
     updated_at: new Date().toISOString(),
     source: 'panel',
   }
@@ -209,13 +364,19 @@ export function syncGptIdsIntoPolicy(ids = [], { displayNameOf = null } = {}) {
   }
   const next = {}
   const added = []
+  const seedEnabled = seedDefaultEnabledIds()
   for (const row of live) {
     const prev = policy.models[row.id]
     if (!prev) added.push(row.id)
     next[row.id] = entry(row.id, {
       ...prev,
+      // A new catalog ID has no local capability or token-limit evidence yet.
+      capabilities: prev?.capabilities || {},
+      params: prev?.params || {},
       display_name: row.display_name || prev?.display_name || displayNameOf?.(row.id) || row.id,
-      enabled: prev ? prev.enabled !== false : false,
+      // An id the static fallback catalog ships enabled stays schedulable the moment the
+      // account catalog confirms it. An id outside that catalog waits for the admin.
+      enabled: prev ? prev.enabled !== false : seedEnabled.has(row.id.toLowerCase()),
       source: 'codex',
     })
     // Upstream catalog facts replace the previous snapshot; a sync without them keeps it.

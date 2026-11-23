@@ -48,26 +48,76 @@ function sftpError(err, what) {
 
 /** SFTP WRITE payloads stay under the 32 KiB every server accepts. */
 const WRITE_CHUNK = 32 * 1024
+const WRITE_WINDOW = 32
 
 /**
  * Atomic, symlink-safe write. `owner` is only set when the SSH user is root (the
  * slot then runs as 10000+n and must own its files); a non-root SSH user already is the slot uid.
  */
-export async function writeRemoteFile(sftp, file, data, { mode = 0o600, owner = null } = {}) {
+export async function writeRemoteFile(sftp, file, data, { mode = 0o600, owner = null, timeoutMs = 0 } = {}) {
+  let timedOut = false
+  const work = writeRemoteFileBody(sftp, file, data, { mode, owner }).catch((error) => {
+    if (timedOut) return undefined
+    throw error
+  })
+  if (!timeoutMs) return work
+  let timer
+  try {
+    return await Promise.race([
+      work,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          timedOut = true
+          reject(new ClusterError(504, 'sftp_timeout', `写入超时：${file}`))
+        }, timeoutMs)
+        timer.unref?.()
+      }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** Regular-file SHA-256, or null when the path is missing. A symlink is not hashed. */
+export async function remoteFileSha256(client, file) {
+  const script = `f=${shellQuote(file)}; if [ -L "$f" ] || [ ! -f "$f" ]; then exit 3; fi; sha256sum "$f"`
+  const result = await execCollect(client, `sh -c ${shellQuote(script)}`, { timeoutMs: 120_000, maxBytes: 4096 })
+  if (result.code === 3) return null
+  if (result.code !== 0) {
+    const detail = (result.stderr || `exit ${result.code}`).trim().slice(-200)
+    throw new ClusterError(502, 'remote_hash_failed', `校验 ${file} 失败：${detail}`)
+  }
+  const hash = result.stdout.trim().split(/\s+/)[0]
+  if (!/^[a-f0-9]{64}$/.test(hash)) {
+    throw new ClusterError(502, 'remote_hash_failed', `校验 ${file} 返回异常`)
+  }
+  return hash
+}
+async function writeRemoteFileBody(sftp, file, data, { mode = 0o600, owner = null } = {}) {
   if (!Buffer.isBuffer(data)) data = Buffer.from(data)
   const dir = file.slice(0, file.lastIndexOf('/'))
   const tmp = `${dir}/.kin-${crypto.randomBytes(8).toString('hex')}.tmp`
   let handle = null
   try {
     handle = await call((cb) => sftp.open(tmp, 'wx', { mode }, cb))
-    for (let off = 0; off < data.length; off += WRITE_CHUNK) {
-      const len = Math.min(WRITE_CHUNK, data.length - off)
-      await call((cb) => sftp.write(handle, data, off, len, off, cb))
+    // Bound memory and requests while keeping distant nodes' SFTP windows full.
+    // Settle the whole batch before closing/unlinking a handle after any failure.
+    for (let start = 0; start < data.length; start += WRITE_CHUNK * WRITE_WINDOW) {
+      const writes = []
+      const end = Math.min(data.length, start + WRITE_CHUNK * WRITE_WINDOW)
+      for (let off = start; off < end; off += WRITE_CHUNK) {
+        const len = Math.min(WRITE_CHUNK, data.length - off)
+        writes.push(call((cb) => sftp.write(handle, data, off, len, off, cb)))
+      }
+      const settled = await Promise.allSettled(writes)
+      const failed = settled.find((result) => result.status === 'rejected')
+      if (failed) throw failed.reason
     }
     await call((cb) => sftp.fchmod(handle, mode, cb))
     if (owner) await call((cb) => sftp.fchown(handle, owner.uid, owner.gid, cb))
     await call((cb) => sftp.close(handle, cb))
     handle = null
+    // Rename over the live path. Never unlink it first: a container command may point at it.
     await call((cb) => sftp.ext_openssh_rename(tmp, file, cb))
   } catch (err) {
     if (handle) await call((cb) => sftp.close(handle, cb)).catch(() => {})
@@ -103,12 +153,60 @@ export async function readRemoteFileNoFollow(client, file, { maxBytes = 1 << 20 
 
 /** Symlink ownership is never checked by the kernel, so root-created links are fine. */
 export async function remoteSymlink(sftp, target, linkPath) {
-  await call((cb) => sftp.unlink(linkPath, cb)).catch(() => {})
+  const tmp = `${linkPath}.${crypto.randomUUID()}.tmp`
+  let created = false
   try {
-    await call((cb) => sftp.symlink(target, linkPath, cb))
+    let stat
+    try {
+      stat = await call((cb) => sftp.lstat(linkPath, cb))
+    } catch (err) {
+      if (err.code !== 2) throw err
+    }
+    if (stat?.isSymbolicLink() && (await call((cb) => sftp.readlink(linkPath, cb))) === target) return
+    await call((cb) => sftp.symlink(target, tmp, cb))
+    created = true
+    await call((cb) => sftp.ext_openssh_rename(tmp, linkPath, cb))
   } catch (err) {
+    if (created) await call((cb) => sftp.unlink(tmp, cb)).catch(() => {})
     throw sftpError(err, `创建链接 ${linkPath} 失败`)
   }
+}
+
+/**
+ * Make each final component a real directory. Parents must be mount roots.
+ * Mode and owner go through `find -P`: GNU chmod before 8.32 and BusyBox reject
+ * `chmod -h` (`invalid option -- 'h'`), which aborted kernel switch and deploy.
+ * `-P` does not follow a symlink the guest swapped in; a link matches nothing
+ * and the script fails closed instead of changing the target.
+ * `owner` is only meaningful for a root SSH session.
+ */
+export function privateDirectoriesScript(dirs, owner = null) {
+  const own =
+    owner == null
+      ? ''
+      : `find -P "$d" -maxdepth 0 -type d -exec chown ${requireId(owner.uid)}:${requireId(owner.gid)} {} + || exit 1;`
+  return dirs
+    .map((dir) => {
+      const d = shellQuote(dir)
+      return [
+        `d=${d};`,
+        'if [ -L "$d" ]; then rm "$d" || exit 1; fi;',
+        'if [ -e "$d" ] && [ ! -d "$d" ]; then rm "$d" || exit 1; fi;',
+        'if [ ! -d "$d" ]; then mkdir "$d" || exit 1; fi;',
+        'if [ -L "$d" ] || [ ! -d "$d" ]; then echo "private directory was replaced" >&2; exit 1; fi;',
+        'hit=$(find -P "$d" -maxdepth 0 -type d -exec chmod 700 {} + -print);',
+        '[ -n "$hit" ] || { echo "private directory was replaced" >&2; exit 1; };',
+        'if [ -L "$d" ] || [ ! -d "$d" ]; then echo "private directory was replaced" >&2; exit 1; fi;',
+        own,
+      ].join(' ')
+    })
+    .join(' ')
+}
+
+function requireId(value) {
+  const id = Number(value)
+  if (!Number.isInteger(id) || id < 0) throw new Error('remote owner id is not an integer')
+  return id
 }
 
 /** Run a shell script; non-zero exit is an error carrying stderr. */

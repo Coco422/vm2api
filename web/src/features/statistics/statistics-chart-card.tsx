@@ -79,12 +79,16 @@ function SeriesName({
 export function StatisticsChartCard({
   dimensions,
   tz,
+  global = false,
   className,
+  dimensionLabels,
 }: {
   /** 当前角色可用的维度，第一个为默认值。 */
   dimensions: StatsDimension[]
   tz: string
+  global?: boolean
   className?: string
+  dimensionLabels?: Partial<Record<StatsDimension, string>>
 }) {
   const [range, setRange] = useState<StatsRange>('today')
   const [dimension, setDimension] = useState<StatsDimension>(dimensions[0])
@@ -96,8 +100,9 @@ export function StatisticsChartCard({
     ? dimension
     : dimensions[0]
 
-  const stats = useQuery(statisticsQueryOptions(range, activeDimension, tz))
-  const data = stats.data
+  const stats = useQuery(statisticsQueryOptions(range, activeDimension, tz, global))
+  const data = stats.isPlaceholderData ? undefined : stats.data
+  const awaitingSelection = stats.isPlaceholderData || stats.isLoading
   const series = useMemo(() => data?.series ?? [], [data])
   const totalsOf = (s: StatsSeries) => data?.seriesTotals[s.dataKey]
   const hasUsage = (s: StatsSeries) => {
@@ -188,7 +193,7 @@ export function StatisticsChartCard({
   const chartHeight = enableFilter
     ? CHART_HEIGHT_WITH_LEGEND
     : CHART_HEIGHT_NO_LEGEND
-  const failed = Boolean(stats.error) && !data
+  const failed = Boolean(stats.error) && !stats.isPlaceholderData && !data
   const allVisible = hidden.size === 0
   const oneVisible = visible.length <= 1
 
@@ -210,7 +215,7 @@ export function StatisticsChartCard({
                   active={activeDimension === dim}
                   onClick={() => changeDimension(dim)}
                 >
-                  {DIMENSION_LABELS[dim]}
+                  {dimensionLabels?.[dim] ?? DIMENSION_LABELS[dim]}
                 </ToggleChip>
               ))}
             </div>
@@ -272,14 +277,16 @@ export function StatisticsChartCard({
               {tab.label}
             </span>
             <span className='text-base font-bold tabular-nums'>
-              {formatMetric(tab.id, tabTotals[tab.id])}
+              {awaitingSelection
+                ? '—'
+                : formatMetric(tab.id, tabTotals[tab.id])}
             </span>
           </button>
         ))}
       </div>
 
       <div ref={chartWrapperRef} className='px-4 py-2'>
-        {stats.isLoading && !data ? (
+        {awaitingSelection ? (
           <Skeleton className='w-full' style={{ height: chartHeight }} />
         ) : failed ? (
           <div
@@ -288,12 +295,19 @@ export function StatisticsChartCard({
           >
             获取统计数据失败
           </div>
-        ) : series.length === 0 || visibleTotal === 0 ? (
+        ) : series.length === 0 ? (
           <div
             className='grid place-items-center text-sm text-muted-foreground'
             style={{ height: chartHeight }}
           >
             暂无统计数据
+          </div>
+        ) : visibleTotal === 0 ? (
+          <div
+            className='grid place-items-center text-sm text-muted-foreground'
+            style={{ height: chartHeight }}
+          >
+            当前显示的系列在所选时段内此指标为 0
           </div>
         ) : (
           <ResponsiveContainer width='100%' height={chartHeight}>
@@ -446,7 +460,7 @@ export function StatisticsChartCard({
               全选
             </LegendAction>
             <LegendAction disabled={oneVisible} onClick={keepFirstWithUsage}>
-              清空
+              仅保留一项
             </LegendAction>
           </div>
           <div className='max-h-[72px] overflow-y-auto pr-36'>

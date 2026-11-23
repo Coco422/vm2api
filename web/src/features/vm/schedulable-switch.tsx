@@ -15,6 +15,8 @@ import { dashboardQueryOptions } from '@/features/overview/queries'
 import { vmQueryOptions, vmsListQueryOptions } from '@/features/vm/queries'
 import { useVmPerms } from '@/features/vm/vm-perms'
 
+type TenantScheduleState = 'enabled' | 'paused' | 'operator-off'
+
 function formatRestrictionUntil(until: number | null | undefined): string {
   const ms = expiresAtToMs(until)
   if (!ms) return ''
@@ -25,6 +27,15 @@ export function vmSchedulableProps(vm: Vm) {
   const scheduleState: ScheduleState | undefined = isRestrictedSchedule(vm)
     ? 'restricted'
     : vm.schedule_state
+  const off =
+    vm.schedule_off === true ||
+    scheduleState === 'off' ||
+    (vm.schedule_manual === true && vm.schedulable === false)
+  const tenantState: TenantScheduleState = !off
+    ? 'enabled'
+    : vm.schedule_disabled_reason === 'tenant_paused'
+      ? 'paused'
+      : 'operator-off'
   return {
     vmId: vm.id,
     // 受限（含维护 / 代理暂停）仍是「开」：开关只表达操作员意图和不可调度。
@@ -35,6 +46,7 @@ export function vmSchedulableProps(vm: Vm) {
           ? scheduleState === 'on'
           : vm.schedulable !== false,
     scheduleState,
+    tenantState,
     restrictionUntil: restrictionUntilOf(vm),
     restrictionReason: vm.restriction_reason,
     unschedulableText: vm.unschedulable_text || vm.unschedulable_reason || null,
@@ -45,6 +57,7 @@ export function SchedulableSwitch({
   vmId,
   schedulable,
   scheduleState,
+  tenantState,
   restrictionUntil,
   unschedulableText,
   className,
@@ -52,6 +65,7 @@ export function SchedulableSwitch({
   vmId: string
   schedulable: boolean
   scheduleState?: ScheduleState
+  tenantState: TenantScheduleState
   restrictionUntil?: number | null
   restrictionReason?: string | null
   unschedulableText?: string | null
@@ -59,10 +73,15 @@ export function SchedulableSwitch({
 }) {
   const qc = useQueryClient()
   const perms = useVmPerms()
-  const canSchedule = perms.admin || perms.dashboard
+  const canSchedule =
+    perms.admin ||
+    perms.dashboard ||
+    (perms.tenantSchedule && tenantState !== 'operator-off')
   const restricted = scheduleState === 'restricted'
   const [optimistic, setOptimistic] = useState<boolean | null>(null)
-  const checked = optimistic ?? schedulable
+  const checked =
+    optimistic ??
+    (perms.tenantSchedule ? tenantState === 'enabled' : schedulable)
   const mutation = useMutation({
     mutationFn: (next: boolean) =>
       api(`/api/panel/vms/${encodeURIComponent(vmId)}/schedulable`, {
@@ -71,7 +90,9 @@ export function SchedulableSwitch({
       }),
     onMutate: (next) => setOptimistic(next),
     onSuccess: async (_data, next) => {
-      toast.success(next ? '已开启调度' : '已关闭调度')
+      if (perms.tenantSchedule)
+        toast.success(next ? '已解除暂停' : '已暂停调度')
+      else toast.success(next ? '已开启调度' : '已关闭调度')
       await Promise.all([
         qc.invalidateQueries({ queryKey: vmsListQueryOptions().queryKey }),
         qc.invalidateQueries({ queryKey: dashboardQueryOptions().queryKey }),
@@ -86,7 +107,7 @@ export function SchedulableSwitch({
   })
 
   const untilText = formatRestrictionUntil(restrictionUntil)
-  const tooltip = !canSchedule
+  const operatorTooltip = !canSchedule
     ? '由管理员调整调度'
     : scheduleState === 'unschedulable' && !checked
       ? `不可调度：${unschedulableText || '错误'}。处理后点击重新开启调度`
@@ -97,6 +118,13 @@ export function SchedulableSwitch({
         : checked
           ? '点击关闭调度'
           : '点击开启调度'
+  const tooltip = perms.tenantSchedule
+    ? tenantState === 'operator-off'
+      ? '管理员已关闭调度'
+      : checked
+        ? '暂停此 VM 的调度'
+        : '解除此 VM 的调度暂停'
+    : operatorTooltip
 
   return (
     <Tooltip>

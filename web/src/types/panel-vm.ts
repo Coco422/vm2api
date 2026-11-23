@@ -1,3 +1,4 @@
+import type { GeminiEnvironment } from '@/features/import/gemini-environments'
 import type { WindowEstimate } from './panel-pricing'
 
 /**
@@ -55,6 +56,8 @@ export type VmProxySnap = {
   scheme?: string
   /** 透明 TCP 把唯一 DNS 应答改写成 SOCKS 主机名。默认关。 */
   domain_forward?: boolean
+  /** 让 SVCB(64)/HTTPS(65) 返回空答案，屏蔽 HTTP/3 与加密 SNI 探测。按条生效，默认关。 */
+  dns_disable_svcb_https?: boolean
   /** 出口地理位置（IPv4）；从未检测过为 null。 */
   geo?: ProxyGeo | null
   /** 公网 IPv6 出口地理位置；从未检测过为 null。 */
@@ -70,6 +73,59 @@ export type VmProxySnap = {
 
 export type InferenceEngine = 'auto' | 'go' | 'rust'
 
+export type CragLicenseStatus = {
+  status:
+    | 'unlicensed'
+    | 'valid'
+    | 'expired'
+    | 'not_yet_valid'
+    | 'invalid'
+    | 'unconfigured'
+  valid: boolean
+  vm_id: string
+  /** offline: CRAGU1 universal code. online: device-bound CRAGL1. */
+  kind?: 'offline' | 'online'
+  /** kernel: all slots; device: one VM; host: one subscription seat. */
+  scope?: 'kernel' | 'device' | 'host'
+  seat?: number
+  license_id?: string
+  term?: '1m' | '3m' | '6m' | '1y'
+  /** Signed UTC epoch seconds, not browser-local timestamps. */
+  issued_at?: number
+  not_before?: number
+  expires_at?: number
+  code?: string
+  message?: string
+}
+
+export type CragLicenseResponse = {
+  license: CragLicenseStatus
+  machine_code: string
+  payload_key_id?: string
+}
+
+export type VmTelemetryState = {
+  enabled: boolean
+  state:
+    | 'disabled'
+    | 'idle'
+    | 'waiting_credentials'
+    | 'waiting_egress'
+    | 'uploading'
+    | 'error'
+    | 'unsupported'
+  pending_events: number
+  last_upload_at: string | null
+  last_error: string | null
+}
+
+export type CragTelemetryState = {
+  state: 'launch_policy'
+  enabled: boolean | null
+  error: string | null
+  upload_confirmed: false
+}
+
 export type VmKernelHealth = {
   reachable?: boolean
   process_up?: boolean
@@ -84,17 +140,15 @@ export type VmKernelHealth = {
   proxy_ok?: boolean | null
   accounts?: number | null
   vm_id?: string | null
+  vm_telemetry?: boolean
+  telemetry_ready?: boolean
+  telemetry?: VmTelemetryState | null
 }
 export type VmKernelSnapshot = {
   credential_owner?: string | null
   credential_state?: string | null
   proxy_state?: string | null
-  telemetry?: {
-    enabled?: boolean | null
-    running?: boolean | null
-    process?: string | null
-    read_only?: boolean
-  } | null
+  telemetry?: VmTelemetryState | CragTelemetryState | null
   process_topology?: {
     rust_pid1?: boolean
     go_worker_pid1?: boolean
@@ -132,6 +186,8 @@ export type KvmProbe = {
 export type VmCreateOptions = {
   vm: unknown
   kvm: KvmProbe
+  /** CRAG support for this machine only; cluster nodes use their placement preflight. */
+  crag_supported: boolean
 }
 
 export type VmSmbios = {
@@ -201,10 +257,13 @@ export type ScheduleState = 'on' | 'off' | 'unschedulable' | 'restricted'
 
 export type Vm = {
   id: string
+  gemini?: GeminiEnvironment
   name?: string
   owner_user_id?: string | null
-  /** 所在集群节点；null / 缺省 = 本机。远端槽位不支持官方初装、wrap-cli、换内核等。 */
+  /** 所在集群节点；null / 缺省 = 本机。 */
   node_id?: string | null
+  /** linux Docker 节点可切 CRAG；darwin 是 macOS 原生槽，不能切。 */
+  node_platform?: 'linux' | 'darwin' | null
   /** Admin-only cluster node label for `node_id`. Tenants never receive this. */
   node_name?: string | null
   origin?: string | null
@@ -304,7 +363,14 @@ export type Vm = {
   claude_reset_credits?: {
     eligible?: boolean
     available_count?: number
+    /** Cards shown to the operator: ready or cooling down, not withheld by upstream. */
+    held_count?: number
     credits?: Array<{
+      /** Opaque per-slot card handle used to pick the card to spend. */
+      ref?: string
+      kind?: 'session' | 'weekly' | 'fable' | 'full'
+      state?: 'ready' | 'cooldown' | 'unavailable'
+      gives_back_weekly?: boolean
       label?: string
       resets_left?: number
       starts_at?: string
@@ -320,8 +386,19 @@ export type Vm = {
   fable?: Record<string, unknown>
   weekly_split?: Record<string, unknown>
   account_tier?: string
-  /** Complete official usage: true = Max, false = Pro, null = unconfirmed. */
+  /** Official OAuth subscription metadata, independent of model availability. */
+  subscription_type?: string | null
+  rate_limit_tier?: string | null
+  /** Whether official usage lists a Fable window; not a subscription identifier. */
   usage_has_fable?: boolean | null
+  /** 开了 pool.fable_requires_max 且本槽不是 Max：Fable 不会派到这里。 */
+  fable_requires_max?: boolean
+  /** 上游回「Usage credits are required」后 Fable 暂停调度到此槽，`until` 前有效。 */
+  fable_credits_required?: {
+    model?: string | null
+    at?: string | null
+    until?: string | null
+  } | null
   /** anthropic | openai。缺省按 Claude 槽展示。 */
   platform?: string | null
   /** claude | codex */
@@ -331,8 +408,12 @@ export type Vm = {
   resolved_inference_engine?: 'go' | 'rust' | null
   persona_preset?: string | null
   resolved_persona_preset?: string | null
+  /** CRAG v2 print only: official_full appends the caller tail; zero replaces. */
+  resolved_crag_print_persona?: 'official_full' | 'zero' | null
   dataplane?: 'wrap' | 'cc' | 'crag' | null
   resolved_dataplane?: 'wrap' | 'cc' | 'crag' | null
+  crag_kernel_version?: 'legacy' | 'v2' | null
+  resolved_crag_kernel_version?: 'legacy' | 'v2' | null
   kernel?: string
   /** docker | kvm。缺省按 docker 展示。 */
   runtime_type?: RuntimeType | null
@@ -409,9 +490,11 @@ export type Vm = {
   total_cost?: number
   /** 累计 token（含缓存），与 total_cost 同源。 */
   total_tokens?: number
+  lifetime_usage?: { cost: number; tokens: number }
   expires_at?: string
   refreshed_at?: string
   oauth_source?: string
+  oauth_registration?: 'console' | 'oauth' | null
   account_uuid?: string
   org_uuid?: string
   access_preview?: string
@@ -476,6 +559,8 @@ export type Vm = {
   window_7d_success?: number
   window_7d_errors?: number
   window_7d_tokens?: number
+  /** 近 24h 每 30 分钟 [成功, 失败]，最后一格是当前；无请求为 null。 */
+  health_24h?: Array<[number, number]> | null
   window_fable_cost?: number
   estimate_5h?: WindowEstimate
   estimate_7d?: WindowEstimate
@@ -612,6 +697,13 @@ export type VmWindowProjection = {
 
 export type VmDetailPayload = {
   vm?: Vm
+  delivery_lifecycle?: {
+    batch: string
+    firstSuccessAt: string | null
+    shutdownAt: string | null
+    confirmedStoppedBy: string | null
+    survivalDays: number | null
+  }
   kernel?: VmKernelSnapshot | null
   proxy?: VmProxySnap | null
   account?: Record<string, unknown> | null
@@ -629,6 +721,17 @@ export type VmDetailPayload = {
   [key: string]: unknown
 }
 
+export type VmSeedFileObservation = {
+  ok: boolean
+  source: 'local' | 'node'
+  files: {
+    settings_json: 'present' | 'missing' | 'error'
+    claude_setting: 'present' | 'missing' | 'error'
+    kin_seed: 'present' | 'missing' | 'error'
+  }
+  error?: string
+}
+
 /** `GET/PUT /api/panel/vms/:id/seed-settings` 剥壳后的 payload。不展示 `cli_home`。 */
 export type VmSeedSettings = {
   vm_id?: string
@@ -641,6 +744,22 @@ export type VmSeedSettings = {
   settings_json?: Record<string, unknown> | null
   claude_setting?: string | null
   kin_seed?: Record<string, unknown> | null
+  seed_files?: VmSeedFileObservation
+  telemetry_log?: string[]
+  telemetry_log_error?: string | null
+  saved?: boolean
+  published?: boolean
+  applied?: boolean
+  service?: {
+    ok?: boolean
+    wrote?: boolean
+    published?: boolean
+    applied?: boolean
+    supported?: boolean
+    state?: string
+    code?: string
+    error?: string
+  }
   [key: string]: unknown
 }
 
@@ -678,6 +797,8 @@ export type OfficialCcStatus = {
   hello_ok?: boolean
   usage_ok?: boolean
   account_tier?: string
+  subscription_type?: string | null
+  rate_limit_tier?: string | null
   /** `profile` = 官方 /api/oauth/profile；`usage` = /usage 推断兜底。 */
   account_tier_source?: string
   /** 槽内 GET /v1/models 返回的模型 id。 */
@@ -703,7 +824,10 @@ export type VmQuotaView = {
   weekly_split: boolean
 }
 
-export type VmQuotaOverride = Partial<VmQuotaView>
+export type VmQuotaOverride = Partial<VmQuotaView> & {
+  tenant_exact_5h?: boolean
+  tenant_exact_7d?: boolean
+}
 
 /** 单槽工作时段（`vm.policy.active_hours`）。start 晚于 end = 跨夜班次。 */
 export type VmActiveHours = {

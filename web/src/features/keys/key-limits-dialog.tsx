@@ -1,8 +1,7 @@
 import { useEffect, useState, type ReactNode } from 'react'
+import type { ApiEndpoint } from '@/types/panel-api-endpoints'
 import type { ApiKeyItem, VmPool } from '@/types/panel-keys'
-import type { PanelUser } from '@/types/panel-users'
 import type { Vm } from '@/types/panel-vm'
-import { isCodexVm } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -21,8 +20,9 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import type { KeyGroupType, KeyLimitsDraft } from './key-payload'
+import { keyVmSelection, vmsInGroup } from './key-vm-selection'
 
-const CONC = [0, 1, 2, 4, 8, 16, 20, 32, 64]
+const CONC = [0, 1, 2, 4, 8, 12, 16, 20, 24, 32, 64]
 const QUOTA_CREATE = [0, 1000, 5000, 10000, 50000]
 const QUOTA_EDIT = [0, 1000, 5000, 10000, 50000, 100000]
 const RPM_CREATE = [0, 30, 60, 120, 600]
@@ -94,8 +94,13 @@ export function KeyLimitsDialog({
   pending,
   onSubmit,
   vms = [],
+  vmsReady = false,
+  vmsError = false,
   pools,
-  users,
+  channels,
+  channelsLoading,
+  channelsError,
+  isAdmin = true,
 }: {
   mode: 'create' | 'edit'
   open: boolean
@@ -104,8 +109,13 @@ export function KeyLimitsDialog({
   pending: boolean
   onSubmit: (draft: KeyLimitsDraft) => void
   vms?: Vm[]
+  vmsReady?: boolean
+  vmsError?: boolean
   pools?: VmPool[]
-  users?: PanelUser[]
+  channels?: ApiEndpoint[]
+  channelsLoading?: boolean
+  channelsError?: boolean
+  isAdmin?: boolean
 }) {
   const [draft, setDraft] = useState<KeyLimitsDraft>(blankDraft())
 
@@ -117,6 +127,7 @@ export function KeyLimitsDialog({
       setDraft({
         name: initial.name || '',
         category: initial.category === 'api' ? 'api' : 'oauth',
+        api_endpoint_id: initial.api_endpoint_id || '',
         max_concurrency: Number(initial.max_concurrency ?? 20),
         quota_requests: Number(initial.quota_requests ?? 0),
         quota_usd: Number(initial.quota_usd ?? 0),
@@ -126,7 +137,7 @@ export function KeyLimitsDialog({
         allowed_vms:
           group === 'all' || group === 'pool' ? [] : initial.allowed_vms || [],
         ...(pools ? { vm_pool_id: initial.vm_pool_id || '' } : {}),
-        user_id: initial.user_id || undefined,
+        allowed_models: (initial.allowed_models || []).join(', '),
       })
       return
     }
@@ -134,18 +145,74 @@ export function KeyLimitsDialog({
     // pools is only the option list. Reloading it must not wipe an open form.
   }, [open, mode, initial])
 
+  if (!isAdmin) {
+    return (
+      <Dialog open={open} onOpenChange={onOpenChange}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>
+              {mode === 'create' ? '生成密钥' : '编辑密钥'}
+            </DialogTitle>
+          </DialogHeader>
+          <Field label='名称'>
+            <Input
+              value={draft.name}
+              placeholder='client-a'
+              maxLength={100}
+              onChange={(e) =>
+                setDraft((d) => ({ ...d, name: e.target.value }))
+              }
+            />
+          </Field>
+          <p className='text-xs text-muted-foreground'>
+            用于区分不同客户端的用量；调用资源和并发由管理员控制。
+          </p>
+          <DialogFooter>
+            <Button
+              variant='outline'
+              onClick={() => onOpenChange(false)}
+              disabled={pending}
+            >
+              取消
+            </Button>
+            <Button
+              onClick={() => onSubmit(draft)}
+              disabled={pending || !draft.name.trim()}
+              loading={pending}
+            >
+              {mode === 'create' ? '生成' : '保存'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    )
+  }
+
   const quotaOpts = mode === 'edit' ? QUOTA_EDIT : QUOTA_CREATE
   const rpmOpts = mode === 'edit' ? RPM_EDIT : RPM_CREATE
-  const employee = users?.find(
-    (user) => user.id === draft.user_id && user.role === 'user'
+  const isApi = draft.category === 'api'
+  const enabledChannels = (channels || []).filter(
+    (channel) => !channel.disabled
   )
-  const listed = vmsInGroup(vms || [], draft.group_type).filter(
-    (vm) => !employee || vm.owner_user_id === employee.id
+  const selectedChannel = enabledChannels.find(
+    (channel) => channel.id === draft.api_endpoint_id
   )
-  const scopeBlocked =
-    draft.group_type === 'pool'
+  const legacyApi =
+    mode === 'edit' && initial?.category === 'api' && !initial.api_endpoint_id
+  const unchangedChannel =
+    !!draft.api_endpoint_id &&
+    initial?.api_endpoint_id === draft.api_endpoint_id
+  const listed = vmsInGroup(vms || [], draft.group_type)
+  const selection = keyVmSelection(draft, vms, vmsReady)
+  const scopeBlocked = isApi
+    ? !selectedChannel &&
+      !unchangedChannel &&
+      !(legacyApi && !draft.api_endpoint_id)
+    : draft.group_type === 'pool'
       ? !draft.vm_pool_id
-      : draft.group_type !== 'all' && draft.allowed_vms.length === 0
+      : draft.group_type !== 'all' &&
+        draft.group_type !== 'gemini' &&
+        selection.blocked
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -166,44 +233,6 @@ export function KeyLimitsDialog({
           </p>
         ) : null}
         <div className='grid gap-3 sm:grid-cols-2'>
-          {users && (
-            <Field label='所属员工 / 用户'>
-              <Select
-                value={draft.user_id || '__default__'}
-                onValueChange={(value) =>
-                  setDraft((d) => ({
-                    ...d,
-                    user_id: value === '__default__' ? undefined : value,
-                    allowed_vms: [],
-                    ...(pools ? { vm_pool_id: '' } : {}),
-                  }))
-                }
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value='__default__'>
-                    {mode === 'create' ? '当前管理员（默认）' : '保持原归属'}
-                  </SelectItem>
-                  {users.map((user) => (
-                    <SelectItem
-                      key={user.id}
-                      value={user.id}
-                      disabled={user.enabled === false}
-                    >
-                      {user.username}
-                      {user.role !== 'user' ? ` · ${user.role}` : ''}
-                      {user.enabled === false ? '（已停用）' : ''}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              <p className='text-[11px] text-muted-foreground'>
-                员工 Key 请选择对应平台，并勾选已分配给该员工的 VM。
-              </p>
-            </Field>
-          )}
           {mode === 'create' ? (
             <Field label='名称'>
               <Input
@@ -223,6 +252,14 @@ export function KeyLimitsDialog({
                   setDraft((d) => ({
                     ...d,
                     category: v === 'api' ? 'api' : 'oauth',
+                    api_endpoint_id: v === 'api' ? d.api_endpoint_id : '',
+                    group_type:
+                      v === 'api' &&
+                      (d.group_type === 'pool' || d.group_type === 'gemini')
+                        ? 'all'
+                        : d.group_type,
+                    allowed_vms: v === 'api' ? [] : d.allowed_vms,
+                    vm_pool_id: v === 'api' ? '' : d.vm_pool_id,
                   }))
                 }
               >
@@ -286,104 +323,219 @@ export function KeyLimitsDialog({
               />
             </Field>
           ) : null}
-          <Field label='分组'>
-            <Select
-              value={draft.group_type}
-              onValueChange={(v) => {
-                const group = v === 'pool' ? 'pool' : groupOf(v)
-                const keep = new Set(
-                  vmsInGroup(vms || [], group).map((vm) => vm.id)
-                )
-                setDraft((d) => ({
-                  ...d,
-                  group_type: group,
-                  allowed_vms:
-                    group === 'all' || group === 'pool'
-                      ? []
-                      : d.allowed_vms.filter((id) => keep.has(id)),
-                  ...(pools
-                    ? { vm_pool_id: group === 'pool' ? d.vm_pool_id || '' : '' }
-                    : {}),
-                }))
-              }}
-            >
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value='all'>all · 全局可调度</SelectItem>
-                {pools ? <SelectItem value='pool'>账号池</SelectItem> : null}
-                <SelectItem value='anthropic'>anthropic</SelectItem>
-                <SelectItem value='openai'>openai</SelectItem>
-              </SelectContent>
-            </Select>
-          </Field>
-          {draft.group_type === 'pool' ? (
-            <Field label='账号池'>
+          {isApi ? (
+            <div className='space-y-1 sm:col-span-2'>
+              <Field label='API 渠道'>
+                <Select
+                  value={
+                    draft.api_endpoint_id || (legacyApi ? '__legacy__' : '')
+                  }
+                  onValueChange={(id) =>
+                    setDraft((d) => ({
+                      ...d,
+                      api_endpoint_id: id === '__legacy__' ? '' : id,
+                      group_type:
+                        id === '__legacy__'
+                          ? groupOf(initial?.group_type)
+                          : 'all',
+                    }))
+                  }
+                >
+                  <SelectTrigger className='w-full' aria-label='API 渠道'>
+                    <SelectValue placeholder='选择已启用的渠道' />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {legacyApi ? (
+                      <SelectItem value='__legacy__'>
+                        沿用原协议筛选（未绑定）
+                      </SelectItem>
+                    ) : null}
+                    {unchangedChannel && !selectedChannel ? (
+                      <SelectItem value={draft.api_endpoint_id!}>
+                        原渠道不可用 · {draft.api_endpoint_id}
+                      </SelectItem>
+                    ) : null}
+                    {enabledChannels.map((channel) => (
+                      <SelectItem key={channel.id} value={channel.id}>
+                        {channel.name || channel.id} · {channel.protocol} ·{' '}
+                        {channel.base_url}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </Field>
+              <p className='text-xs text-muted-foreground'>
+                {selectedChannel
+                  ? selectedChannel.models?.length
+                    ? `已保存 ${selectedChannel.models.length} 个模型；此密钥只调用所选渠道。`
+                    : '此渠道尚未保存模型。请先到 API 页面获取模型。'
+                  : channelsError
+                    ? '无法加载 API 渠道。请重试。'
+                    : channelsLoading
+                      ? '正在加载 API 渠道…'
+                      : unchangedChannel
+                        ? '原渠道已停用或删除，调用不会切换到其他渠道。'
+                        : !enabledChannels.length
+                          ? '暂无已启用的 API 渠道。请先配置渠道。'
+                          : '选择渠道后，此密钥只调用该渠道。'}
+              </p>
+            </div>
+          ) : null}
+          {!isApi || (legacyApi && !draft.api_endpoint_id) ? (
+            <Field label={isApi ? 'API 协议' : '平台 / 分组'}>
               <Select
-                value={draft.vm_pool_id || ''}
-                onValueChange={(id) =>
-                  setDraft((d) => ({ ...d, vm_pool_id: id }))
-                }
+                value={draft.group_type}
+                onValueChange={(v) => {
+                  const group = v === 'pool' ? 'pool' : groupOf(v)
+                  const keep = new Set(
+                    vmsInGroup(vms || [], group).map((vm) => vm.id)
+                  )
+                  setDraft((d) => ({
+                    ...d,
+                    group_type: group,
+                    allowed_vms:
+                      isApi ||
+                      group === 'all' ||
+                      group === 'pool' ||
+                      group === 'gemini'
+                        ? []
+                        : d.allowed_vms.filter((id) => keep.has(id)),
+                    ...(pools
+                      ? {
+                          vm_pool_id:
+                            !isApi && group === 'pool'
+                              ? d.vm_pool_id || ''
+                              : '',
+                        }
+                      : {}),
+                  }))
+                }}
               >
                 <SelectTrigger>
-                  <SelectValue placeholder='选择账号池' />
+                  <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  {(pools || []).map((pool) => (
-                    <SelectItem key={pool.id} value={pool.id}>
-                      {pool.name}
-                      {pool.enabled ? '' : ' · 停用'}
-                    </SelectItem>
-                  ))}
+                  <SelectItem value='all'>
+                    {isApi ? 'all · 全部协议' : 'all · 全局可调度'}
+                  </SelectItem>
+                  {!isApi && pools ? (
+                    <SelectItem value='pool'>账号池</SelectItem>
+                  ) : null}
+                  <SelectItem value='anthropic'>
+                    {isApi ? 'anthropic · Anthropic 协议' : 'anthropic'}
+                  </SelectItem>
+                  <SelectItem value='openai'>
+                    {isApi ? 'openai · OpenAI 协议' : 'openai'}
+                  </SelectItem>
+                  {!isApi && pools ? (
+                    <SelectItem value='gemini'>Gemini · CRAGAnti</SelectItem>
+                  ) : null}
                 </SelectContent>
               </Select>
             </Field>
-          ) : draft.group_type === 'all' ? (
-            <p className='text-xs text-muted-foreground sm:col-span-2'>
-              all 是最高权限，不再选择 VM。
-            </p>
-          ) : (
-            <div className='sm:col-span-2'>
-              <Field label='可用 VM'>
-                <div className='max-h-40 space-y-1 overflow-y-auto rounded-md border p-2'>
-                  {listed.length === 0 ? (
-                    <p className='text-xs text-muted-foreground'>
-                      该分组下没有 VM
-                    </p>
-                  ) : (
-                    listed.map((vm) => (
-                      <label
-                        key={vm.id}
-                        className='flex items-center gap-2 text-sm'
-                      >
-                        <input
-                          type='checkbox'
-                          className='size-3.5'
-                          checked={draft.allowed_vms.includes(vm.id)}
-                          onChange={(e) => {
-                            const on = e.target.checked
-                            setDraft((d) => ({
-                              ...d,
-                              allowed_vms: on
-                                ? [...d.allowed_vms, vm.id]
-                                : d.allowed_vms.filter((id) => id !== vm.id),
-                            }))
-                          }}
-                        />
-                        <span className='truncate'>
-                          {vm.name || vm.email || vm.id}
-                        </span>
-                        <span className='font-mono text-xs text-muted-foreground'>
-                          {vm.id}
-                        </span>
-                      </label>
-                    ))
-                  )}
-                </div>
+          ) : null}
+          {!isApi &&
+            (draft.group_type === 'pool' ? (
+              <Field label='账号池'>
+                <Select
+                  value={draft.vm_pool_id || ''}
+                  onValueChange={(id) =>
+                    setDraft((d) => ({ ...d, vm_pool_id: id }))
+                  }
+                >
+                  <SelectTrigger>
+                    <SelectValue placeholder='选择账号池' />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {(pools || []).map((pool) => (
+                      <SelectItem key={pool.id} value={pool.id}>
+                        {pool.name}
+                        {pool.enabled ? '' : ' · 停用'}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
               </Field>
-            </div>
-          )}
+            ) : draft.group_type === 'gemini' ? (
+              <p className='text-xs text-muted-foreground sm:col-span-2'>
+                仅用于 Gemini 宿主机账号，不使用 VM
+                或直连渠道。请求会在已授权且已拉取模型的账号之间调度。
+              </p>
+            ) : draft.group_type === 'all' ? (
+              <p className='text-xs text-muted-foreground sm:col-span-2'>
+                all 是最高权限，不再选择 VM。
+              </p>
+            ) : (
+              <div className='sm:col-span-2'>
+                <Field label='可用 VM'>
+                  {!vmsReady ? (
+                    <p role='status' className='text-xs text-muted-foreground'>
+                      {vmsError
+                        ? '无法加载可用 VM，请刷新后重试。保存已暂停。'
+                        : '正在核对可用 VM…'}
+                    </p>
+                  ) : selection.removed.length > 0 ? (
+                    <p role='status' className='text-xs text-muted-foreground'>
+                      已排除当前不可用的旧选择：{selection.removed.join(', ')}。
+                      请确认可用 VM 后保存。
+                    </p>
+                  ) : null}
+                  <div className='max-h-40 space-y-1 overflow-y-auto rounded-md border p-2'>
+                    {listed.length === 0 ? (
+                      <p className='text-xs text-muted-foreground'>
+                        该分组下没有 VM
+                      </p>
+                    ) : (
+                      listed.map((vm) => (
+                        <label
+                          key={vm.id}
+                          className='flex items-center gap-2 text-sm'
+                        >
+                          <input
+                            type='checkbox'
+                            className='size-3.5'
+                            checked={selection.draft.allowed_vms.includes(
+                              vm.id
+                            )}
+                            disabled={!vmsReady}
+                            onChange={(e) => {
+                              const on = e.target.checked
+                              setDraft((d) => ({
+                                ...d,
+                                allowed_vms: on
+                                  ? [...d.allowed_vms, vm.id]
+                                  : d.allowed_vms.filter((id) => id !== vm.id),
+                              }))
+                            }}
+                          />
+                          <span className='truncate'>
+                            {vm.name || vm.email || vm.id}
+                          </span>
+                          <span className='font-mono text-xs text-muted-foreground'>
+                            {vm.id}
+                          </span>
+                        </label>
+                      ))
+                    )}
+                  </div>
+                </Field>
+              </div>
+            ))}
+          <div className='sm:col-span-2'>
+            <Field label='允许的模型'>
+              <Input
+                value={draft.allowed_models}
+                placeholder='留空不限，例如 claude-sonnet-5, gpt-6-sol'
+                onChange={(e) =>
+                  setDraft((d) => ({ ...d, allowed_models: e.target.value }))
+                }
+              />
+            </Field>
+            <p className='mt-1 text-xs text-muted-foreground'>
+              按客户端请求里写的模型名匹配（不分大小写，映射前，Claude Code 的
+              [1m] 后缀自动忽略），逗号分隔；名单外的模型直接返回 400。
+            </p>
+          </div>
         </div>
         <DialogFooter>
           <Button
@@ -394,7 +546,9 @@ export function KeyLimitsDialog({
             取消
           </Button>
           <Button
-            onClick={() => onSubmit(draft)}
+            onClick={() => {
+              if (!scopeBlocked) onSubmit(selection.draft)
+            }}
             disabled={
               pending ||
               (mode === 'create' && !draft.name.trim()) ||
@@ -414,6 +568,7 @@ function blankDraft(): KeyLimitsDraft {
   return {
     name: '',
     category: 'oauth',
+    api_endpoint_id: '',
     max_concurrency: 20,
     quota_requests: 0,
     quota_usd: 0,
@@ -421,16 +576,12 @@ function blankDraft(): KeyLimitsDraft {
     expires_in_days: 30,
     group_type: 'all',
     allowed_vms: [],
+    allowed_models: '',
   }
 }
 
 function groupOf(value: string | undefined): KeyGroupType {
-  if (value === 'anthropic' || value === 'openai') return value
+  if (value === 'anthropic' || value === 'openai' || value === 'gemini')
+    return value
   return 'all'
-}
-
-function vmsInGroup(vms: Vm[], group: KeyGroupType): Vm[] {
-  if (group === 'openai') return vms.filter((vm) => isCodexVm(vm))
-  if (group === 'anthropic') return vms.filter((vm) => !isCodexVm(vm))
-  return []
 }

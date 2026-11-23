@@ -8,13 +8,16 @@ import { EventEmitter } from 'node:events'
 import { tenantPanelPayload, tenantProxyView } from '../../src/company/tenant-panel-privacy.mjs'
 import { servePoolSeatStream } from '../../src/lib/admin/pool-seat-stream.mjs'
 
-test('a blocked or disabled private exit is never reported as healthy', () => {
+test('tenant exits expose a neutral service label rather than operator health', () => {
   for (const proxy of [
     { status: 'ok', enabled: false },
     { status: 'ok', enabled: true, blocked_reason: 'private-provider-policy' },
   ]) {
     const safe = tenantProxyView(proxy)
-    assert.equal(safe.status, 'dead')
+    assert.equal(safe.label, '独享代理')
+    assert.equal(safe.status, null)
+    assert.equal(safe.enabled, null)
+    assert.equal(safe.blocked_reason, null)
     assert.doesNotMatch(JSON.stringify(safe), /private-provider-policy/)
   }
 })
@@ -59,7 +62,7 @@ test('tenant log/filter names and embedded exit errors cannot expose supplier me
   assert.equal(payload.items[0].vmName, vm.name, 'projection must not rewrite stored logs or admin data')
 })
 
-test('tenant live stream keeps exit health while removing proxy IDs and raw errors', () => {
+test('tenant live stream hides exit health while administrators retain the original snapshot', () => {
   const original = { id: 'px-supplier', status: 'ok', enabled: true, last_error: 'supplier.example:10007' }
   for (const tenant of [true, false]) {
     const req = new EventEmitter(),
@@ -78,7 +81,7 @@ test('tenant live stream keeps exit health while removing proxy IDs and raw erro
     })
     req.emit('close')
     const frame = JSON.parse(frames.find((s) => s.startsWith('event: proxy')).split('data: ')[1])
-    assert.equal(frame.proxies['vm-03'].status, 'ok')
+    assert.equal(frame.proxies['vm-03'].status, tenant ? null : 'ok')
     if (tenant) {
       assert.equal(frame.proxies['vm-other'], undefined)
       assert.doesNotMatch(JSON.stringify(frame), /supplier|10007/)

@@ -1,81 +1,228 @@
-# PR/main gate against the production baseline: deploy/payload.json pins the
-# exact ELFs running live, so CI only checks source and the pinned bytes.
+# Daily CI checks core behavior in changed components. Full regression and
+# native ARM packaging remain explicit manual checks, independent of PRs.
 name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [dev]
   pull_request:
+    branches: [dev, main]
   workflow_dispatch:
+    inputs:
+      full:
+        description: Run all unit/web tests and formatting checks
+        type: boolean
+        default: false
+      arm64:
+        description: Build and smoke-test the native ARM image
+        type: boolean
+        default: false
 
-# Only PR runs supersede each other; every main push keeps its own verdict so
-# it is visible when main turned red and when it recovered.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
-  ci:
+  changes:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    outputs:
+      backend: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.backend == 'true' }}
+      go: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.go == 'true' }}
+      web: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.web == 'true' }}
+      packaging: ${{ inputs.full || steps.filter.outputs.packaging == 'true' }}
+      oauth: ${{ inputs.full || steps.filter.outputs.oauth == 'true' }}
+      unit_tests: ${{ steps.filter.outputs.unit_tests_files || '[]' }}
+      web_tests: ${{ steps.filter.outputs.web_tests_files || '[]' }}
+      web_src: ${{ steps.filter.outputs.web_src_files || '[]' }}
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+      - uses: dorny/paths-filter@v3
+        if: github.event_name != 'workflow_dispatch'
+        id: filter
+        with:
+          list-files: json
+          filters: |
+            backend:
+              - 'src/**'
+              - 'deploy/payload.json'
+              - 'test/unit/**'
+              - 'test/fixtures/**'
+              - 'test/harness.mjs'
+              - 'scripts/**/*.mjs'
+              - 'package.json'
+              - 'package-lock.json'
+              - 'pnpm-lock.yaml'
+              - 'biome.json'
+              - '.github/workflows/test.yml'
+            go:
+              - 'worker/**'
+              - 'api-kernel/**'
+              - 'redact/**'
+              - '.github/workflows/test.yml'
+            web:
+              - 'web/**'
+              - '.github/workflows/test.yml'
+            packaging:
+              - 'deploy/**'
+              - 'docker/**'
+              - 'share/**'
+              - 'scripts/docker-entrypoint.sh'
+              - 'scripts/fetch-payload.mjs'
+              - 'test/deploy/**'
+              - '.github/workflows/test.yml'
+            oauth:
+              - 'deploy/payload.json'
+              - 'src/lib/oauth/**'
+              - 'src/lib/identity/vm-identity.mjs'
+              - 'test/unit/oauth-binary.test.mjs'
+              - 'scripts/fetch-payload.mjs'
+              - '.github/workflows/test.yml'
+            unit_tests:
+              - added|modified: 'test/unit/*.test.mjs'
+            web_tests:
+              - added|modified: 'web/src/**/*.test.ts'
+              - added|modified: 'web/src/**/*.test.tsx'
+            web_src:
+              - added|modified: 'web/src/**/*.ts'
+              - added|modified: 'web/src/**/*.tsx'
+
+  ci:
+    needs: changes
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: require change classification
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+        run: test "$CHANGES_RESULT" = success
+      - uses: actions/checkout@v7
+        if: needs.changes.outputs.backend == 'true' || needs.changes.outputs.go == 'true' || needs.changes.outputs.web == 'true' || needs.changes.outputs.packaging == 'true'
+        with:
+          fetch-depth: 0
       - name: merge current base
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && (needs.changes.outputs.backend == 'true' || needs.changes.outputs.go == 'true' || needs.changes.outputs.web == 'true' || needs.changes.outputs.packaging == 'true')
         env:
           BASE_REF: ${{ github.base_ref }}
         run: |
-          # refs/pull/<n>/merge keeps the base from the PR's last push and a
-          # re-run reuses it; merge today's base so a re-run tests against it.
           git fetch --no-tags origin "$BASE_REF"
           git -c user.name=ci -c user.email=ci@localhost merge --no-edit FETCH_HEAD
       - uses: actions/setup-node@v7
+        if: needs.changes.outputs.backend == 'true' || needs.changes.outputs.web == 'true' || needs.changes.outputs.packaging == 'true'
         with:
           node-version: '22'
           cache: npm
           cache-dependency-path: package-lock.json
+      - run: npm ci
+        if: needs.changes.outputs.backend == 'true' || needs.changes.outputs.oauth == 'true'
       - uses: actions/setup-go@v7
+        if: needs.changes.outputs.go == 'true' || inputs.full || contains(needs.changes.outputs.unit_tests, 'test/unit/egress.test.mjs')
         with:
           go-version: '1.25.x'
           cache-dependency-path: |
             worker/go.sum
             api-kernel/go.sum
-      - uses: pnpm/action-setup@v6
-        with:
-          version: 10
-          cache: true
-          cache_dependency_path: web/pnpm-lock.yaml
-      - run: npm ci
-      - name: format and syntax
-        run: |
-          npx biome format
-          test -z "$(gofmt -l worker api-kernel)" || { gofmt -l worker api-kernel; exit 1; }
-          find src scripts -name '*.mjs' -print0 | xargs -0 -n1 node --check
+            redact/go.sum
       - name: pinned payload
+        if: needs.changes.outputs.packaging == 'true'
         run: |
           node scripts/fetch-payload.mjs
           node scripts/fetch-payload.mjs --check
       - name: native CLI packaging unit tests
+        if: needs.changes.outputs.packaging == 'true'
         run: python3 -m unittest discover -s test/deploy -p test_native_cli.py -v
-      - run: npm run test:unit
-      - name: go vet and test
+      - name: backend syntax
+        if: needs.changes.outputs.backend == 'true'
+        run: find src scripts -name '*.mjs' -print0 | xargs -0 -n1 node --check
+      - name: OAuth binary contract
+        if: needs.changes.outputs.oauth == 'true' && !inputs.full
         run: |
-          (cd worker && go vet ./... && go test ./...)
-          (cd api-kernel && go vet ./... && go test ./...)
-      - name: web
+          manifest="$RUNNER_TEMP/oauth-test-payload.json"
+          jq -e '.files |= map(select(.path == "bin/kin-oauth-auth")) | select(.files | length == 1)' deploy/payload.json > "$manifest"
+          node scripts/fetch-payload.mjs --manifest "$manifest"
+          node scripts/fetch-payload.mjs --manifest "$manifest" --check
+          node --test test/unit/oauth-binary.test.mjs
+      - name: backend tests
+        if: needs.changes.outputs.backend == 'true'
+        env:
+          FULL: ${{ inputs.full }}
+          CHANGED_TESTS: ${{ needs.changes.outputs.unit_tests }}
+        run: |
+          # egress.test.mjs spawns the real helper from bin/kin-egress.
+          if [ "$FULL" = true ] || jq -e 'index("test/unit/egress.test.mjs") != null' <<< "$CHANGED_TESTS" >/dev/null; then
+            (cd worker && CGO_ENABLED=0 go build -o ../bin/kin-egress ./cmd/kin-egress)
+          fi
+          if [ "$FULL" = true ]; then
+            # Four workers for the four vCPUs a standard runner has. The suite is
+            # 412 files and over a quarter of an hour one at a time.
+            VM2API_TEST_CONCURRENCY=4 npm run test:unit
+          else
+            tests=$(jq -r '.[] | split("/")[-1] | select(. != "oauth-binary.test.mjs")' <<< "$CHANGED_TESTS")
+            changed=()
+            if [ -n "$tests" ]; then
+              mapfile -t changed <<< "$tests"
+            fi
+            npm run test:ci -- "${changed[@]}"
+          fi
+      - name: Go tests
+        if: needs.changes.outputs.go == 'true'
+        run: |
+          (cd worker && go test ./...)
+          (cd api-kernel && go test ./...)
+          (cd redact && go test ./...)
+      - uses: pnpm/action-setup@v6
+        if: needs.changes.outputs.web == 'true'
+        with:
+          version: 10
+          cache: true
+          cache_dependency_path: web/pnpm-lock.yaml
+      - name: web tests and build
+        if: needs.changes.outputs.web == 'true'
         working-directory: web
+        env:
+          FULL: ${{ inputs.full }}
+          CHANGED_TESTS: ${{ needs.changes.outputs.web_tests }}
+          CHANGED_SRC: ${{ needs.changes.outputs.web_src }}
         run: |
           pnpm install --frozen-lockfile
-          pnpm format:check
-          pnpm test
+          if [ "$FULL" = true ]; then
+            pnpm test
+          else
+            tests=$(jq -r '.[] | ltrimstr("web/")' <<< "$CHANGED_TESTS")
+            changed=()
+            if [ -n "$tests" ]; then
+              mapfile -t changed <<< "$tests"
+            fi
+            # A changed source file is covered by its sibling test, which the
+            # changed-test filter alone never selects. Without this a PR can
+            # break a test it does not touch and still go green.
+            while IFS= read -r src; do
+              [ -n "$src" ] || continue
+              for candidate in "${src%.*}.test.tsx" "${src%.*}.test.ts"; do
+                [ -f "$candidate" ] && changed+=("$candidate")
+              done
+            done <<< "$(jq -r '.[] | ltrimstr("web/")' <<< "$CHANGED_SRC")"
+            if [ ${#changed[@]} -gt 0 ]; then
+              mapfile -t changed < <(printf '%s\n' "${changed[@]}" | sort -u)
+            fi
+            pnpm test:ci "${changed[@]}"
+          fi
           pnpm build
+      - name: full formatting checks
+        if: inputs.full
+        run: |
+          npx biome format
+          test -z "$(gofmt -l worker api-kernel redact)" || { gofmt -l worker api-kernel redact; exit 1; }
+          pnpm -C web format:check
 
   arm64-native-cli:
+    if: github.event_name == 'workflow_dispatch' && inputs.arm64
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:

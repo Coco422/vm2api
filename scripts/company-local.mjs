@@ -8,6 +8,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const sandbox = path.join(root, '.local/company-tests')
 const marker = path.join(sandbox, 'owner.json')
 const command = process.argv[2] || 'status'
+let testTmpAlias = null
 
 function ensure() {
   for (const dir of [path.join(root, '.local'), sandbox]) {
@@ -22,6 +23,8 @@ function ensure() {
   const owner = JSON.parse(fs.readFileSync(marker, 'utf8'))
   if (owner.project !== root || owner.purpose !== 'company-local-tests') throw new Error('Sandbox ownership mismatch')
   for (const dir of ['tmp', 'data', 'logs', 'artifacts']) fs.mkdirSync(path.join(sandbox, dir), { recursive: true })
+  // Temp executable fixtures must not inherit this repository's ESM package boundary.
+  fs.writeFileSync(path.join(sandbox, 'tmp/package.json'), '{"type":"commonjs"}\n')
 }
 
 function record(action, details = {}) {
@@ -65,7 +68,7 @@ function run(name, executable, args, cwd = root) {
   const env = {
     ...process.env,
     KIN_DATA_DIR: path.join(sandbox, 'data'),
-    TMPDIR: path.join(sandbox, 'tmp'),
+    TMPDIR: testTmpAlias || path.join(sandbox, 'tmp'),
     COMPANY_TEST_ROOT: sandbox,
     TSR_TMP_DIR: path.join(sandbox, 'router-tmp'),
   }
@@ -84,6 +87,26 @@ function run(name, executable, args, cwd = root) {
   return true
 }
 
+function offlineBootstrap(payload = false) {
+  const bootstrap = path.join(sandbox, payload ? 'payload-offline.mjs' : 'offline.mjs')
+  const kernel = path.join(root, 'bin/kin-kernel')
+  const cli = path.join(root, 'share/wrap-cli/cli-node')
+  if (payload) for (const file of [kernel, cli]) fs.accessSync(file, fs.constants.X_OK)
+  fs.writeFileSync(
+    bootstrap,
+    `import {setPriceCatalogTestHooks} from ${JSON.stringify(new URL('../src/lib/admin/price-catalog.mjs', import.meta.url).href)};
+setPriceCatalogTestHooks({backgroundRefresh:false});
+const nativeFetch=globalThis.fetch;
+globalThis.fetch=async(input,init)=>{
+  const url=new URL(typeof input==='string'||input instanceof URL?input:input.url);
+  if(!['127.0.0.1','localhost','[::1]'].includes(url.hostname))throw new Error('External fetch disabled in local tests');
+  return nativeFetch(input,{...init,redirect:'manual'});
+};
+${payload ? `process.env.KIN_303_KERNEL=${JSON.stringify(kernel)};process.env.KIN_303_CLI=${JSON.stringify(cli)};process.env.KIN_AUTOMODE_KERNEL=${JSON.stringify(kernel)};process.env.KIN_AUTOMODE_CLI=${JSON.stringify(cli)};` : ''}`,
+  )
+  return bootstrap
+}
+
 if (command === 'cleanup') await clean()
 else {
   ensure()
@@ -97,33 +120,65 @@ else {
   if (command === 'status') console.log(JSON.stringify({ root: sandbox, outputs: fs.readdirSync(sandbox) }, null, 2))
   else if (command === 'stop') await stop()
   else if (command === 'record') record(process.argv[3] || 'manual', { note: process.argv.slice(4).join(' ') })
-  else if (command === 'test') {
-    const bootstrap = path.join(sandbox, 'offline.mjs')
-    fs.writeFileSync(
-      bootstrap,
-      `import {setPriceCatalogTestHooks} from ${JSON.stringify(new URL('../src/lib/admin/price-catalog.mjs', import.meta.url).href)}; setPriceCatalogTestHooks({backgroundRefresh:false}); globalThis.fetch=async()=>{throw new Error('External fetch disabled in local tests')};`,
-    )
+  else if (command === 'payload-e2e') {
+    run('payload-e2e', process.execPath, [
+      '--import',
+      offlineBootstrap(true),
+      '--test',
+      '--test-concurrency=1',
+      'test/e2e/official-303.e2e.test.mjs',
+      'test/e2e/credential-rotation.e2e.test.mjs',
+      'test/e2e/auto-mode.e2e.test.mjs',
+    ])
+  } else if (command === 'test') {
+    const bootstrap = offlineBootstrap()
     const files = process.argv.slice(3)
-    const targets = files.length
-      ? files
-      : [
-          'company-employee',
-          'company-usage',
-          'company-reset',
-          'company-local',
-          'company-admin',
-          'key-scope',
-          'panel-acl',
-          'claude-reset-credits',
-          'tenant-billing',
-          'panel-route-coverage',
-          'panel-tenant-guards',
-          'api-keys',
-          'pricing',
-        ]
-    for (const file of targets) if (!/^[a-z0-9-]+$/.test(file)) throw new Error('Expected unit test basename')
+    const all = files.length === 1 && files[0] === '--all'
+    const targets = all
+      ? fs
+          .readdirSync(path.join(root, 'test/unit'))
+          .filter((file) => file.endsWith('.test.mjs'))
+          .sort()
+          .map((file) => file.slice(0, -9))
+      : files.length
+        ? files
+        : [
+            'company-employee',
+            'company-usage',
+            'company-reset',
+            'company-local',
+            'company-admin',
+            'key-scope',
+            'panel-acl',
+            'claude-reset-credits',
+            'tenant-billing',
+            'panel-route-coverage',
+            'panel-tenant-guards',
+            'api-keys',
+            'pricing',
+          ]
     for (const file of targets)
-      if (!run(file, process.execPath, ['--import', bootstrap, '--test', `test/unit/${file}.test.mjs`])) break
+      if (!/^[a-z0-9]+(?:[.-][a-z0-9]+)*$/.test(file)) throw new Error('Expected unit test basename')
+    // macOS sockaddr_un cannot hold this checkout's absolute sandbox paths.
+    // The short alias owns no data: all test artifacts still land in sandbox/tmp.
+    const aliasDir = process.platform === 'darwin' ? fs.mkdtempSync('/tmp/vm2t-') : null
+    const alias = aliasDir ? path.join(aliasDir, 't') : null
+    try {
+      if (alias) {
+        fs.symlinkSync(path.join(sandbox, 'tmp'), alias)
+        testTmpAlias = alias
+        record('test-tmp-alias', { alias, target: path.join(sandbox, 'tmp') })
+      }
+      for (const file of targets)
+        if (!run(file, process.execPath, ['--import', bootstrap, '--test', `test/unit/${file}.test.mjs`]) && !all) break
+    } finally {
+      if (alias) {
+        testTmpAlias = null
+        if (fs.existsSync(alias)) fs.unlinkSync(alias)
+        fs.rmdirSync(aliasDir)
+        record('test-tmp-alias-removed', { alias })
+      }
+    }
   } else if (command === 'format' || command === 'check') {
     const backend = [
       'src/company',
@@ -176,7 +231,11 @@ else {
       ],
       path.join(root, 'web'),
     )
-  else if (command === 'build') {
+  else if (command === 'go-test') {
+    process.env.GOCACHE = path.join(sandbox, 'go-cache')
+    process.env.GOTMPDIR = path.join(sandbox, 'tmp')
+    run('go-test', 'go', ['test', '-race', './...'], path.join(root, 'worker'))
+  } else if (command === 'build') {
     // tsbuildinfo is also written inside the owned sandbox, never into shared node_modules.
     if (
       run(
@@ -224,5 +283,7 @@ else {
       JSON.stringify({ pid: process.pid, identity: processIdentity(process.pid) }),
     )
   } else
-    throw new Error('Commands: status | record | test | web-test | build | check | format | serve | stop | cleanup')
+    throw new Error(
+      'Commands: status | record | test [--all] | payload-e2e | go-test | web-test | build | check | format | serve | stop | cleanup',
+    )
 }

@@ -15,11 +15,20 @@ export type VmPerms = {
   test: boolean
   /** GET /api/panel/test-models（后端目前只放行 admin）。 */
   testModels: boolean
-  /** oauth/*、导入凭证、额度刷新、重置券、诊断与恢复服务。 */
+  /** 手动刷新官方额度：管理员及槽位属主。 */
+  usageQuery: boolean
+  /** oauth/*、导入凭证、额度刷新、重置券、诊断与恢复服务。租户只查看。 */
   credential: boolean
   /** 查询和使用当前 VM 的上游重置券；不授予凭证管理权限。 */
   resetCredits: boolean
+  /** 修改本人 Claude VM 的 5h / 7d 闸线。 */
+  quotaThresholds: boolean
+  /** 暂停本人 VM 的调度，以及解除租户暂停。 */
+  tenantSchedule: boolean
   /** 删除 VM。 */
+  /** 槽位出口页。租户不开放代理。 */
+  proxy: boolean
+  /** DELETE /vms/:id（仅管理员）。 */
   remove: boolean
 }
 
@@ -30,8 +39,12 @@ const NONE: VmPerms = {
   power: false,
   test: false,
   testModels: false,
+  usageQuery: false,
   credential: false,
   resetCredits: false,
+  quotaThresholds: false,
+  tenantSchedule: false,
+  proxy: false,
   remove: false,
 }
 
@@ -47,13 +60,28 @@ export function vmPermsFor(
       power: true,
       test: true,
       testModels: true,
+      usageQuery: true,
       credential: true,
       resetCredits: true,
+      quotaThresholds: true,
+      tenantSchedule: false,
+      proxy: true,
       remove: true,
     }
   }
-  if (role === 'user') return { ...NONE, known: true, resetCredits: true }
-  if (role === 'super') return { ...NONE, known: true, dashboard: true }
+  if (role === 'user')
+    return {
+      ...NONE,
+      known: true,
+      test: true,
+      testModels: true,
+      usageQuery: true,
+      resetCredits: true,
+      quotaThresholds: true,
+      tenantSchedule: true,
+    }
+  if (role === 'super')
+    return { ...NONE, known: true, dashboard: true, proxy: true }
   return NONE
 }
 
@@ -63,13 +91,13 @@ export function useVmPerms(): VmPerms {
 }
 
 export type VmDetailTab =
-  'overview' | 'account' | 'proxy' | 'test' | 'ops' | 'seed'
+  'overview' | 'account' | 'proxy' | 'test' | 'ops' | 'desktop' | 'seed'
 
 export function vmDetailTabs(perms: VmPerms): VmDetailTab[] {
   const tabs: VmDetailTab[] = ['overview']
   if (perms.admin || perms.dashboard) tabs.push('account', 'proxy')
   if (perms.test) tabs.push('test')
-  if (perms.admin) tabs.push('ops', 'seed')
+  if (perms.admin) tabs.push('ops', 'desktop', 'seed')
   return tabs
 }
 

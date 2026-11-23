@@ -85,6 +85,7 @@ export function LeaderboardCard({
   title,
   scope,
   tz,
+  global = false,
   accentColor = 'primary',
   onViewAll,
   className,
@@ -92,11 +93,14 @@ export function LeaderboardCard({
   title: string
   scope: LeaderboardScope
   tz: string
+  global?: boolean
   accentColor?: Accent
   onViewAll?: () => void
   className?: string
 }) {
-  const board = useQuery(leaderboardQueryOptions('today', scope, MAX_ITEMS, tz))
+  const board = useQuery(
+    leaderboardQueryOptions('today', scope, MAX_ITEMS, tz, global)
+  )
   const entries = board.data?.entries ?? []
   const maxCost = Math.max(0, ...entries.map((e) => e.totalCost))
 
@@ -110,7 +114,7 @@ export function LeaderboardCard({
             onClick={onViewAll}
             className='flex cursor-pointer items-center gap-0.5 text-xs font-medium text-primary transition-colors hover:text-primary/80'
           >
-            <span>查看全部</span>
+            <span>查看排行榜</span>
             <ChevronRight className='h-3 w-3' />
           </button>
         ) : null}

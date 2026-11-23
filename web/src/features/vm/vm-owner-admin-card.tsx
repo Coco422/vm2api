@@ -41,9 +41,15 @@ export function VmOwnerAdminCard({ vm }: { vm: Vm }) {
   }
 
   const { mutate: setOwner, isPending } = useMutation({
-    mutationFn: (user_id: string | null) => patchVmOwner(vm.id, user_id),
-    onSuccess: async (_data, user_id) => {
-      toast.success(user_id ? '已分配给租户' : '已收回进平台池')
+    mutationFn: ({
+      userId,
+      deliveryBatch,
+    }: {
+      userId: string | null
+      deliveryBatch?: string
+    }) => patchVmOwner(vm.id, userId, deliveryBatch),
+    onSuccess: async (_data, { userId }) => {
+      toast.success(userId ? '已分配给租户' : '已收回进平台池')
       setAssignOpen(false)
       setReclaimOpen(false)
       await invalidate()
@@ -97,7 +103,9 @@ export function VmOwnerAdminCard({ vm }: { vm: Vm }) {
         open={assignOpen}
         pending={isPending}
         onOpenChange={setAssignOpen}
-        onConfirm={(userId) => setOwner(userId)}
+        onConfirm={(userId, deliveryBatch) =>
+          setOwner({ userId, deliveryBatch })
+        }
       />
       <ConfirmDialog
         open={reclaimOpen}
@@ -113,7 +121,7 @@ export function VmOwnerAdminCard({ vm }: { vm: Vm }) {
         confirmText='确认收回'
         destructive
         isLoading={isPending}
-        handleConfirm={() => setOwner(null)}
+        handleConfirm={() => setOwner({ userId: null })}
       />
     </>
   )

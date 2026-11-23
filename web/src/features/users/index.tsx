@@ -3,11 +3,12 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { VIEW_TITLES } from '@/config/nav'
 import type { PanelRole } from '@/types/panel-auth'
 import type { PanelUser } from '@/types/panel-users'
-import { KeyRound, Pencil, Plus, Trash2 } from 'lucide-react'
+import { KeyRound, Pencil, Plus, ShieldOff, Trash2 } from 'lucide-react'
 import { toast } from 'sonner'
 import { useAuthStore } from '@/stores/auth-store'
-import { api } from '@/lib/api'
+import { api, resetUserTwoFactorRequest } from '@/lib/api'
 import { fmtAgo } from '@/lib/format'
+import { cn } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -42,6 +43,13 @@ import { TableSkeleton } from '@/components/page-skeletons'
 import { PasswordInput } from '@/components/password-input'
 import { QueryGate } from '@/components/query-gate'
 import { usersQueryOptions } from '@/features/users/queries'
+import {
+  CONCURRENCY_DEFAULT,
+  CONCURRENCY_MAX,
+  CONCURRENCY_MIN,
+  concurrencyLabel,
+  parseConcurrency,
+} from '@/features/users/user-concurrency'
 
 // Mirrors assertPassword() in src/lib/admin/panel-users.mjs.
 const PASSWORD_MIN = 8
@@ -70,6 +78,7 @@ export function UsersPage() {
   const [edit, setEdit] = useState<PanelUser | null>(null)
   const [pwTarget, setPwTarget] = useState<PanelUser | null>(null)
   const [del, setDel] = useState<PanelUser | null>(null)
+  const [twoFaReset, setTwoFaReset] = useState<PanelUser | null>(null)
   const refresh = () =>
     qc.invalidateQueries({ queryKey: usersQueryOptions().queryKey })
 
@@ -86,7 +95,7 @@ export function UsersPage() {
       <QueryGate
         loading={q.isLoading}
         error={q.error}
-        skeleton={<TableSkeleton rows={8} columns={6} />}
+        skeleton={<TableSkeleton rows={8} columns={8} />}
       >
         <div className='overflow-x-auto rounded-md border'>
           <Table>
@@ -95,7 +104,9 @@ export function UsersPage() {
                 <TableHead>用户名</TableHead>
                 <TableHead>角色</TableHead>
                 <TableHead>状态</TableHead>
+                <TableHead>两步验证</TableHead>
                 <TableHead>自建配额</TableHead>
+                <TableHead>用户并发上限</TableHead>
                 <TableHead>最近登录</TableHead>
                 <TableHead className='text-end'>操作</TableHead>
               </TableRow>
@@ -104,7 +115,7 @@ export function UsersPage() {
               {items.length === 0 ? (
                 <TableRow>
                   <TableCell
-                    colSpan={6}
+                    colSpan={8}
                     className='h-24 text-center text-muted-foreground'
                   >
                     暂无用户
@@ -137,8 +148,20 @@ export function UsersPage() {
                         <Badge variant='secondary'>启用</Badge>
                       )}
                     </TableCell>
+                    <TableCell>
+                      {u.two_factor ? (
+                        <Badge variant='secondary'>已开启</Badge>
+                      ) : (
+                        <span className='text-xs text-muted-foreground'>
+                          未开启
+                        </span>
+                      )}
+                    </TableCell>
                     <TableCell className='tabular-nums'>
                       {u.vm_create_quota ?? 0}
+                    </TableCell>
+                    <TableCell className='tabular-nums'>
+                      {concurrencyLabel(u)}
                     </TableCell>
                     <TableCell
                       className='text-muted-foreground'
@@ -162,6 +185,20 @@ export function UsersPage() {
                       >
                         <KeyRound />
                         改密码
+                      </Button>
+                      <Button
+                        size='sm'
+                        variant='ghost'
+                        disabled={!u.two_factor}
+                        title={
+                          u.two_factor
+                            ? '清掉该账号的两步验证'
+                            : '该账号未开启两步验证'
+                        }
+                        onClick={() => setTwoFaReset(u)}
+                      >
+                        <ShieldOff />
+                        重置 2FA
                       </Button>
                       <Button
                         size='sm'
@@ -199,6 +236,25 @@ export function UsersPage() {
         isSelf={!!pwTarget && pwTarget.username === me?.user}
         onClose={() => setPwTarget(null)}
         onDone={refresh}
+      />
+      <ConfirmDialog
+        open={!!twoFaReset}
+        onOpenChange={() => setTwoFaReset(null)}
+        title={`重置 ${twoFaReset?.username} 的两步验证`}
+        desc='清掉该账号的验证器密钥和全部恢复码，下次登录只要密码；该账号的现有会话会被登出。用于用户同时丢失手机和恢复码的情况。'
+        confirmText='重置'
+        cancelBtnText='取消'
+        destructive
+        handleConfirm={() => {
+          if (!twoFaReset) return
+          resetUserTwoFactorRequest(twoFaReset.id)
+            .then(() => {
+              toast.success('两步验证已重置')
+              setTwoFaReset(null)
+              return refresh()
+            })
+            .catch((e: Error) => toast.error(e.message))
+        }}
       />
       <ConfirmDialog
         open={!!del}
@@ -239,8 +295,10 @@ function CreateUserDialog({
   const [confirm, setConfirm] = useState('')
   const [role, setRole] = useState<PanelRole>('user')
   const [quota, setQuota] = useState(0)
+  const [concurrency, setConcurrency] = useState(String(CONCURRENCY_DEFAULT))
   const [enabled, setEnabled] = useState(true)
   const pwErr = passwordError(password, confirm)
+  const concurrencyValue = parseConcurrency(concurrency)
 
   const reset = () => {
     setUsername('')
@@ -248,6 +306,7 @@ function CreateUserDialog({
     setConfirm('')
     setRole('user')
     setQuota(0)
+    setConcurrency(String(CONCURRENCY_DEFAULT))
     setEnabled(true)
   }
 
@@ -261,6 +320,7 @@ function CreateUserDialog({
           role,
           enabled,
           vm_create_quota: quota,
+          concurrency: concurrencyValue,
         }),
       }),
     onSuccess: async () => {
@@ -316,6 +376,9 @@ function CreateUserDialog({
             setEnabled={setEnabled}
             quota={quota}
             setQuota={setQuota}
+            concurrency={concurrency}
+            setConcurrency={setConcurrency}
+            concurrencyInvalid={concurrencyValue == null}
           />
           <DialogFooter>
             <Button
@@ -325,6 +388,7 @@ function CreateUserDialog({
                 !password ||
                 password !== confirm ||
                 !!pwErr ||
+                concurrencyValue == null ||
                 create.isPending
               }
               loading={create.isPending}
@@ -381,12 +445,23 @@ function EditUserForm({
   const [role, setRole] = useState<PanelRole>(user.role)
   const [enabled, setEnabled] = useState(user.enabled !== false)
   const [quota, setQuota] = useState(user.vm_create_quota ?? 0)
+  // Only an edited value is sent, so saving other fields never rewrites the limit.
+  const initialConcurrency = String(user.concurrency ?? 0)
+  const [concurrency, setConcurrency] = useState(initialConcurrency)
+  const concurrencyDirty = concurrency !== initialConcurrency
+  const concurrencyValue = parseConcurrency(concurrency)
+  const concurrencyInvalid = concurrencyDirty && concurrencyValue == null
 
   const patch = useMutation({
     mutationFn: () =>
       api(`/api/panel/users/${encodeURIComponent(user.id)}`, {
         method: 'PATCH',
-        body: JSON.stringify({ role, enabled, vm_create_quota: quota }),
+        body: JSON.stringify({
+          role,
+          enabled,
+          vm_create_quota: quota,
+          ...(concurrencyDirty ? { concurrency: concurrencyValue } : {}),
+        }),
       }),
     onSuccess: async () => {
       toast.success('已更新')
@@ -414,12 +489,15 @@ function EditUserForm({
         setEnabled={setEnabled}
         quota={quota}
         setQuota={setQuota}
+        concurrency={concurrency}
+        setConcurrency={setConcurrency}
+        concurrencyInvalid={concurrencyInvalid}
         lockSelf={isSelf}
       />
       <DialogFooter>
         <Button
           type='submit'
-          disabled={patch.isPending}
+          disabled={concurrencyInvalid || patch.isPending}
           loading={patch.isPending}
         >
           保存
@@ -596,13 +674,16 @@ function PasswordFields({
   )
 }
 
-function RoleFields({
+export function RoleFields({
   role,
   setRole,
   enabled,
   setEnabled,
   quota,
   setQuota,
+  concurrency,
+  setConcurrency,
+  concurrencyInvalid,
   lockSelf,
 }: {
   role: PanelRole
@@ -611,6 +692,9 @@ function RoleFields({
   setEnabled: (on: boolean) => void
   quota: number
   setQuota: (n: number) => void
+  concurrency: string
+  setConcurrency: (raw: string) => void
+  concurrencyInvalid: boolean
   lockSelf?: boolean
 }) {
   return (
@@ -634,16 +718,50 @@ function RoleFields({
         </Select>
       </Field>
       <Field id='user-quota' label='自建 VM 配额 (0–100)'>
+        <div className='space-y-1'>
+          <Input
+            id='user-quota'
+            aria-describedby='user-quota-help'
+            type='number'
+            min={0}
+            max={100}
+            value={quota}
+            onChange={(e) =>
+              setQuota(Math.max(0, Math.min(100, Number(e.target.value) || 0)))
+            }
+          />
+          <p id='user-quota-help' className='text-xs text-muted-foreground'>
+            仅租户受此配额限制；0 表示禁止自建 VM
+          </p>
+        </div>
+      </Field>
+      <Field
+        id='user-concurrency'
+        label={`并发上限 (${CONCURRENCY_MIN}–${CONCURRENCY_MAX}，0 为不限)`}
+      >
         <Input
-          id='user-quota'
+          id='user-concurrency'
           type='number'
-          min={0}
-          max={100}
-          value={quota}
-          onChange={(e) =>
-            setQuota(Math.max(0, Math.min(100, Number(e.target.value) || 0)))
-          }
+          inputMode='numeric'
+          min={CONCURRENCY_MIN}
+          max={CONCURRENCY_MAX}
+          step={1}
+          value={concurrency}
+          onChange={(e) => setConcurrency(e.target.value)}
+          aria-invalid={concurrencyInvalid}
+          aria-describedby='user-concurrency-hint'
         />
+        <p
+          id='user-concurrency-hint'
+          className={cn(
+            'text-xs',
+            concurrencyInvalid ? 'text-destructive' : 'text-muted-foreground'
+          )}
+        >
+          {concurrencyInvalid
+            ? `请输入 ${CONCURRENCY_MIN}–${CONCURRENCY_MAX} 的整数`
+            : '该用户所有 Key 同时在途的请求合计上限，0 为不限；管理员不受限。'}
+        </p>
       </Field>
       <div className='flex items-center justify-between'>
         <Label htmlFor='user-enabled'>启用</Label>

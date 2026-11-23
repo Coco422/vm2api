@@ -1,22 +1,17 @@
 import path from 'node:path'
 import { listVmRecordFiles, readJsonCached } from '../lib/vm/vm-file.mjs'
 
-/** A tenant needs exit availability, never the purchased proxy's identity. */
+/** Exit operation is private; tenants receive a service label, never a health claim. */
 export function tenantProxyView(proxy) {
   if (!proxy || typeof proxy !== 'object') return null
   return {
     configured: true,
-    label: '已配置',
-    status:
-      proxy.blocked_reason || proxy.enabled === false
-        ? 'dead'
-        : ['unknown', 'ok', 'fail', 'dead', 'down', 'error'].includes(proxy.status)
-          ? proxy.status
-          : null,
-    enabled: typeof proxy.enabled === 'boolean' ? proxy.enabled : null,
-    blocked_reason: proxy.blocked_reason ? 'unavailable' : null,
-    latency_ms: typeof proxy.latency_ms === 'number' ? proxy.latency_ms : null,
-    consecutive_failures: typeof proxy.consecutive_failures === 'number' ? proxy.consecutive_failures : 0,
+    label: '独享代理',
+    status: null,
+    enabled: null,
+    blocked_reason: null,
+    latency_ms: null,
+    consecutive_failures: 0,
   }
 }
 
@@ -66,6 +61,7 @@ export function tenantPanelPayload(payload, { projectRoot, ownerUserId } = {}) {
       else if (/^proxy[_A-Z]/.test(key) && !['proxy_configured', 'proxy_cli_enabled'].includes(key)) out[key] = null
       else if (vm && key === 'name') out[key] = value.id
       else if (vm && key === 'note') out[key] = null
+      else if (vm && key === 'lifetime_usage') continue
       else if (key === 'vmName' || key === 'vm_name') out[key] = value.vmId || value.vm_id || null
       else out[key] = visit(item)
     }

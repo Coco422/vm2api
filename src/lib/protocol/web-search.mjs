@@ -91,6 +91,10 @@ export function isAnthropicServerTool(tool) {
   return type !== '' && type !== 'function' && type !== 'custom'
 }
 
+export function isVersionedAnthropicServerTool(tool) {
+  return typeof tool?.type === 'string' && /_\d{8}$/.test(tool.type) && typeof tool.name === 'string' && !!tool.name
+}
+
 export function hasClaudeWebSearch(tools) {
   return Array.isArray(tools) && tools.some(isWebSearchTool)
 }
@@ -120,34 +124,6 @@ export function isWebSearchDisabled({ body, headers } = {}) {
   if (isFalseFlag(hdr)) return true
   if (isFalseFlag(body?.web_search)) return true
   return false
-}
-
-function contentToText(content) {
-  if (typeof content === 'string') return content
-  if (Array.isArray(content)) {
-    return content
-      .map((part) => {
-        if (typeof part === 'string') return part
-        if (part && typeof part.text === 'string') return part.text
-        if (part && typeof part.content === 'string') return part.content
-        return ''
-      })
-      .filter(Boolean)
-      .join('\n')
-  }
-  if (content && typeof content.text === 'string') return content.text
-  return ''
-}
-
-/** Last user turn only. Older turns do not keep search armed. */
-export function lastUserPromptText(body) {
-  const messages = Array.isArray(body?.messages) ? body.messages : []
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i]?.role === 'user') return contentToText(messages[i].content)
-  }
-  if (typeof body?.input === 'string') return body.input
-  if (Array.isArray(body?.input)) return contentToText(body.input)
-  return ''
 }
 
 const MAX_BLOCK_DEPTH = 4
@@ -304,11 +280,4 @@ export function sanitizeAnthropicTools(tools) {
     }
     return next
   })
-}
-
-export function sanitizeBodyServerTools(body) {
-  if (!body || typeof body !== 'object' || !Array.isArray(body.tools)) return body
-  const tools = sanitizeAnthropicTools(body.tools)
-  if (tools === body.tools) return body
-  return { ...body, tools }
 }

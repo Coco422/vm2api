@@ -6,7 +6,7 @@ import path from 'node:path'
 import http from 'node:http'
 import { fileURLToPath } from 'node:url'
 
-test('local admin assigns employees, keys and policies without external operations; restart preserves edits', async () => {
+test('admin assigns VM and policy; tenant creates own key; ownership survives restart', async () => {
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'company-admin-'))
   fs.mkdirSync(path.join(sandbox, 'data'))
   fs.mkdirSync(path.join(sandbox, 'site/web/dist'), { recursive: true })
@@ -38,13 +38,8 @@ test('local admin assigns employees, keys and policies without external operatio
       req.on('error', reject)
       req.end(body ? JSON.stringify(body) : undefined)
     })
-  const login = async () => {
-    const res = await request(
-      'POST',
-      '/api/panel/login',
-      { username: 'localadmin', password: 'local-admin-8791' },
-      null,
-    )
+  const login = async (username = 'localadmin', password = 'local-admin-8791') => {
+    const res = await request('POST', '/api/panel/login', { username, password }, null)
     assert.equal(res.status, 200, JSON.stringify(res))
     assert.ok(res.token)
     token = res.token
@@ -83,31 +78,29 @@ test('local admin assigns employees, keys and policies without external operatio
     assert.equal(listed.data.items.find((vm) => vm.id === 'spare-vm-1').origin, 'admin_assigned')
     const detail = await request('GET', '/api/panel/vms/spare-vm-1')
     assert.equal(detail.data.vm.owner_user_id, userId)
-    const keyRes = await request('POST', '/api/panel/api-keys', {
-      name: 'fixture employee key',
-      user_id: userId,
-      category: 'oauth',
-      group_type: 'anthropic',
-      allowed_vms: ['spare-vm-1'],
-      quota_usd: 10,
-      quota_requests: 0,
-      max_concurrency: 3,
-    })
+    const adminToken = token
+    await login('fixture-employee', 'local-employee-test-only')
+    const tenantToken = token
+    const keyRes = await request('POST', '/api/panel/api-keys', { name: 'my-client' })
     assert.equal(keyRes.status, 201, JSON.stringify(keyRes))
     const key = keyRes.item
+    assert.equal(key.user_id, userId)
     let me = await request('GET', '/api/company/me', null, key.key)
     assert.equal(me.status, 200, JSON.stringify(me))
     assert.deepEqual(
       me.data.vms.map((vm) => vm.id),
       ['spare-vm-1'],
     )
-    assert.equal(me.data.key.quota_usd, 10)
-    const edited = await request('PATCH', `/api/panel/api-keys/${key.id}`, { quota_usd: 0, max_concurrency: 4 })
-    assert.equal(edited.status, 200, JSON.stringify(edited))
-    assert.equal(edited.item.quota_usd, 0)
-    assert.equal(edited.item.max_concurrency, 4)
-    me = await request('GET', '/api/company/me', null, key.key)
-    assert.equal(me.data.key.quota_usd, 0)
+    const renamed = await request('PATCH', `/api/panel/api-keys/${key.id}`, { name: 'renamed-client' })
+    assert.equal(renamed.status, 200)
+    assert.equal((await request('PATCH', `/api/panel/api-keys/${key.id}`, { quota_usd: 100 })).status, 403)
+    token = adminToken
+    assert.equal((await request('POST', `/api/panel/api-keys/${key.id}/reveal`, {})).status, 404)
+    const adminKeys = await request('GET', '/api/panel/api-keys')
+    assert.equal(
+      adminKeys.keys.some((item) => item.id === key.id),
+      false,
+    )
     const policy = await request('PATCH', '/api/panel/vms/spare-vm-1', { max_concurrency: 3, max_rpm: 30 })
     assert.equal(policy.status, 200, JSON.stringify(policy))
     assert.equal(policy.ok, true)
@@ -130,7 +123,8 @@ test('local admin assigns employees, keys and policies without external operatio
     await login()
     me = await request('GET', '/api/company/me', null, key.key)
     assert.equal(me.status, 200)
-    assert.equal(me.data.key.quota_usd, 0)
+    const tenantKeys = await request('GET', '/api/panel/api-keys', null, tenantToken)
+    assert.equal(tenantKeys.keys.find((item) => item.id === key.id)?.name, 'renamed-client')
     assert.deepEqual(
       me.data.vms.map((vm) => vm.id),
       ['spare-vm-1'],

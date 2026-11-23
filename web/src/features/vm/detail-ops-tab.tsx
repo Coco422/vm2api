@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import type { Vm, VmProxySnap } from '@/types/panel-vm'
+import type { Vm, VmKernelSnapshot, VmProxySnap } from '@/types/panel-vm'
 import { type CredType, credTypeLabel } from '@/lib/cred-type'
 import { isCodexVm } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
@@ -7,6 +7,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -21,6 +22,7 @@ import {
 import { ChoiceTiles } from '@/components/choice-tiles'
 import { isActiveVmPointer } from '@/features/vm/active-vm'
 import { Field } from '@/features/vm/detail-section-primitives'
+import { VmEngineEditor } from '@/features/vm/engine-editor'
 import { VmEnvironmentCard } from '@/features/vm/environment-card'
 import { NodeChip } from '@/features/vm/node-chip'
 import { VmPhysicalFeaturesCard } from '@/features/vm/physical-features-card'
@@ -28,8 +30,72 @@ import { isRemoteVm, REMOTE_UNSUPPORTED_TEXT } from '@/features/vm/placement'
 import { VmOwnerAdminCard } from '@/features/vm/vm-owner-admin-card'
 import { VmShellCard } from '@/features/vm/vm-shell-card'
 
+export function KernelRepairChoices({
+  remote,
+  kernelMode,
+  setKernelMode,
+  onCancel,
+  onConfirm,
+}: {
+  remote: boolean
+  kernelMode: 'keep' | 'traits'
+  setKernelMode: (mode: 'keep' | 'traits') => void
+  onCancel: () => void
+  onConfirm: (mode: 'keep' | 'traits') => void
+}) {
+  return (
+    <>
+      <DialogHeader>
+        <DialogTitle>重装 kernel</DialogTitle>
+      </DialogHeader>
+      {remote ? (
+        <DialogDescription>
+          更新 kernel；不会清空家目录或重建身份。
+        </DialogDescription>
+      ) : (
+        <ChoiceTiles
+          label='更新方式'
+          value={kernelMode}
+          onChange={setKernelMode}
+          choices={[
+            {
+              value: 'keep',
+              title: '保留原数据重建',
+              detail:
+                '留下凭证、指纹和统计，只换 kernel、cli-node 与 Go 遥测。',
+            },
+            {
+              value: 'traits',
+              title: '重建新特征',
+              detail: '清家目录并重抽计算机身份。',
+            },
+          ]}
+        />
+      )}
+      <DialogFooter>
+        <Button variant='outline' onClick={onCancel}>
+          取消
+        </Button>
+        <Button
+          variant={
+            !remote && kernelMode === 'traits' ? 'destructive' : 'default'
+          }
+          onClick={() => onConfirm(remote ? 'keep' : kernelMode)}
+        >
+          {remote
+            ? '确认'
+            : kernelMode === 'keep'
+              ? '保留原数据重建'
+              : '重建新特征'}
+        </Button>
+      </DialogFooter>
+    </>
+  )
+}
+
 type VmOpsTabProps = {
   vm: Vm
+  kernel?: VmKernelSnapshot | null
   proxy: VmProxySnap
   officialCc: boolean
   credType: CredType
@@ -72,6 +138,9 @@ export function VmOpsTab(props: VmOpsTabProps) {
   return (
     <TabsContent value='ops' className='space-y-3 pt-4'>
       <VmOwnerAdminCard vm={vm} />
+      {!gpt ? (
+        <VmEngineEditor id={vm.id} vm={vm} kernel={props.kernel} />
+      ) : null}
       <Card>
         <CardHeader className='pb-2'>
           <CardTitle className='text-sm'>容器</CardTitle>
@@ -126,16 +195,18 @@ export function VmOpsTab(props: VmOpsTabProps) {
         <Button
           size='sm'
           variant='outline'
-          disabled={isActiveVmPointer(vm)}
-          loading={busy('/activate')}
+          disabled={busy('/activate') || busy('/deactivate')}
+          loading={busy('/activate') || busy('/deactivate')}
           title={
             isActiveVmPointer(vm)
-              ? '已是当前活跃槽'
+              ? '清空面板默认槽位，不影响调度'
               : '写入 vms/active.json，面板默认接口指向此槽'
           }
-          onClick={() => onAction('/activate')}
+          onClick={() =>
+            onAction(isActiveVmPointer(vm) ? '/deactivate' : '/activate')
+          }
         >
-          设为活跃
+          {isActiveVmPointer(vm) ? '取消活跃' : '设为活跃'}
         </Button>
         <Button
           size='sm'
@@ -216,15 +287,24 @@ export function VmOpsTab(props: VmOpsTabProps) {
         <>
           <Separator />
           <div className='flex flex-wrap items-center gap-2'>
-            <Button
-              size='sm'
-              variant='outline'
-              disabled={remote}
-              loading={busy('/wrap-cli/promote')}
-              onClick={() => onAction('/wrap-cli/promote')}
-            >
-              晋升母本
-            </Button>
+            <div className='space-y-1'>
+              <Button
+                size='sm'
+                variant='outline'
+                disabled={remote}
+                loading={busy('/wrap-cli/promote')}
+                aria-describedby='wrap-template-help'
+                onClick={() => onAction('/wrap-cli/promote')}
+              >
+                设为 Wrap CLI 模板
+              </Button>
+              <p
+                id='wrap-template-help'
+                className='text-xs text-muted-foreground'
+              >
+                用此槽的 Wrap CLI 文件替换现有模板。
+              </p>
+            </div>
             <Button
               size='sm'
               variant='outline'
@@ -248,43 +328,16 @@ export function VmOpsTab(props: VmOpsTabProps) {
       </div>
       <Dialog open={kernelOpen} onOpenChange={setKernelOpen}>
         <DialogContent>
-          <DialogHeader>
-            <DialogTitle>重装 kernel</DialogTitle>
-          </DialogHeader>
-          <ChoiceTiles
-            label='更新方式'
-            value={kernelMode}
-            onChange={setKernelMode}
-            choices={[
-              {
-                value: 'keep',
-                title: '保留原数据重建',
-                detail:
-                  '留下凭证、指纹和统计，只换 kernel、cli-node 与 Go 遥测。',
-              },
-              {
-                value: 'traits',
-                title: '重建新特征',
-                detail: remote
-                  ? '集群槽只换镜像，不在这里清远程家目录。'
-                  : '清家目录并重抽计算机身份。',
-              },
-            ]}
+          <KernelRepairChoices
+            remote={remote}
+            kernelMode={kernelMode}
+            setKernelMode={setKernelMode}
+            onCancel={() => setKernelOpen(false)}
+            onConfirm={(mode) => {
+              setKernelOpen(false)
+              onAction('/wrap-cli/repair', { mode })
+            }}
           />
-          <DialogFooter>
-            <Button variant='outline' onClick={() => setKernelOpen(false)}>
-              取消
-            </Button>
-            <Button
-              variant={kernelMode === 'traits' ? 'destructive' : 'default'}
-              onClick={() => {
-                setKernelOpen(false)
-                onAction('/wrap-cli/repair', { mode: kernelMode })
-              }}
-            >
-              {kernelMode === 'keep' ? '保留原数据重建' : '重建新特征'}
-            </Button>
-          </DialogFooter>
         </DialogContent>
       </Dialog>
     </TabsContent>

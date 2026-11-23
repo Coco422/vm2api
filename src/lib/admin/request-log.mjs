@@ -1,5 +1,5 @@
 /**
- * Request logging — sub2api UsageLog + access-log inspired (SQLite-backed).
+ * SQLite-backed request logs for access, usage, and billing.
  *
  * Modes:
  *   off    — no writes
@@ -20,6 +20,7 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { redactSecrets } from '../core/security.mjs'
 import { resolveStoreDb } from '../db/database.mjs'
+import { enqueueWrite, writeBehindArmed } from '../db/write-behind.mjs'
 import { UsageLogsRepo } from '../db/repos/usage-logs-repo.mjs'
 import { classifyRequestError, resolveMutedErrorClasses } from './error-class.mjs'
 import { costColumnsFromUsage, normalizeUsage } from './pricing.mjs'
@@ -82,10 +83,48 @@ function safeIp(req) {
   return String(raw).slice(0, 45)
 }
 
+/**
+ * Catalog size as the model sees it. `tools.length` alone cannot tell four
+ * top-level entries from the ~1400 callable functions a namespaced plugin
+ * catalog expands to, which is the shape that reaches an output-token limit
+ * (#1310). Also records whether the caller already asked for deferred loading,
+ * so a request that handles its own catalog is distinguishable from one that
+ * does not.
+ */
+function summarizeTools(tools) {
+  const empty = { count: 0, functions: 0, bytes: 0, deferred: 0, search: false }
+  if (!Array.isArray(tools) || !tools.length) return empty
+  let functions = 0
+  let deferred = 0
+  let search = false
+  const visit = (tool) => {
+    if (!tool || typeof tool !== 'object') return
+    const type = typeof tool.type === 'string' ? tool.type.trim() : ''
+    if (type.startsWith('tool_search')) search = true
+    if (tool.defer_loading === true || tool.custom?.defer_loading === true) deferred += 1
+    const members = Array.isArray(tool.tools) ? tool.tools : null
+    if (members) {
+      // A namespace is a container; only its members are callable.
+      for (const member of members) visit(member)
+      return
+    }
+    if (type === 'function' || type === 'custom' || (!type && typeof tool.name === 'string')) functions += 1
+  }
+  for (const tool of tools) visit(tool)
+  let bytes = 0
+  try {
+    bytes = Buffer.byteLength(JSON.stringify(tools))
+  } catch {
+    // An unserializable catalog still reports its counts.
+  }
+  return { count: tools.length, functions, bytes, deferred, search }
+}
+
 function summarizeBody(body) {
   if (!body || typeof body !== 'object') return { empty: true }
   const messages = Array.isArray(body.messages) ? body.messages : null
   const roles = messages ? messages.map((m) => m?.role).filter(Boolean) : []
+  const toolStats = summarizeTools(body.tools)
   let systemLen = 0
   if (typeof body.system === 'string') systemLen = body.system.length
   else if (Array.isArray(body.system)) {
@@ -98,6 +137,10 @@ function summarizeBody(body) {
     messages_count: messages ? messages.length : body.input != null ? 1 : 0,
     roles,
     tools_count: Array.isArray(body.tools) ? body.tools.length : 0,
+    tool_functions_count: toolStats.functions,
+    tools_bytes: toolStats.bytes,
+    tools_deferred_count: toolStats.deferred,
+    tools_search_declared: toolStats.search,
     has_thinking: body.thinking != null,
     system_len: systemLen,
     top_level_keys: Object.keys(body).sort(),
@@ -549,6 +592,14 @@ export class RequestLogStore {
       model: extra.model || null,
       stream: !!extra.stream,
       status: extra.status ?? null,
+      upstream_status: extra.audit_upstream_400
+        ? 400
+        : Number(extra.upstream_status) === 400
+          ? null
+          : (extra.upstream_status ?? null),
+      upstream_400_message: extra.audit_upstream_400_message
+        ? String(extra.audit_upstream_400_message).slice(0, 300)
+        : null,
       duration_ms,
       api_key_kind: extra.api_key_kind || null,
       api_key_id: extra.api_key_id || null,
@@ -579,6 +630,7 @@ export class RequestLogStore {
       attempt_count: extra.attempt_count ?? null,
       final_state: extra.final_state || null,
       final_account_id: extra.final_account_id || extra.account_id || null,
+      usage_account_id: extra.usage_account_id || null,
       session_id: sessionIdForLog(extra.session_id),
       outbound_session_id: sessionIdForLog(extra.outbound_session_id),
       reasoning_effort: REASONING_EFFORTS.has(extra.reasoning_effort) ? extra.reasoning_effort : null,
@@ -591,15 +643,15 @@ export class RequestLogStore {
       image_usage: extra.image_usage ? JSON.stringify(extra.image_usage) : null,
       image_input_tokens: imageTokenCount(extra.image_usage?.input_tokens),
       image_output_tokens: imageTokenCount(extra.image_usage?.output_tokens),
-      // sub2api ownership + billing columns
+      // Ownership and billing columns
       user_id: extra.user_id ?? null,
-      vm_owner_user_id: this.repo.vmOwnerOf(extra.vm_id),
+      vm_owner_user_id: null,
       group_id: extra.group_id ?? 1,
       rate_multiplier: Number.isFinite(Number(extra.rate_multiplier)) ? Number(extra.rate_multiplier) : 1,
       ...costColumnsForLog(billedUsage, extra.upstream_model || extra.model || extra.requested_model, extra),
       upstream_service_tier: extra.upstream_service_tier || null,
     }
-    // sub2api actual_cost: official cost × group rate multiplier (0 is a valid rate)
+    // Unless supplied, actual_cost is the official cost × group rate (0 is valid).
     if (summary.total_cost != null) {
       summary.actual_cost = extra.actual_cost ?? summary.total_cost * summary.rate_multiplier
     }
@@ -622,14 +674,12 @@ export class RequestLogStore {
     const classified = classifyRequestError(summary)
     if (classified?.error_class) summary.error_class = classified.error_class
 
-    try {
+    // Capture ownership at request completion; retries must not reattribute history.
+    summary.vm_owner_user_id = this.repo.vmOwnerOf(extra.vm_id)
+    const persist = () => {
       this.repo.insertSummaryIfAbsent(summary)
-    } catch {}
-    if (this.jsonlMirror) this._appendJsonl(summary)
-    this._mem.push(summary)
-    if (this._mem.length > this._memMax) this._mem = this._mem.slice(-this._memMax)
-
-    if (ctx.mode === 'debug') {
+      if (this.jsonlMirror) this._appendJsonl(summary)
+      if (ctx.mode !== 'debug') return
       const debugRec = {
         ...summary,
         headers: ctx.headers,
@@ -642,7 +692,6 @@ export class RequestLogStore {
             : null,
         hop_meta: extra.hop_meta || null,
         via: extra.via || extra.hop_meta?.via || null,
-        upstream_status: extra.upstream_status ?? null,
         outbound_summary: extra.outbound_summary || null,
         cache_prefix: extra.cache_prefix || null,
         cache_continuity: extra.cache_continuity || null,
@@ -658,12 +707,18 @@ export class RequestLogStore {
           ctx.capture_outbound && !extra.classifier && extra.outbound_body != null
             ? clampBody(extra.outbound_body, this.maxDebugBodyChars)
             : null,
+        outbound_body_source: ctx.capture_outbound ? extra.outbound_body_source || null : null,
+        outbound_body_truncated: ctx.capture_outbound ? extra.outbound_body_truncated === true : false,
         response: ctx.response ? debugResponse(ctx.response) : null,
       }
       try {
         this.repo.insertDebug(summary.request_id || summary.id, summary.ts, debugRec)
       } catch {}
     }
+    this._mem.push(summary)
+    if (this._mem.length > this._memMax) this._mem = this._mem.slice(-this._memMax)
+    if (writeBehindArmed()) enqueueWrite(persist)
+    else persist()
     return summary
   }
 
@@ -728,6 +783,14 @@ export class RequestLogStore {
 
   billingStats(opts = {}) {
     return this.repo.billingStats(opts)
+  }
+
+  healthBuckets(opts = {}) {
+    return this.repo.healthBuckets(opts)
+  }
+
+  topErrors(opts) {
+    return this.repo.topErrors(opts)
   }
 
   ownerBilling(opts = {}) {

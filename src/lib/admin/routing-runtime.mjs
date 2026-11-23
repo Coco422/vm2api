@@ -9,13 +9,17 @@ import { atomicWriteJson } from '../vm/vm-file.mjs'
 import {
   listVms,
   getVm,
-  persistAccountTier,
   persistVmQuotaOverride,
   persistVmSessionSlots,
   persistVmMaxSessions,
   markUnschedulable,
 } from '../vm/vm-registry.mjs'
-import { normalizeInferenceConfig, normalizeSessionSlots, resolveInferenceEngine } from '../vm/slot-engine.mjs'
+import {
+  normalizeInferenceConfig,
+  normalizeSessionSlots,
+  resolveInferenceEngine,
+  resolveKernelDataplane,
+} from '../vm/slot-engine.mjs'
 import { slotExec } from '../vm/slot-runtime.mjs'
 import { maxRequestBytes, streamIdleTimeoutMs } from '../core/config.mjs'
 
@@ -30,7 +34,9 @@ import { RequestAttemptsRepo } from '../db/repos/request-attempts-repo.mjs'
 import { normalizeOfficialCcConfig } from '../oauth/official-cc-bootstrap.mjs'
 import { normalizeHealthProbeConfig } from './health-probe.mjs'
 import { normalizeUsageProbeConfig } from '../oauth/usage-probe-monitor.mjs'
-import { mergeNotifyConfig } from './notify.mjs'
+import { mergeNotifyConfig, validateNotifyRoutingPatch } from './notify.mjs'
+import { normalizeRedaction } from '../redaction/policy.mjs'
+import { ensureRedaction } from '../redaction/runtime.mjs'
 import { normalizeLoggingConfig } from './request-log.mjs'
 import { markVmRefreshError } from '../oauth/oauth-credentials.mjs'
 import { shouldMarkMissingRefresh } from '../pool/schedule-eligibility.mjs'
@@ -44,15 +50,18 @@ import {
   mergeOpenAIQuotaPolicy,
   normalizeOpenAIQuotaPolicy,
 } from '../pool/openai-quota-policy.mjs'
-import { rustKernelHealth } from '../transport/rust-kernel-client.mjs'
-import { requestKernelReloadWhenIdle, syncClaudeKernelConfigs } from '../transport/rust-kernel-supervisor.mjs'
+import { gatewayPolicyReady, rustKernelHealth } from '../transport/rust-kernel-client.mjs'
+import {
+  requestKernelReloadWhenIdle,
+  syncClaudeKernelConfigs,
+  syncCragSessionPolicy,
+} from '../transport/rust-kernel-supervisor.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
 import { wakeOpenAIWaiter } from '../pool/openai-account-runtime.mjs'
 import { normalizeVmConfig } from '../vm/machine-spec.mjs'
-import { syncWorkerTelemetry } from '../vm/vm-runtime.mjs'
-import { slotHost } from '../vm/slot-host.mjs'
-import { telemetryUploadInterval } from '../vm/worker-telemetry.mjs'
+import { applyNativeTelemetry } from '../vm/fleet-update.mjs'
+import { telemetryDefaultEnabled, telemetryUploadInterval } from '../vm/native-telemetry.mjs'
 
 export function createRoutingRuntime(ctx) {
   const getRouting = () => (typeof ctx.getRoutingConfig === 'function' ? ctx.getRoutingConfig() : ctx.routingConfig)
@@ -105,8 +114,11 @@ export function createRoutingRuntime(ctx) {
     return vm
   }
 
-  function applyVmSessionSlots(id, n, { override = true } = {}) {
-    return persistVmSessionSlots(ctx.cfg.paths.project, id, normalizeSessionSlots(n), { override })
+  function applyVmSessionSlots(id, n, { override = true, publish = true } = {}) {
+    const project = ctx.cfg.paths.project
+    const vm = persistVmSessionSlots(project, id, normalizeSessionSlots(n), { override })
+    if (publish && vm && syncCragSessionPolicy(project, vm, getRouting())) reloadCragSessionPolicy(vm)
+    return vm
   }
 
   function applyVmMaxSessions(id, n, { override = true } = {}) {
@@ -131,7 +143,7 @@ export function createRoutingRuntime(ctx) {
         continue
       }
       if (Number(vm.session_slots) === value) continue
-      applyVmSessionSlots(vm.id, value, { override: false })
+      applyVmSessionSlots(vm.id, value, { override: false, publish: false })
       applied.updated += 1
     }
     return applied
@@ -168,7 +180,7 @@ export function createRoutingRuntime(ctx) {
     return vm.claude?.has_access || vm.has_token ? 'pro' : accountTier
   }
 
-  function applyRoutingTierConcurrency(tiers) {
+  function applyRoutingTierConcurrency(tiers, { preserveExisting = false } = {}) {
     const routingConfig = getRouting()
     const policies = normalizeTiers(tiers, routingConfig.quota, routingConfig.concurrency)
     const skip = []
@@ -188,10 +200,17 @@ export function createRoutingRuntime(ctx) {
         applied.skipped += 1
         continue
       }
+      // Boot keeps persisted slot settings; explicit routing saves update inherited
+      // values. Account DB synchronization and live tier admission still run below.
+      if (preserveExisting && Object.prototype.hasOwnProperty.call(storedVm?.policy || {}, 'maxConcurrency')) {
+        continue
+      }
       const key = vmTierKey(vm)
       const next = Number(policies[key]?.max_concurrency ?? 2)
       const cur = Number(storedVm?.policy?.maxConcurrency)
-      if (cur === next) continue
+      // An explicit save also releases a legacy unflagged pin when its value
+      // already matches the tier; a materialized inherited value needs no write.
+      if (cur === next && storedVm?.policy?.concurrencyOverride === false) continue
       applyVmConcurrency(vm.id, next, { override: false })
       applied[key] += 1
     }
@@ -387,41 +406,80 @@ export function createRoutingRuntime(ctx) {
 
   function inferenceTouchesKernel(inference) {
     if (!inference || typeof inference !== 'object') return false
-    return Object.prototype.hasOwnProperty.call(inference, 'session_idle_ttl_seconds')
+    return ['session_idle_ttl_seconds', 'session_slots', 'prewarm_enabled'].some((key) => Object.hasOwn(inference, key))
+  }
+
+  function reloadCragSessionPolicy(vm) {
+    if (vm.status !== 'running' || resolveInferenceEngine(vm, getRouting()) !== 'rust') return
+    requestKernelReloadWhenIdle(slotExec(ctx.cfg.paths.project, vm), { requireLiveKernel: true })
   }
 
   function syncKernelPanelConfig(routingConfig) {
-    return syncClaudeKernelConfigs(ctx.cfg.paths.project, routingConfig)
+    return syncClaudeKernelConfigs(ctx.cfg.paths.project, routingConfig, reloadCragSessionPolicy)
   }
 
-  // kernel.json hot-reloads, but the job watchdog reads its idle limit from env at start.
-  function reloadClaudeKernelsWhenIdle(routingConfig) {
+  // Legacy watchdogs read idle limits at startup. Native policy-capable
+  // workers get the new limit on each request instead.
+  async function reloadClaudeKernelsWhenIdle(routingConfig, { idleOnly }) {
     const project = ctx.cfg.paths.project
-    let queued = 0
+    const pending = []
     for (const { id } of listVms(project)) {
       const vm = getVm(project, id)
       if (!vm || isCodexVm(vm) || vm.status !== 'running') continue
       if (resolveInferenceEngine(vm, routingConfig) !== 'rust') continue
-      if (requestKernelReloadWhenIdle(slotExec(project, vm)).ok) queued += 1
+      const exec = slotExec(project, vm)
+      pending.push(
+        (async () => {
+          if (idleOnly) {
+            const health = await rustKernelHealth(exec, { timeoutMs: 800 }).catch(() => null)
+            if (gatewayPolicyReady(health)) return false
+          }
+          return requestKernelReloadWhenIdle(exec).ok
+        })(),
+      )
     }
-    return queued
+    return (await Promise.all(pending)).filter(Boolean).length
   }
 
-  // The sidecar re-reads worker.json on mtime change, so a rewrite applies without a restart.
-  // Node slots read a pushed copy; that push is queued and only logged on failure.
-  function syncTelemetryUploadInterval(routingConfig) {
+  // Native slots hot-read kernel.json; publication must be acknowledged per VM.
+  async function syncTelemetryUploadInterval(
+    routingConfig,
+    { defaultEnabled = false, prevDefaultEnabled = false } = {},
+  ) {
     const project = ctx.cfg.paths.project
     const applied = { updated: 0, queued: 0, skipped: 0, failed: [] }
+    const optIn = defaultEnabled === true && prevDefaultEnabled !== true
     for (const { id } of listVms(project)) {
       const vm = getVm(project, id)
       if (!vm || isCodexVm(vm)) continue
+      if (optIn && vm.seed_policy?.telemetry_disabled !== false) {
+        const vmPath = path.join(project, 'vms', `${id}.json`)
+        const fresh = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+        fresh.seed_policy = { ...(fresh.seed_policy || {}), telemetry_disabled: false }
+        fresh.updated_at = new Date().toISOString()
+        atomicWriteJson(vmPath, fresh, { mode: 0o600 })
+      }
+      if (resolveKernelDataplane(vm, routingConfig) === 'crag' && !optIn) {
+        applied.skipped += 1
+        continue
+      }
       try {
-        if (!syncWorkerTelemetry(vm, project, routingConfig).wrote) {
+        const current = getVm(project, id) || vm
+        const result = await applyNativeTelemetry({
+          projectRoot: project,
+          vm: current,
+          routing: routingConfig,
+          lifecycle: { watchdog: ctx.kernelWatchdog, poolScheduler: ctx.poolScheduler },
+        })
+        if (result.supported === false) {
           applied.skipped += 1
           continue
         }
-        if (slotHost(vm).queueSyncRun(vm, path.join(project, 'vms', vm.id))) applied.queued += 1
-        else applied.updated += 1
+        if (!result.ok || !result.published) {
+          applied.failed.push(vm.id)
+          continue
+        }
+        applied.updated += 1
       } catch {
         applied.failed.push(vm.id)
       }
@@ -429,10 +487,18 @@ export function createRoutingRuntime(ctx) {
     return applied
   }
 
-  function persistRoutingPatch(body = {}) {
+  async function persistRoutingPatch(body = {}) {
+    validateNotifyRoutingPatch(body)
     const hasCodexQuota = body?.codex && Object.prototype.hasOwnProperty.call(body.codex, 'quota')
     if (hasCodexQuota) validateOpenAIQuotaPatch(body.codex.quota)
     validateInferenceWebsocketPatch(body)
+    let nextRedaction = null
+    if (body.redaction !== undefined) {
+      nextRedaction = normalizeRedaction(body.redaction)
+      if (nextRedaction.enabled) {
+        await ensureRedaction({ ...getRouting(), redaction: nextRedaction }, { projectRoot: ctx.cfg.paths.project })
+      }
+    }
     let routingConfig = getRouting()
     const prevOfficialCc = routingConfig.official_cc
     const prevHealthProbe = routingConfig.health_probe
@@ -442,6 +508,7 @@ export function createRoutingRuntime(ctx) {
     const prevIdleMs = streamIdleTimeoutMs(routingConfig)
     const prevRequestBytes = maxRequestBytes(routingConfig)
     const prevUploadInterval = telemetryUploadInterval(routingConfig)
+    const prevDefaultEnabled = telemetryDefaultEnabled(routingConfig)
     setRouting(routingConfig)
     if (body.sticky) routingConfig.sticky = { ...(routingConfig.sticky || {}), ...body.sticky }
     if (body.quota) routingConfig.quota = { ...(routingConfig.quota || {}), ...body.quota }
@@ -489,11 +556,15 @@ export function createRoutingRuntime(ctx) {
       }
       routingConfig.vm = normalizeVmConfig(next)
     }
-    if (body.telemetry && Object.hasOwn(body.telemetry, 'upload_interval_seconds')) {
-      routingConfig.telemetry = {
-        ...(routingConfig.telemetry || {}),
-        upload_interval_seconds: telemetryUploadInterval({ telemetry: body.telemetry }),
+    if (body.telemetry && typeof body.telemetry === 'object' && !Array.isArray(body.telemetry)) {
+      const nextTelemetry = { ...(routingConfig.telemetry || {}) }
+      if (Object.hasOwn(body.telemetry, 'upload_interval_seconds')) {
+        nextTelemetry.upload_interval_seconds = telemetryUploadInterval({ telemetry: body.telemetry })
       }
+      if (Object.hasOwn(body.telemetry, 'default_enabled')) {
+        nextTelemetry.default_enabled = body.telemetry.default_enabled === true
+      }
+      routingConfig.telemetry = nextTelemetry
     }
     applyOfficialCcRoutingBody(body, prevOfficialCc)
     applyHealthProbeRoutingBody(body, prevHealthProbe)
@@ -515,11 +586,16 @@ export function createRoutingRuntime(ctx) {
         mutedErrorClasses: routingConfig.logging.muted_error_classes,
       })
     }
+    if (nextRedaction) routingConfig.redaction = nextRedaction
     fs.mkdirSync(path.dirname(ctx.routingConfigPath), { recursive: true })
-    fs.writeFileSync(ctx.routingConfigPath, JSON.stringify(routingConfig, null, 2))
+    atomicWriteJson(ctx.routingConfigPath, routingConfig, { mode: 0o600 })
     ctx.stickyRouter.reloadConfig(routingConfig)
     ctx.accountQuota.reloadConfig(routingConfig)
     getPool()?.reloadConfig?.(poolSchedulerConfig())
+    const sessionSlotsApplied =
+      body.inference && Object.hasOwn(body.inference, 'session_slots')
+        ? applyRoutingSessionSlots(nextSessionSlots)
+        : { updated: 0, skipped: 0 }
     const idleChanged = streamIdleTimeoutMs(routingConfig) !== prevIdleMs
     const requestBytesChanged = maxRequestBytes(routingConfig) !== prevRequestBytes
     // Body limit is applied once, when axum builds DefaultBodyLimit.
@@ -530,23 +606,26 @@ export function createRoutingRuntime(ctx) {
       requestBytesChanged
         ? syncKernelPanelConfig(routingConfig)
         : null
-    // Stream idle / body-limit still need an idle restart; CCH and sticky-slot TTL hot-read kernel.json.
-    const kernelReload = idleChanged || requestBytesChanged ? reloadClaudeKernelsWhenIdle(routingConfig) : 0
+    const reloadNeeded =
+      idleChanged || requestBytesChanged
+        ? reloadClaudeKernelsWhenIdle(routingConfig, { idleOnly: !requestBytesChanged })
+        : 0
+    const defaultEnabled = telemetryDefaultEnabled(routingConfig)
     const telemetrySync =
-      telemetryUploadInterval(routingConfig) !== prevUploadInterval ? syncTelemetryUploadInterval(routingConfig) : null
+      telemetryUploadInterval(routingConfig) !== prevUploadInterval || defaultEnabled !== prevDefaultEnabled
+        ? await syncTelemetryUploadInterval(routingConfig, { defaultEnabled, prevDefaultEnabled })
+        : null
     // Pool and failover settings hot-reload into the live scheduler and runner.
     // Rebuilding them would drop the seat book and queues while their requests
     // still run (the panel sends `failover` with every routing save).
     if (body.pool) configureUnitCircuit(routingConfig)
     if (body.failover) ctx.failoverRunner?.reloadConfig?.(routingConfig.failover || {})
+    const kernelReload = await reloadNeeded
     try {
       return {
         concurrency: applyRoutingTierConcurrency(routingConfig.tiers),
         rpm: applyRoutingTierRpm(routingConfig.tiers),
-        session_slots:
-          body.inference && Object.prototype.hasOwnProperty.call(body.inference, 'session_slots')
-            ? applyRoutingSessionSlots(nextSessionSlots)
-            : { updated: 0, skipped: 0 },
+        session_slots: sessionSlotsApplied,
         openai_quota: hasCodexQuota
           ? applyRoutingOpenAIQuota(routingConfig.codex.quota)
           : { concurrency: 0, rpm: 0, sessions: 0, skipped: 0 },
@@ -590,6 +669,7 @@ export function createRoutingRuntime(ctx) {
       doc.pool = normalizePoolRouting(doc.pool)
       doc.vm = normalizeVmConfig(doc.vm)
       if (!hasOpenAIQuota) migrateLegacyOpenAIPolicies(doc)
+      if (doc.redaction != null) doc.redaction = normalizeRedaction(doc.redaction)
       return doc
     } catch (error) {
       throw new Error(`Routing config '${ctx.routingConfigPath}' has invalid JSON: ${error?.message || error}`, {
@@ -698,6 +778,7 @@ export function createRoutingRuntime(ctx) {
       accountQuota: ctx.accountQuota,
       runtimeRepo,
       workerHealth: rustKernelHealth,
+      getRouting,
       config: poolSchedulerConfig(),
     })
     setPool(poolScheduler)
@@ -727,11 +808,15 @@ export function createRoutingRuntime(ctx) {
       onProxyFailure: (vmId, reason) => {
         ctx.proxyPool.reportRuntimeFailure(vmId, reason)
       },
-      onFablePlanDenied: ({ selected }) => {
+      onFablePlanDenied: ({ selected, policy }) => {
         const accountId = selected?.accountId
         if (accountId && selected?.model) {
           try {
-            ctx.accountQuota.markModelUnsupported(accountId, selected.model)
+            if (policy?.reason === 'fable_credits_required') {
+              ctx.accountQuota.markFableCreditsRequired(accountId, selected.model)
+            } else {
+              ctx.accountQuota.markModelUnsupported(accountId, selected.model)
+            }
           } catch {}
         }
       },
@@ -739,13 +824,8 @@ export function createRoutingRuntime(ctx) {
         const accountId = selected?.accountId
         if (accountId) {
           try {
-            ctx.accountQuota.setAccountTier(accountId, 'max')
+            // Model access is not subscription evidence (Pro may also have it).
             ctx.accountQuota.clearModelUnsupported(accountId, model)
-          } catch {}
-        }
-        if (selected?.vmId) {
-          try {
-            persistAccountTier(ctx.cfg.paths.project, selected.vmId, 'max')
           } catch {}
         }
       },

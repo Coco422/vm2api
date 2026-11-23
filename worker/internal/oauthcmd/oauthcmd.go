@@ -68,6 +68,12 @@ func Run(args []string, stdin io.Reader, stdout io.Writer) int {
 		return writeAndReturn(stdout, errorEnvelope(0, code, errorMessage(code)), 0)
 	}
 
+	// Cookie import's browser stage: Chrome-transport organizations + authorize,
+	// before any credential or token client exists.
+	if op == "session-code" {
+		return runSessionCode(cfg, stdin, stdout)
+	}
+
 	httpClient, err := oauthHTTPClient(cfg)
 	if err != nil {
 		code := classifyError(err)
@@ -75,10 +81,11 @@ func Run(args []string, stdin io.Reader, stdout io.Writer) int {
 	}
 	store := credential.NewStore(cfg.CredentialPath)
 	refresher := &kinoauth.Refresher{
-		Store:    store,
-		Client:   httpClient,
-		TokenURL: cfg.OAuthTokenURL,
-		Skew:     cfg.RefreshSkew,
+		Store:     store,
+		Client:    httpClient,
+		TokenURL:  cfg.OAuthTokenURL,
+		Skew:      cfg.RefreshSkew,
+		OnAttempt: func(attempt kinoauth.Attempt) { _ = json.NewEncoder(stdout).Encode(attempt) },
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 	defer cancel()
@@ -182,7 +189,7 @@ func parseArgs(args []string) (string, string, bool, bool) {
 
 func validateOperation(op string) error {
 	switch op {
-	case "refresh", "usage", "profile", "models", "count-tokens", "reset-status", "reset-redeem":
+	case "refresh", "usage", "profile", "models", "count-tokens", "reset-status", "reset-redeem", "session-code":
 		return nil
 	default:
 		return fmt.Errorf("unknown oauth operation %q", op)
@@ -206,19 +213,17 @@ func requestHeaders(cfg config.Config, op string) map[string]string {
 }
 
 func userAgent(cfg config.Config) string {
-	for key, value := range cfg.Telemetry.Headers {
-		if strings.EqualFold(strings.TrimSpace(key), "user-agent") && strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
-		}
+	if value := strings.TrimSpace(cfg.OAuthUserAgent); value != "" {
+		return value
 	}
-	if version := strings.TrimSpace(cfg.Telemetry.Identity.CLIVersion); version != "" {
+	if version := strings.TrimSpace(cfg.CLIVersion); version != "" {
 		return "claude-cli/" + version + " (external, cli)"
 	}
 	return "claude-cli/2.1.293 (external, cli)"
 }
 
 func claudeResetUserAgent(cfg config.Config) string {
-	version := strings.TrimSpace(cfg.Telemetry.Identity.CLIVersion)
+	version := strings.TrimSpace(cfg.CLIVersion)
 	if version == "" {
 		version = "2.1.293"
 	}
@@ -359,6 +364,7 @@ func classifyError(err error) string {
 	lower := strings.ToLower(err.Error())
 	switch {
 	case strings.Contains(lower, "proxy required"),
+		strings.Contains(lower, "proxy is required"),
 		strings.Contains(lower, "socks"):
 		return "proxy_required"
 	case strings.Contains(lower, "upstream transport"),

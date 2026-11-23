@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { lazy, Suspense, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { VIEW_TITLES } from '@/config/nav'
 import type { ApiKeyItem } from '@/types/panel-keys'
@@ -23,13 +23,14 @@ import { PageHeader } from '@/components/page-header'
 import { TableSkeleton } from '@/components/page-skeletons'
 import { QueryGate } from '@/components/query-gate'
 import { StatusMark } from '@/components/status-mark'
+import { apiEndpointsQueryOptions } from '@/features/api-endpoints/queries'
 import { meQueryOptions } from '@/features/auth/queries'
 import { apiKeysQueryOptions } from '@/features/keys/queries'
-import { usersQueryOptions } from '@/features/users/queries'
 import { vmsListQueryOptions } from '@/features/vm/queries'
 import {
   keyExpiryText,
   keyIsDead,
+  keyModelsText,
   keyQuotaLabel,
   keyQuotaPct,
   keyStatusTone,
@@ -39,24 +40,35 @@ import {
 import { KeyLimitsDialog } from './key-limits-dialog'
 import { keyLimitsPayload, type KeyLimitsDraft } from './key-payload'
 import { KeyRevealDialog, type RevealedKey } from './key-reveal-dialog'
-import { KeyStatsDialog } from './key-stats-dialog'
 import { VmPoolsCard, vmPoolsQueryOptions } from './vm-pools-card'
+
+// 统计弹窗带 recharts（约 100 KB gzip），只在点开时加载。
+const KeyStatsDialog = lazy(() =>
+  import('./key-stats-dialog').then((m) => ({ default: m.KeyStatsDialog }))
+)
 
 export function KeysPage() {
   const qc = useQueryClient()
   const q = useQuery(apiKeysQueryOptions())
   const me = useQuery(meQueryOptions())
   const isAdmin = me.data?.role === 'admin'
-  const users = useQuery({ ...usersQueryOptions(), enabled: isAdmin })
+  const canManageKeys = isAdmin || me.data?.role === 'user'
   const pools = useQuery({ ...vmPoolsQueryOptions(), enabled: isAdmin })
   const vms = useQuery(vmsListQueryOptions())
   const vmItems = vms.data?.items || []
   const [createOpen, setCreateOpen] = useState(false)
   const [editId, setEditId] = useState('')
   const [statsId, setStatsId] = useState('')
+  // 首次打开后保持挂载，关闭动画照常播放。
+  const [statsOpened, setStatsOpened] = useState(false)
+  if (statsId && !statsOpened) setStatsOpened(true)
   const [rotateId, setRotateId] = useState('')
   const [revealed, setRevealed] = useState<RevealedKey | null>(null)
   const [delId, setDelId] = useState('')
+  const channels = useQuery({
+    ...apiEndpointsQueryOptions(),
+    enabled: isAdmin && (createOpen || !!editId),
+  })
   const keys = q.data?.keys || []
   const editing = keys.find((k) => k.id === editId) || null
   const rotating = keys.find((k) => k.id === rotateId) || null
@@ -91,7 +103,7 @@ export function KeysPage() {
         body: JSON.stringify(keyLimitsPayload(draft, 'edit', { isAdmin })),
       }),
     onSuccess: async () => {
-      toast.success('并发已更新')
+      toast.success('密钥已更新')
       setEditId('')
       await refresh()
     },
@@ -200,7 +212,7 @@ export function KeysPage() {
       title={VIEW_TITLES.keys}
       description='发给客户端的 sk-vm- 密钥。请求走这张密钥，不要把主控密钥写进环境变量。'
       extra={
-        isAdmin ? (
+        canManageKeys ? (
           <Button onClick={() => setCreateOpen(true)}>生成</Button>
         ) : undefined
       }
@@ -214,8 +226,8 @@ export function KeysPage() {
         {keys.length === 0 ? (
           <EmptyState
             reason='尚无密钥。协议密钥只能调 /v1。'
-            actionLabel={isAdmin ? '生成' : undefined}
-            onAction={isAdmin ? () => setCreateOpen(true) : undefined}
+            actionLabel={canManageKeys ? '生成' : undefined}
+            onAction={canManageKeys ? () => setCreateOpen(true) : undefined}
           />
         ) : (
           <Table>
@@ -236,7 +248,8 @@ export function KeysPage() {
                 <KeyRow
                   key={k.id}
                   item={k}
-                  canManage={isAdmin}
+                  canManage={canManageKeys}
+                  canResetQuota={isAdmin}
                   busy={
                     toggle.isPending ||
                     resetQuota.isPending ||
@@ -264,24 +277,34 @@ export function KeysPage() {
       </QueryGate>
       <KeyLimitsDialog
         mode='create'
+        isAdmin={isAdmin}
         open={createOpen}
         onOpenChange={setCreateOpen}
         pending={create.isPending}
         vms={vmItems}
+        vmsReady={vms.isSuccess && !vms.isFetching}
+        vmsError={vms.isError}
         pools={isAdmin ? pools.data?.pools || [] : undefined}
-        users={isAdmin ? users.data?.items || [] : undefined}
+        channels={isAdmin ? channels.data?.items || [] : undefined}
+        channelsLoading={channels.isPending}
+        channelsError={channels.isError}
         onSubmit={(draft) => create.mutate(draft)}
       />
       <KeyLimitsDialog
         mode='edit'
+        isAdmin={isAdmin}
         open={!!editId}
         onOpenChange={(open) => {
           if (!open) setEditId('')
         }}
         initial={editing}
         vms={vmItems}
+        vmsReady={vms.isSuccess && !vms.isFetching}
+        vmsError={vms.isError}
         pools={isAdmin ? pools.data?.pools || [] : undefined}
-        users={isAdmin ? users.data?.items || [] : undefined}
+        channels={isAdmin ? channels.data?.items || [] : undefined}
+        channelsLoading={channels.isPending}
+        channelsError={channels.isError}
         pending={edit.isPending}
         onSubmit={(draft) => {
           if (!editId) return
@@ -289,18 +312,22 @@ export function KeysPage() {
         }}
       />
       <KeyRevealDialog value={revealed} onClose={() => setRevealed(null)} />
-      <KeyStatsDialog
-        item={keys.find((k) => k.id === statsId) || null}
-        vms={vmItems}
-        onOpenChange={(open) => {
-          if (!open) setStatsId('')
-        }}
-      />
+      {statsOpened ? (
+        <Suspense fallback={null}>
+          <KeyStatsDialog
+            item={keys.find((k) => k.id === statsId) || null}
+            vms={vmItems}
+            onOpenChange={(open) => {
+              if (!open) setStatsId('')
+            }}
+          />
+        </Suspense>
+      ) : null}
       <ConfirmDialog
         open={!!rotateId}
         onOpenChange={() => setRotateId('')}
         title='换新密钥'
-        desc={`${rotating?.name || rotateId} · 这条密钥建库时只留了哈希，明文取不回来。换新会立刻让旧值失效（客户端会收到 401），名称 / 分类 / 并发 / 额度 / 统计都保留。`}
+        desc={`${rotating?.name || rotateId} · 换新会立刻让旧值失效（客户端会收到 401），请更新客户端密钥。名称 / 分类 / 并发 / 额度 / 统计都保留。`}
         confirmText='换新'
         cancelBtnText='取消'
         isLoading={rotate.isPending}
@@ -312,7 +339,7 @@ export function KeysPage() {
         open={!!delId}
         onOpenChange={() => setDelId('')}
         title='删除密钥'
-        desc='删除后立即失效，客户端再用该 key 将收到 401。'
+        desc='删除后立即失效，客户端再用该 key 将收到 401。历史用量和计费记录保留。'
         confirmText='删除'
         cancelBtnText='取消'
         destructive
@@ -340,6 +367,7 @@ function draftName(payload: unknown): string | undefined {
 function KeyRow({
   item,
   canManage,
+  canResetQuota,
   busy,
   onView,
   onCopy,
@@ -352,6 +380,7 @@ function KeyRow({
 }: {
   item: ApiKeyItem
   canManage: boolean
+  canResetQuota: boolean
   busy: boolean
   onView: () => void
   onCopy: () => void
@@ -367,6 +396,7 @@ function KeyRow({
   const pct = keyQuotaPct(item)
   const conc = Number(item.max_concurrency || 0)
   const rpm = Number(item.rpm || 0)
+  const models = keyModelsText(item)
   return (
     <TableRow className={cn(keyIsDead(item) && 'bg-destructive/10')}>
       <TableCell>
@@ -426,6 +456,12 @@ function KeyRow({
       </TableCell>
       <TableCell className='text-xs'>
         {conc ? `${conc} 并发` : '并发不限'} · {rpm ? `RPM ${rpm}` : 'RPM 不限'}
+        <div
+          className={cn(!models.title && 'text-muted-foreground')}
+          title={models.title}
+        >
+          {models.text}
+        </div>
       </TableCell>
       <TableCell
         className={cn('text-xs', expiry.expired && 'text-destructive')}
@@ -438,6 +474,16 @@ function KeyRow({
         </Button>
         {canManage ? (
           <>
+            {item.revealable ? (
+              <Button
+                size='sm'
+                variant='ghost'
+                disabled={busy}
+                onClick={onRotate}
+              >
+                换新
+              </Button>
+            ) : null}
             <Button size='sm' variant='ghost' disabled={busy} onClick={onEdit}>
               编辑
             </Button>
@@ -449,9 +495,16 @@ function KeyRow({
             >
               {active ? '停用' : '启用'}
             </Button>
-            <Button size='sm' variant='ghost' disabled={busy} onClick={onReset}>
-              清零
-            </Button>
+            {canResetQuota ? (
+              <Button
+                size='sm'
+                variant='ghost'
+                disabled={busy}
+                onClick={onReset}
+              >
+                清零
+              </Button>
+            ) : null}
             <Button
               size='sm'
               variant='destructive'
@@ -468,6 +521,7 @@ function KeyRow({
 }
 
 function scopeText(item: ApiKeyItem): string {
+  if (item.group_type === 'gemini') return 'Gemini · CRAGAnti'
   if (item.vm_pool_id) return `账号池 · ${item.vm_pool_name || item.vm_pool_id}`
   if (item.group_type === 'anthropic')
     return `Anthropic · ${item.allowed_vms?.length || 0} 台`

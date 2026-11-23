@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import {
+  cachePrefixSessionCountsForTest,
   clearCachePrefixSessions,
   confirmCachePrefix,
   describeCacheContinuity,
@@ -70,6 +71,29 @@ test('an idle session past the longest TTL starts over', () => {
   clearCachePrefixSessions()
   track('s', body('p', 'u1'), 0)
   assert.deepEqual(track('s', body('other', 'u1'), 60 * 60_000), { turn: 1, break: null })
+})
+
+test('idle snapshots are dropped on the next write, not kept until the size limit', () => {
+  clearCachePrefixSessions()
+  track('old', body('p', 'u1'), 0)
+  track('recent', body('p', 'u1'), 30 * 60_000)
+  track('new', body('p', 'u1'), 60 * 60_000 + 1)
+  // `old` is past the longest cache TTL; its image floor lasts a day.
+  assert.deepEqual(cachePrefixSessionCountsForTest(), { sessions: 2, images: 3 })
+  track('later', body('p', 'u1'), 24 * 60 * 60_000 + 1)
+  assert.deepEqual(cachePrefixSessionCountsForTest(), { sessions: 1, images: 3 })
+  track('next day', body('p', 'u1'), 25 * 60 * 60_000 + 1)
+  assert.deepEqual(cachePrefixSessionCountsForTest(), { sessions: 1, images: 2 })
+})
+
+test('a session written again is not swept by its first write time', () => {
+  clearCachePrefixSessions()
+  track('a', body('p', 'u1'), 0)
+  track('b', body('p', 'u1'), 10 * 60_000)
+  track('a', body('p', 'u1', 'a1', 'u2'), 50 * 60_000)
+  track('c', body('p', 'u1'), 70 * 60_000)
+  assert.equal(cachePrefixSessionCountsForTest().sessions, 2)
+  assert.deepEqual(track('a', body('p', 'u1', 'a1', 'u2', 'a2', 'u3'), 71 * 60_000), { turn: 3, break: null })
 })
 
 test('inbound to outbound image edits are classified without storing bytes', () => {
@@ -574,4 +598,112 @@ test('an anchor reads the newest entry an earlier turn wrote, not an unwritten u
   // User turns 4 and 6 were never a tail; 0 is the newest live entry before 7.
   const { anchor } = prepareCachePrefix('w', marked(history(12, { 2: 'x', 7: 'y' })), 2)
   assert.equal(anchor, 0)
+})
+
+test('persona Environment injection does not break the prefix when each turn ends with a caller reminder', async () => {
+  const { applyCrsUnofficialPersona } = await import('../../src/lib/identity/crs-persona.mjs')
+  const { prepareCliHopBody } = await import('../../src/lib/protocol/outbound-attempt.mjs')
+  clearCachePrefixSessions()
+  const model = 'claude-opus-5-5'
+  const history = []
+  for (let turn = 0; turn < 3; turn++) {
+    // Claude Code resends its own trailing role=system reminder, never the gateway's Environment.
+    history.push({ role: 'user', content: [{ type: 'text', text: `question ${turn}` }] })
+    history.push({
+      role: 'system',
+      content: [{ type: 'text', text: `<total_tokens>${1000 - turn} tokens left</total_tokens>` }],
+    })
+    const rendered = applyCrsUnofficialPersona(
+      { model, system: 'caller rules', messages: structuredClone(history) },
+      { forceConfigured: true, mode: 'official_full', model },
+    )
+    const wire = prepareCliHopBody(rendered, { stream: true, personaPreset: 'official_full' })
+    const { break: br } = prepareCachePrefix('acct:persona-env', wire, turn)
+    assert.equal(br, null, `turn ${turn} broke at messages[${br?.index}] ${br?.diff?.reason}`)
+    confirmCachePrefix('acct:persona-env', turn)
+    history.push({ role: 'assistant', content: [{ type: 'text', text: `answer ${turn}` }] })
+  }
+})
+
+test('the continuity diagnostic reuses the request body digests (#1497)', async () => {
+  const { createRequestBodyContext, requestBodyContextStats, resetRequestBodyContextStats } = await import(
+    '../../src/lib/protocol/request-body-context.mjs'
+  )
+  const inbound = body('you are a cli', 'turn one', 'answer one', 'turn two')
+  // The outbound body shares the untouched messages and rewrites the system
+  // block, which is what the gateway's persona injection does.
+  const outbound = { ...inbound, system: [{ type: 'text', text: 'you are claude code' }] }
+
+  const misses = () => requestBodyContextStats.valueDigestMisses + requestBodyContextStats.messageIdentityMisses
+  // Without a context `snapshotBody` hashes directly and the counters never see
+  // it, so the only meaningful probe is whether the work routes through the
+  // context and whether a second pass over the same bodies is free.
+  const ctx = createRequestBodyContext(inbound)
+  resetRequestBodyContextStats()
+  firstHistoryDiff(inbound, outbound, { ctx })
+  const cold = misses()
+  resetRequestBodyContextStats()
+  firstHistoryDiff(inbound, outbound, { ctx })
+  const warm = misses()
+  assert.ok(cold > 0, 'the diagnostic must hash through the request context')
+  // Not zero: the context memoizes the tools/system digests and each message's
+  // identity, while `messageRecord`'s part and valueStamp digests are rebuilt.
+  assert.ok(warm < cold, `a second pass must reuse the warmed digests, saw ${warm} of ${cold}`)
+  resetRequestBodyContextStats()
+})
+
+test('passing a body context never changes the reported break (#1497)', async () => {
+  const { createRequestBodyContext } = await import('../../src/lib/protocol/request-body-context.mjs')
+  const base = body('you are a cli', 'turn one', 'answer one', 'turn two')
+  const shapes = {
+    identical: { ...base },
+    system: { ...base, system: [{ type: 'text', text: 'rewritten' }] },
+    tools: { ...base, tools: [{ name: 'Read' }, { name: 'Write' }] },
+    'message text': { ...base, messages: base.messages.map((m, i) => (i ? m : { ...m, content: 'edited' })) },
+    'message count': { ...base, messages: base.messages.slice(0, 2) },
+    'message structure': {
+      ...base,
+      messages: base.messages.map((m, i) => (i ? m : { ...m, content: [{ type: 'text', text: 'turn one' }] })),
+    },
+    'tools and system': { ...base, tools: [{ name: 'Bash' }], system: [{ type: 'text', text: 'rewritten' }] },
+  }
+  for (const [label, outbound] of Object.entries(shapes)) {
+    const ctx = createRequestBodyContext(base)
+    assert.deepEqual(firstHistoryDiff(base, outbound, { ctx }), firstHistoryDiff(base, outbound), label)
+  }
+})
+
+test('a candidate without this session is answered without snapshotting the body (#1496)', () => {
+  clearCachePrefixSessions()
+  // Scheduling asks this for every candidate account. Only the one holding the
+  // session has a previous turn to compare against; for the rest the snapshot is
+  // built and then dropped, so the cost scaled with candidates x body size.
+  let reads = 0
+  const counted = {
+    model: 'claude-sonnet-5-5',
+    get tools() {
+      reads++
+      return [{ name: 'Read' }]
+    },
+    get system() {
+      reads++
+      return [{ type: 'text', text: 'you are a cli' }]
+    },
+    get messages() {
+      reads++
+      return [{ role: 'user', content: 'x'.repeat(4096) }]
+    },
+  }
+  const cold = peekCachePrefix('no-such-account:sess-1', counted, 1)
+  assert.deepEqual(cold, { turn: 1, break: null, confirmed: false, intercept: null })
+  assert.equal(reads, 0, 'nothing may read the body when there is no previous turn to compare')
+
+  // The account that does hold the session still gets the real comparison.
+  const warm = body('you are a cli', 'first')
+  prepareCachePrefix('holder:sess-1', warm, 1)
+  confirmCachePrefix('holder:sess-1', 1)
+  const second = peekCachePrefix('holder:sess-1', body('you are a cli', 'first', 'reply', 'again'), 2)
+  assert.equal(second.turn, 2)
+  assert.equal(second.confirmed, true)
+  assert.equal(second.break, null)
 })

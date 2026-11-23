@@ -168,7 +168,7 @@ class Recovery(unittest.TestCase):
             result=exporter.snapshot(config,archive)
         verify_bundle(archive,'worker23')
         self.assertEqual(result['recovery_links'],{str(link):'../archive/cert1.pem'})
-        self.assertIn('rootfs/'+str(cert).lstrip('/'),result['files']);self.assertNotIn('rootfs/'+str(link).lstrip('/'),result['files'])
+        self.assertIn('rootfs/'+str(cert.resolve()).lstrip('/'),result['files']);self.assertNotIn('rootfs/'+str(link).lstrip('/'),result['files'])
         with tarfile.open(archive) as tar:self.assertFalse(any(x.issym() for x in tar))
 
     def test_transport_start_failure_releases_handshake_capacity(self):

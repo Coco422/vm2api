@@ -15,7 +15,7 @@ type AuthState = {
   me: MeResponse | null
   setMe: (me: MeResponse | null) => void
   signIn: (token: string, user: string) => void
-  signOut: () => void
+  signOut: (options?: { localOnly?: boolean }) => void
 }
 
 export const useAuthStore = create<AuthState>()((set) => ({
@@ -31,8 +31,8 @@ export const useAuthStore = create<AuthState>()((set) => ({
     setSession(token, user)
     set({ token, user, me: null })
   },
-  signOut: () => {
-    logoutRequest()
+  signOut: (options) => {
+    if (!options?.localOnly) logoutRequest()
     clearSession()
     set({ token: '', user: '', me: null })
   },

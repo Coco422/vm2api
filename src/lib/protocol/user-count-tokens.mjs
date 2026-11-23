@@ -3,9 +3,10 @@
  * Peek only — never bind/unbind sticky or bill tokens_in.
  */
 import { makeError, mapUpstreamError, rewritePoolErrorForClient, ErrorType, ErrorCode } from '../core/errors.mjs'
-import { refusalGuardPolicy } from '../core/refusal-guard.mjs'
+import { refusalAuditIdentity, refusalGuardPolicy, riskPrincipal } from '../core/refusal-guard.mjs'
 import { RefusalGuardsRepo } from '../db/repos/refusal-guards-repo.mjs'
 import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.mjs'
+import { RefusalSessionBlocksRepo } from '../db/repos/refusal-session-blocks-repo.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { findAccount } from '../admin/panel-api.mjs'
 import { readJevConfig, scopeAccountFromVm } from './jev-intercept.mjs'
@@ -30,21 +31,13 @@ import { apiKeyBetaHeader, setupTokenBetaHeader } from './claude-code-betas.mjs'
 import { listQuotaFromHeaders, publicUsageWindow, usageWindowsEmpty } from '../pool/quota-window.mjs'
 import { ownerScopeFromRequest, vmMatchesOwnerScope } from '../admin/resource-owner.mjs'
 import { keyAllowsVm, keyScopeFromRequest, vmPoolDenial } from '../admin/key-scope.mjs'
+import { keyModelError } from '../admin/key-models.mjs'
 import { getVm, listVms } from '../vm/vm-registry.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { summarizeCodexSlot } from '../vm/codex-slot.mjs'
 import { pickCodexSlots } from '../pool/codex-slot-pool.mjs'
 import { detectInboundPlatform } from './platform-detect.mjs'
 import { resolveInboundIdentity } from '../identity/identity-rewrite.mjs'
-export function countTokensUnsupportedError() {
-  return makeError({
-    type: ErrorType.INVALID_REQUEST,
-    code: ErrorCode.COUNT_TOKENS_UNSUPPORTED,
-    message: 'count_tokens 只支持 Setup Token / Console API Key，OAuth 请用 GET /v1/usage',
-    status: 400,
-  })
-}
-
 export function usageUnsupportedError() {
   return makeError({
     type: ErrorType.INVALID_REQUEST,
@@ -215,6 +208,15 @@ function deviceRepo(deps) {
   }
 }
 
+function sessionRepo(deps) {
+  if (deps.refusalSessions) return deps.refusalSessions
+  try {
+    return new RefusalSessionBlocksRepo()
+  } catch {
+    return null
+  }
+}
+
 /** Distill, hard regex, refusal cache, and jev. `wait` means the slot is required before a verdict. */
 export async function blockCountTokensBeforeHop(req, inbound, deps = {}) {
   let jev
@@ -228,23 +230,21 @@ export async function blockCountTokensBeforeHop(req, inbound, deps = {}) {
     inbound,
     body: inbound,
     headers: req?.headers,
+    identity: refusalAuditIdentity({
+      inbound: deps.rawInbound || inbound,
+      headers: req?.headers,
+      principal: riskPrincipal(req),
+    }),
     ...distillContext(req, inbound),
     distillRules: deps.cfg?.distill,
     policy: refusalPolicy(deps),
     jev,
     repo: refusalRepo(deps),
     devices: deviceRepo(deps),
+    sessions: sessionRepo(deps),
     account: deps.account || null,
   })
-  let wait = false
-  if (decision?.action !== 'block' && decision?.intercept) {
-    try {
-      wait = JSON.parse(decision.intercept).by === 'scope-wait'
-    } catch {
-      wait = false
-    }
-  }
-  return { error: decision?.action === 'block' ? decision.error : null, wait }
+  return { error: decision?.action === 'block' ? decision.error : null, wait: decision.wait === true }
 }
 
 export async function handleUserCountTokens(req, res, deps) {
@@ -268,6 +268,8 @@ export async function handleUserCountTokens(req, res, deps) {
   }
   const parsed = parseCountTokensBody(inbound)
   if (!parsed.ok) return json(res, parsed.error.status, parsed.error.body)
+  const modelDenied = keyModelError(req, parsed.body.model, { anthropic: true })
+  if (modelDenied) return json(res, modelDenied.status, modelDenied.body)
   const routing = typeof deps.getRoutingConfig === 'function' ? deps.getRoutingConfig() : null
   if (
     claudeCodeOnlyFromRouting(routing) &&
@@ -277,7 +279,7 @@ export async function handleUserCountTokens(req, res, deps) {
     const err = claudeCodeOnlyError()
     return json(res, err.status, err.body)
   }
-  const gate = await blockCountTokensBeforeHop(req, parsed.body, deps)
+  const gate = await blockCountTokensBeforeHop(req, parsed.body, { ...deps, rawInbound: inbound })
   if (gate?.error) return json(res, gate.error.status, gate.error.body)
   const peeked = await peekCurrentAccount({
     poolScheduler: typeof deps.getPoolScheduler === 'function' ? deps.getPoolScheduler() : deps.poolScheduler,
@@ -291,6 +293,7 @@ export async function handleUserCountTokens(req, res, deps) {
   if (gate.wait) {
     const again = await blockCountTokensBeforeHop(req, parsed.body, {
       ...deps,
+      rawInbound: inbound,
       account: scopeAccountFromVm(peeked.vm, findAccount(deps.accountQuota, peeked.vm)?.unified),
     })
     if (again?.error) return json(res, again.error.status, again.error.body)

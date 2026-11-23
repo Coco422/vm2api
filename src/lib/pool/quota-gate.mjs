@@ -41,13 +41,19 @@ export function gateOvershootOf(quota = {}) {
 }
 
 /** `{ band, overshoot }` from a `routing.quota` block (or a policy carrying the same keys). */
-export function quotaGateOf(quota = {}) {
-  return { band: criticalBandOf(quota), overshoot: gateOvershootOf(quota) }
+export function quotaGateOf(quota = {}, window = null) {
+  const exact = window != null && quota[`tenant_exact_${window}`] === true
+  return { band: criticalBandOf(quota), overshoot: exact ? 0 : gateOvershootOf(quota) }
 }
 
 /** Gate keys to stamp onto a tier policy so evaluateAccount sees the configured band/overshoot. */
 export function gatePolicyFields(quota = {}) {
-  return { critical_band: criticalBandOf(quota), gate_overshoot: gateOvershootOf(quota) }
+  return {
+    critical_band: criticalBandOf(quota),
+    gate_overshoot: gateOvershootOf(quota),
+    ...(quota.tenant_exact_5h === true ? { tenant_exact_5h: true } : {}),
+    ...(quota.tenant_exact_7d === true ? { tenant_exact_7d: true } : {}),
+  }
 }
 
 /** Float slack: 0.8 + 0.05 is 0.8500000000000001, and a reading of exactly 85% must gate. */

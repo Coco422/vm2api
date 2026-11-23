@@ -276,6 +276,7 @@ test('API OpenAI replies converted to non-streaming Anthropic retain disjoint hi
           actual_cost: 0.2,
         },
       ])
+      db.prepare(`UPDATE vms SET owner_user_id = 'u1' WHERE id = 'vm-a'`).run()
       const stored = db.prepare('SELECT * FROM usage_logs').all()
       assert.equal(stored[0].input_tokens, 20 - cacheWrite)
       assert.equal(stored[0].cache_read_tokens, 80)
@@ -327,6 +328,7 @@ test('mixed-provider cache rates weight each row by prompt tokens for every scop
       // Outside the current window: must not change its denominator.
       { ...shared, created_at: '2026-04-30T23:59:59.000Z', cache_creation_tokens: 10_000 },
     ])
+    db.prepare(`UPDATE vms SET owner_user_id = 'u1' WHERE id = 'vm-a'`).run()
     const repo = new StatisticsRepo(db)
     const options = { range: 'today', tz: 'UTC', now }
     const expected = 480 / 1100
@@ -349,15 +351,33 @@ test('mixed-provider cache rates weight each row by prompt tokens for every scop
   }
 })
 
-test('panel routes owner-scope statistics for users and reject user/vm groupings', async () => {
+test('panel routes expose the global user leaderboard and keep private statistics scoped', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-stats-route-'))
   const db = openDatabase({ dbPath: path.join(dir, 'panel.db') })
   try {
     seedUsers(db)
     const at = new Date(Date.now() - 1000).toISOString()
     seed(db, [
-      { created_at: at, user_id: 'u1', api_key_id: 'k1', total_cost: 1 },
-      { created_at: at, user_id: 'u2', api_key_id: 'k2', total_cost: 7 },
+      {
+        created_at: at,
+        user_id: 'u1',
+        api_key_id: 'k1',
+        vm_id: 'vm-a',
+        input_tokens: 11,
+        total_cost: 1,
+        actual_cost: 9,
+        outbound_session_id: 'own-session',
+      },
+      {
+        created_at: at,
+        user_id: 'u2',
+        api_key_id: 'k2',
+        vm_id: 'vm-a',
+        input_tokens: 29,
+        total_cost: 7,
+        actual_cost: 0.7,
+        outbound_session_id: 'foreign-session',
+      },
     ])
     const call = async (role, url) => {
       const response = {}
@@ -379,7 +399,9 @@ test('panel routes owner-scope statistics for users and reject user/vm groupings
       return response
     }
     assert.equal((await call('user', '/api/panel/statistics?dimension=user')).status, 400)
-    assert.equal((await call('user', '/api/panel/statistics/leaderboard?scope=vm')).status, 400)
+    assert.equal((await call('user', '/api/panel/statistics/leaderboard?scope=user')).status, 400)
+    const vmBoard = await call('user', '/api/panel/statistics/leaderboard?scope=vm')
+    assert.equal(vmBoard.status, 400)
     assert.equal((await call('admin', '/api/panel/statistics?range=never')).status, 400)
 
     const mine = await call('user', '/api/panel/statistics/leaderboard?scope=key&range=today&user_id=u2')
@@ -388,9 +410,141 @@ test('panel routes owner-scope statistics for users and reject user/vm groupings
       mine.body.data.entries.map((e) => e.id),
       ['k1'],
     )
+    const personal = await call('user', '/api/panel/statistics?dimension=model&user_id=u2')
+    assert.equal(personal.body.data.totals.cost, 1)
+
+    const global = await call('user', '/api/panel/statistics?visibility=global&dimension=model&user_id=u2')
+    assert.equal(global.status, 200)
+    assert.equal(global.body.data.totals.cost, 8)
+    assert.equal(global.body.data.totals.requests, 2)
+    assert.doesNotMatch(JSON.stringify(global.body), /alice|bob|u1|u2|k1|k2|vm-a|own-session|foreign-session/)
+    const globalBoard = await call('user', '/api/panel/statistics/leaderboard?visibility=global&scope=model')
+    assert.equal(globalBoard.status, 200)
+    assert.equal(globalBoard.body.data.entries[0].totalCost, 8)
+    assert.doesNotMatch(JSON.stringify(globalBoard.body), /alice|bob|u1|u2|k1|k2|vm-a|own-session|foreign-session/)
+    const userBoard = await call('user', '/api/panel/statistics/leaderboard?visibility=global&scope=user&user_id=u1')
+    assert.equal(userBoard.status, 200)
+    assert.deepEqual(
+      userBoard.body.data.entries.map(({ id, name, totalCost, totalTokens }) => [id, name, totalCost, totalTokens]),
+      [
+        ['rank-1', 'bob', 7, 29],
+        ['rank-2', 'alice', 1, 11],
+      ],
+    )
+    assert.doesNotMatch(JSON.stringify(userBoard.body), /u1|u2|k1|k2|vm-a|own-session|foreign-session|[ab]@x/)
+    for (const dimension of ['user', 'key', 'vm']) {
+      assert.equal((await call('user', `/api/panel/statistics?visibility=global&dimension=${dimension}`)).status, 400)
+    }
+    for (const scope of ['key', 'vm']) {
+      assert.equal(
+        (await call('user', `/api/panel/statistics/leaderboard?visibility=global&scope=${scope}`)).status,
+        400,
+      )
+    }
+    const overview = await call('user', '/api/panel/usage-logs/overview?tz=UTC')
+    const globalOverview = await call('user', '/api/panel/usage-logs/overview?visibility=global&tz=UTC')
+    assert.equal(overview.status, 200)
+    assert.equal(globalOverview.status, 200)
+    assert.equal(overview.body.data.todayCost, 1)
+    assert.equal(globalOverview.body.data.todayCost, 8)
+    assert.equal(overview.body.data.activeSessions, 1)
+    assert.equal(globalOverview.body.data.activeSessions, 2)
+    assert.doesNotMatch(JSON.stringify(globalOverview.body), /alice|bob|u1|u2|k1|k2|vm-a/)
+
+    // Global visibility cannot turn log details, filters or session lists into global queries.
+    const privateOptions = await call('user', '/api/panel/usage-logs/filter-options?visibility=global&user_id=u2')
+    assert.equal(privateOptions.status, 200)
+    assert.doesNotMatch(JSON.stringify(privateOptions.body), /bob|u2|k2/)
+    const privateLogs = await call('user', '/api/panel/usage-logs?visibility=global&user_id=u2')
+    assert.equal(privateLogs.status, 200)
+    assert.doesNotMatch(JSON.stringify(privateLogs.body), /bob|u2|k2/)
+    for (const endpoint of ['active-sessions', 'session-suggestions']) {
+      const sessions = await call('user', `/api/panel/usage-logs/${endpoint}?visibility=global&user_id=u2`)
+      assert.equal(sessions.status, 200)
+      assert.match(JSON.stringify(sessions.body), /own-session/)
+      assert.doesNotMatch(JSON.stringify(sessions.body), /bob|u2|k2|foreign-session/)
+    }
     const all = await call('admin', '/api/panel/statistics?dimension=user&range=today')
     assert.equal(all.status, 200)
     assert.equal(all.body.data.totals.cost, 8)
+
+    const adminBoard = await call('admin', '/api/panel/statistics/leaderboard?scope=user')
+    assert.deepEqual(
+      adminBoard.body.data.entries.map((entry) => entry.id),
+      ['u2', 'u1'],
+    )
+
+    db.prepare("INSERT INTO users (id, email, username, password_hash) VALUES ('legacy-id', 'legacy@x', '', 'x')").run()
+    seed(db, [{ created_at: at, user_id: 'legacy-id', total_cost: 0.1 }])
+    const legacy = await call('user', '/api/panel/statistics/leaderboard?visibility=global&scope=user')
+    assert.equal(legacy.body.data.entries.at(-1).name, '未知')
+    assert.doesNotMatch(JSON.stringify(legacy.body), /legacy-id|legacy@x/)
+  } finally {
+    closeDatabase()
+  }
+})
+
+test('tenant vm scope lists each owned slot and hides pool slots', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-stats-owned-'))
+  const db = openDatabase({ dbPath: path.join(dir, 'panel.db') })
+  try {
+    seedUsers(db)
+    db.exec(`
+      UPDATE vms SET owner_user_id = 'u1' WHERE id = 'vm-a';
+      INSERT INTO vms (id, name, vm_json, owner_user_id) VALUES
+        ('vm-idle', 'Idle', '{}', 'u1'),
+        ('vm-pool', 'Pool', '{}', NULL);
+    `)
+    const at = new Date(Date.now() - 1000).toISOString()
+    seed(db, [
+      {
+        created_at: at,
+        user_id: 'u1',
+        api_key_id: 'k1',
+        vm_id: 'vm-a',
+        total_cost: 3,
+        input_tokens: 10,
+        output_tokens: 4,
+        cache_read_tokens: 6,
+        cache_creation_tokens: 2,
+        cache_creation_5m_tokens: 1,
+        cache_creation_1h_tokens: 1,
+      },
+      {
+        created_at: at,
+        user_id: 'u1',
+        api_key_id: 'k1',
+        vm_id: 'vm-pool',
+        total_cost: 9,
+        input_tokens: 100,
+      },
+    ])
+    const repo = new StatisticsRepo(db)
+    const board = repo.leaderboard({ range: 'today', scope: 'vm', owner_user_id: 'u1', limit: 100 })
+    assert.deepEqual(
+      board.entries.map((entry) => entry.id),
+      ['vm-a', 'vm-idle'],
+    )
+    assert.equal(board.entries[0].name, 'Slot A')
+    assert.equal(board.entries[0].totalCost, 3)
+    assert.equal(board.entries[0].inputTokens, 10)
+    assert.equal(board.entries[0].outputTokens, 4)
+    assert.equal(board.entries[0].cacheReadTokens, 6)
+    assert.equal(board.entries[0].cacheCreationTokens, 2)
+    assert.equal(board.entries[0].cacheCreation5mTokens, 1)
+    assert.equal(board.entries[0].cacheCreation1hTokens, 1)
+    assert.equal(board.entries[0].totalTokens, 22)
+    assert.equal(board.entries[1].name, 'Idle')
+    assert.equal(board.entries[1].totalRequests, 0)
+    assert.equal(board.entries[1].totalCost, 0)
+    const chart = repo.statistics({ range: 'today', dimension: 'vm', owner_user_id: 'u1' })
+    assert.deepEqual(
+      chart.series.map((series) => series.id),
+      ['vm-a'],
+    )
+    assert.equal(chart.totals.cost, 12)
+    assert.equal(chart.totals.inputTokens, 110)
+    assert.equal(chart.totals.cacheCreation5mTokens, 1)
   } finally {
     closeDatabase()
   }

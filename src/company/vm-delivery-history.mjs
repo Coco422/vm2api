@@ -1,0 +1,55 @@
+// Server-only backfill. See docs/COMPANY_SUBSCRIPTIONS.md for evidence and scope.
+export const VM_DELIVERY_BATCHES = [
+  {
+    name: '第一批',
+    members: [
+      { vmId: 'vm-03', firstSuccessAt: '2026-10-31T08:16:14.894Z' },
+      { vmId: 'vm-04', firstSuccessAt: '2026-10-31T10:16:25.409Z' },
+      { vmId: 'vm-05', firstSuccessAt: '2026-10-31T15:34:26.191Z' },
+      { vmId: 'vm-06', firstSuccessAt: '2026-11-01T09:10:37.555Z', shutdownAt: '2026-11-18T04:15:17.684Z' },
+      { vmId: 'vm-07', firstSuccessAt: '2026-10-31T14:51:44.459Z' },
+      { vmId: 'vm-08', firstSuccessAt: '2026-10-31T08:57:23.513Z', shutdownAt: '2026-11-18T04:15:18.179Z' },
+      { vmId: 'vm-09', firstSuccessAt: '2026-10-31T08:58:03.069Z' },
+      { vmId: 'vm-10', firstSuccessAt: '2026-10-31T08:58:05.078Z' },
+      { vmId: 'vm-11', firstSuccessAt: '2026-10-31T08:58:40.514Z', confirmedStoppedBy: '2026-10-31T18:23:00.000Z' },
+      { vmId: 'vm-12', firstSuccessAt: '2026-10-31T09:02:13.580Z' },
+      { vmId: 'vm-13', firstSuccessAt: '2026-11-02T08:46:28.682Z' },
+    ],
+  },
+  {
+    name: '第二批',
+    members: [
+      { vmId: 'vm-2-02', firstSuccessAt: '2026-11-10T08:35:38.188Z' },
+      { vmId: 'vm-2-04', firstSuccessAt: '2026-11-10T09:13:13.152Z' },
+      { vmId: 'vm-2-05', firstSuccessAt: '2026-11-10T08:35:26.521Z' },
+      { vmId: 'vm-2-06', firstSuccessAt: '2026-11-10T12:12:48.089Z' },
+      { vmId: 'vm-2-07', firstSuccessAt: '2026-11-10T08:35:11.734Z' },
+      { vmId: 'vm-2-11', firstSuccessAt: '2026-11-10T07:10:11.566Z' },
+      { vmId: 'vm-2-12', firstSuccessAt: '2026-11-10T08:34:59.730Z' },
+      { vmId: 'vm-2-13', firstSuccessAt: '2026-11-10T09:44:34.894Z', shutdownAt: '2026-11-18T04:15:18.647Z' },
+      { vmId: 'vm-2-14', firstSuccessAt: '2026-11-10T07:44:17.353Z' },
+      { vmId: 'vm-2-22', firstSuccessAt: '2026-11-10T07:44:31.443Z' },
+    ],
+  },
+  {
+    name: '第三批',
+    members: [
+      { vmId: 'vm-2-15', firstSuccessAt: '2026-11-19T05:39:18.568Z' },
+      { vmId: 'vm-2-16', firstSuccessAt: '2026-11-19T05:39:21.666Z' },
+      { vmId: 'vm-2-17', firstSuccessAt: '2026-11-19T05:00:36.410Z' },
+      { vmId: 'vm-2-18', firstSuccessAt: '2026-11-19T05:39:27.659Z' },
+      { vmId: 'vm-2-19', firstSuccessAt: '2026-11-19T05:39:30.532Z' },
+      { vmId: 'vm-2-20', firstSuccessAt: '2026-11-19T05:39:33.646Z' },
+      { vmId: 'vm-2-21', firstSuccessAt: '2026-11-19T05:39:36.053Z' },
+      { vmId: 'vm-2-03', firstSuccessAt: '2026-11-19T05:39:38.854Z' },
+      { vmId: 'vm-2-08', firstSuccessAt: '2026-11-19T05:39:42.276Z' },
+      { vmId: 'vm-2-09', firstSuccessAt: '2026-11-19T05:39:46.334Z' },
+      { vmId: 'vm-2-01', firstSuccessAt: '2026-11-19T07:30:06.235Z' },
+      { vmId: 'vm-2-23', firstSuccessAt: '2026-11-19T07:43:31.315Z', shutdownAt: '2026-11-19T16:25:40.741Z' },
+    ],
+  },
+  {
+    name: '补机（11 月 20 日）',
+    members: [{ vmId: 'vm-2-25', firstSuccessAt: '2026-11-19T17:28:15.586Z' }],
+  },
+]

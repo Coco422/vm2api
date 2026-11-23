@@ -47,8 +47,8 @@ export function createSandboxPanel({ db, project, accountQuota, apiKeyStore, jso
   const requireAuth = (req, res) => {
     const session = verifyPanelSession(extractPanelToken(req))
     const user = session ? panelUsers.getByUsername(session.user) : null
-    if (!user || user.enabled === false || user.role !== 'admin') {
-      json(res, 401, { ok: false, error: { code: 'admin_required', message: '请登录本地测试管理员账号' } })
+    if (!user || user.enabled === false) {
+      json(res, 401, { ok: false, error: { code: 'panel_login_required', message: '请登录本地测试账号' } })
       return false
     }
     Object.assign(req, {
@@ -76,6 +76,7 @@ export function createSandboxPanel({ db, project, accountQuota, apiKeyStore, jso
   }
   const original = createPanelHandler(context)
   const runtime = createRoutingRuntime(context)
+  context.applyVmQuotaOverride = runtime.applyVmQuotaOverride
   const detail = async (id) =>
     buildVmDetail({
       ...context,
@@ -104,8 +105,9 @@ export function createSandboxPanel({ db, project, accountQuota, apiKeyStore, jso
         p === '/api/panel/logout' ||
         p === '/api/panel/users' ||
         p === '/api/panel/api-keys' ||
+        /^\/api\/panel\/vms\/[^/]+\/schedulable$/.test(p) ||
         /^\/api\/panel\/api-keys\/[^/]+\/(reveal|rotate|reset-quota)$/.test(p))) ||
-    (method === 'PATCH' && /^\/api\/panel\/(users\/[^/]+|api-keys\/[^/]+|vms\/[^/]+\/owner)$/.test(p)) ||
+    (method === 'PATCH' && /^\/api\/panel\/(me|users\/[^/]+|api-keys\/[^/]+|vms\/[^/]+\/(owner|quota-thresholds))$/.test(p)) ||
     (method === 'PUT' && p === '/api/panel/onboarding')
 
   return async (req, res, url) => {

@@ -299,14 +299,41 @@ test('overview splits today/yesterday-same-time in the requested zone', () => {
   seed(db, [
     { created_at: '2026-03-09T02:00:00.000Z', total_cost: 1 }, // yesterday 10:00 local
     { created_at: '2026-03-09T06:00:00.000Z', total_cost: 2 }, // yesterday 14:00 local, after same-time
-    { created_at: '2026-03-09T17:00:00.000Z', total_cost: 4, status: 500, error_code: 'upstream_error' },
-    { created_at: '2026-03-10T03:59:30.000Z', total_cost: 8, session_id: 's-live', outbound_session_id: 'out-live' },
+    {
+      created_at: '2026-03-09T17:00:00.000Z',
+      total_cost: 4,
+      status: 500,
+      error_code: 'upstream_error',
+      input_tokens: 10,
+      output_tokens: 4,
+      cache_read_tokens: 6,
+      cache_creation_tokens: 2,
+      cache_creation_5m_tokens: 2,
+    },
+    {
+      created_at: '2026-03-10T03:59:30.000Z',
+      total_cost: 8,
+      session_id: 's-live',
+      outbound_session_id: 'out-live',
+      input_tokens: 1,
+      output_tokens: 1,
+      cache_creation_tokens: 3,
+      cache_creation_1h_tokens: 3,
+    },
   ])
   const view = new UsageLogsView(db)
   const sh = view.overview({ tz: 'Asia/Shanghai', now })
   assert.equal(sh.todayRequests, 2)
   assert.equal(sh.todayCost, 12)
   assert.equal(sh.todayErrors, 1)
+  assert.equal(sh.todayInputTokens, 11)
+  assert.equal(sh.todayOutputTokens, 5)
+  assert.equal(sh.todayCacheReadTokens, 6)
+  assert.equal(sh.todayCacheCreationTokens, 5)
+  assert.equal(sh.todayCacheCreation5mTokens, 2)
+  assert.equal(sh.todayCacheCreation1hTokens, 3)
+  assert.equal(sh.todayTokens, 27)
+  assert.equal(sh.todayCacheHitRate, 6 / 22)
   assert.equal(sh.yesterdayRequests, 1)
   assert.equal(sh.yesterdayCost, 1)
   assert.equal(sh.rpm, 1)
@@ -317,7 +344,7 @@ test('overview splits today/yesterday-same-time in the requested zone', () => {
   assert.equal(utc.yesterdayRequests, 1)
 })
 
-test('active sessions and session suggestions group by outbound session, owner-scoped, newest first', () => {
+test('active sessions group by caller session, owner-scoped, newest first; suggestions stay per outbound session', () => {
   const db = freshDb()
   const now = Date.now()
   const iso = (ago) => new Date(now - ago).toISOString()
@@ -346,21 +373,18 @@ test('active sessions and session suggestions group by outbound session, owner-s
   ])
   const view = new UsageLogsView(db)
   const active = view.activeSessions({ owner_user_id: 'u1', now })
-  assert.equal(active.total, 2)
+  assert.equal(active.total, 1)
   assert.deepEqual(
     active.sessions.map((s) => [s.sessionId, s.clientSessionId, s.requests]),
-    [
-      ['abc-1b', 'client-1', 1],
-      ['abc-1', 'client-1', 2],
-    ],
+    [['client-1', 'client-1', 3]],
   )
-  assert.equal(active.sessions[1].lastStatus, 200)
-  assert.equal(active.sessions[1].keyName, 'alice-key')
-  assert.equal(view.activeSessions({ now }).total, 3)
+  assert.equal(active.sessions[0].lastStatus, 200)
+  assert.equal(active.sessions[0].keyName, 'alice-key')
+  assert.equal(view.activeSessions({ now }).total, 2)
   assert.deepEqual(view.sessionSuggestions({ q: 'abc', owner_user_id: 'u1' }), ['abc-1b', 'abc-1', 'abc-3'])
   assert.deepEqual(view.sessionSuggestions({ q: 'abc-2' }), ['abc-2'])
   assert.deepEqual(view.sessionSuggestions({ q: 'client' }), [])
-  assert.equal(view.overview({ now }).activeSessions, 3)
+  assert.equal(view.overview({ now }).activeSessions, 2)
 })
 
 test('active sessions never resolve the last row from another tenant sharing the session id', () => {
@@ -418,4 +442,29 @@ test('tenant error collection hides other users and anonymous ingress failures',
   const all = repo.windowStats().error_collection
   assert.equal(all.recent.length, 3)
   assert.deepEqual(all.ingress_hits.map((h) => h.ip).sort(), ['198.51.100.7', '203.0.113.9'])
+})
+
+test('active sessions flag one-off (single request, no tools) apart without merging, and list them last', () => {
+  const db = freshDb()
+  const now = Date.now()
+  const iso = (ago) => new Date(now - ago).toISOString()
+  seed(db, [
+    { created_at: iso(1_000), outbound_session_id: 'side-1', api_key_id: 'k1', has_tools: 0 },
+    { created_at: iso(2_000), outbound_session_id: 'side-2', api_key_id: 'k1', has_tools: 0 },
+    { created_at: iso(50_000), outbound_session_id: 'main-1', api_key_id: 'k1', has_tools: 1 },
+    { created_at: iso(40_000), outbound_session_id: 'two-1', api_key_id: 'k1', has_tools: 0 },
+    { created_at: iso(30_000), outbound_session_id: 'two-1', api_key_id: 'k1', has_tools: 0 },
+  ])
+  const active = new UsageLogsView(db).activeSessions({ now })
+  assert.equal(active.total, 4)
+  assert.equal(active.oneOffTotal, 2)
+  assert.deepEqual(
+    active.sessions.map((s) => [s.sessionId, s.oneOff]),
+    [
+      ['two-1', false],
+      ['main-1', false],
+      ['side-1', true],
+      ['side-2', true],
+    ],
+  )
 })

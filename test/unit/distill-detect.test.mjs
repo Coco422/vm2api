@@ -612,17 +612,17 @@ test('handleProtocol intercepts before credential hop', () => {
   assert.ok(early > 0 && early < codex)
   const before = src.indexOf("applyIntercept(cfg.intercept.rules, 'before_upstream'")
   const late = src.indexOf('await applyProtocolIntercept(', early + 1)
-  const api = src.indexOf("inferenceBackend === 'api'")
+  const apiHop = src.indexOf('picked: apiPicked')
   assert.ok(before > 0)
   assert.ok(late > before)
-  assert.ok(api > late)
+  assert.ok(apiHop > late)
   const guard = src.slice(
     src.indexOf('async function applyProtocolIntercept'),
     src.indexOf('function isZeroInjectMode'),
   )
   assert.ok(guard.includes('isProxiedOfficialClaudeCode'))
   const countSrc = fs.readFileSync(path.join(root, 'src/lib/protocol/user-count-tokens.mjs'), 'utf8')
-  const countGuard = countSrc.indexOf('blockCountTokensBeforeHop(req, parsed.body, deps)')
+  const countGuard = countSrc.indexOf('await blockCountTokensBeforeHop(req, parsed.body,')
   const countHop = countSrc.indexOf('countTokensViaWorker)(peeked.exec')
   assert.ok(countGuard > 0 && countHop > countGuard)
 })

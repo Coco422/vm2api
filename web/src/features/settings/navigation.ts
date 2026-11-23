@@ -10,8 +10,10 @@ import {
   Magnet,
   Network,
   PackageCheck,
+  Sparkles,
   RadioTower,
   ScrollText,
+  ShieldCheck,
   type LucideIcon,
 } from 'lucide-react'
 
@@ -20,8 +22,9 @@ export const SETTINGS_TABS = [
   ['pool', '账号池'],
   ['quota', '配额'],
   ['openai', 'OpenAI'],
-  ['logs', '日志'],
+  ['logs', '日志保留'],
   ['protocol', '协议'],
+  ['redaction', '脱敏'],
   ['init', '初装'],
   ['health', '探测'],
   ['notify', '通知'],
@@ -29,6 +32,7 @@ export const SETTINGS_TABS = [
   ['socks5', 'SOCKS5'],
   ['backup', '备份'],
   ['about', '关于'],
+  ['gemini', 'Gemini'],
 ] as const
 
 export type SettingsTabId = (typeof SETTINGS_TABS)[number][0]
@@ -52,7 +56,10 @@ export const SETTINGS_NAV_GROUPS: {
   },
   {
     label: '协议',
-    items: [{ id: 'protocol', icon: Fingerprint }],
+    items: [
+      { id: 'protocol', icon: Fingerprint },
+      { id: 'redaction', icon: ShieldCheck },
+    ],
   },
   {
     label: '槽位',
@@ -70,6 +77,7 @@ export const SETTINGS_NAV_GROUPS: {
       { id: 'logs', icon: ScrollText },
       { id: 'backup', icon: Archive },
       { id: 'about', icon: Info },
+      { id: 'gemini', icon: Sparkles },
     ],
   },
 ]

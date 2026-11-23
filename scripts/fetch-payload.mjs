@@ -85,9 +85,18 @@ if (opts.pin) {
   for (const file of manifest.files) {
     const target = path.join(opts.dest, file.path)
     if (matches(readLocal(file), file)) continue
-    const url = `${base}/${manifest.release}/${file.asset}`
+    const isCrag = file.path.startsWith('share/crag/') || file.path === 'dist/crag-v2-licensed-amd64.tar.gz'
+    const release = isCrag ? manifest.crag_release || manifest.release : manifest.release
+    const url = `${base}/${release}/${file.asset}`
     if (!downloads.has(url)) {
-      const res = await fetch(url)
+      let res
+      for (let attempt = 1; attempt <= 4; attempt++) {
+        res = await fetch(url).catch((err) => ({ ok: false, status: 0, error: err }))
+        if (res.ok) break
+        if (attempt < 4) {
+          await new Promise((r) => setTimeout(r, attempt * 2000))
+        }
+      }
       if (!res.ok) throw new Error(`GET ${url} -> HTTP ${res.status}`)
       downloads.set(url, Buffer.from(await res.arrayBuffer()))
     }

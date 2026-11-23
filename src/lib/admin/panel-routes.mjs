@@ -1,12 +1,30 @@
-import { tenantPanelPayload } from '../../company/tenant-panel-privacy.mjs'
+import { tenantTestKey } from '../../company/tenant-test.mjs'
 /**
  * /admin and /api/panel routes. Login / logout / me and { ok, data }
  * envelopes are unchanged; slot start/reload go through startSlotReady.
  */
+import { setSlotDesktopEnabled, slotDesktopStatus } from '../vm/slot-desktop.mjs'
 import { companyPanelMutationError } from '../../company/panel-policy.mjs'
+import { updateTenantAccount } from '../../company/tenant-account.mjs'
+import {
+  globalStatisticsRequested,
+  tenantStatisticsDimensions,
+  tenantUserLeaderboard,
+} from '../../company/statistics-access.mjs'
+import {
+  prepareVmDelivery,
+  recordDeliveryShutdown,
+  vmDeliveryBatchStatistics,
+  vmDeliveryLifecycle,
+} from '../../company/vm-delivery-statistics.mjs'
+import { mergeTenantVmQuotaThresholds } from '../../company/tenant-vm-quota.mjs'
+import { tenantKeyCreateInput, tenantKeyInput } from '../../company/tenant-keys.mjs'
+import { tenantPanelPayload } from '../../company/tenant-panel-privacy.mjs'
 import { redeemCompanyOpenaiReset } from '../../company/quota-reset-receipt.mjs'
+
 import fs from 'node:fs'
 import path from 'node:path'
+import { randomUUID } from 'node:crypto'
 import {
   verifyPanelLogin,
   createPanelSession,
@@ -16,20 +34,38 @@ import {
   clearPanelSessionCookie,
   revokePanelSession,
   revokePanelSessionsForUser,
+  verifyPanelSession,
   getPanelAdmin,
 } from '../core/security.mjs'
+import {
+  TwoFactorError,
+  beginTwoFactorSetup,
+  confirmTwoFactorSetup,
+  consumeTwoFactorChallenge,
+  disableTwoFactor,
+  isTwoFactorEnabled,
+  issueTwoFactorChallenge,
+  regenerateRecoveryCodes,
+  twoFactorEnabledFor,
+  twoFactorStatus,
+  verifyTwoFactorCode,
+} from '../core/panel-2fa.mjs'
 import { loadDistillRules, saveDistillRules, validateDistillPatch } from '../core/distill-detect.mjs'
 import { applyRefusalGuardPatch, refusalGuardPolicy } from '../core/refusal-guard.mjs'
 import {
   applyJevPatch,
   buildScopeInventory,
   listPolicyModels as listDecisionModels,
+  probePolicyBaseline,
+  probePolicyQuota,
   publicJevConfig,
+  publicJevKeys,
   readJevConfig,
 } from '../protocol/jev-intercept.mjs'
 import { JevUsageRepo } from '../db/repos/jev-usage-repo.mjs'
 import { RefusalGuardsRepo } from '../db/repos/refusal-guards-repo.mjs'
 import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.mjs'
+import { RefusalSessionBlocksRepo } from '../db/repos/refusal-session-blocks-repo.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { parseCodexImportPayload, upsertCodexAccount, readCodexAccounts } from '../vm/codex-slot.mjs'
 import { generateAuthUrl, exchangeAuthCode, normalizeOauthFlavor } from '../oauth/oauth-auth-url.mjs'
@@ -42,13 +78,7 @@ import {
   looksLikeOfficialSetupToken,
   SETUP_TOKEN_FLAVOR,
 } from '../oauth/claude-setup-token.mjs'
-import {
-  completeClaudeAuthLogin,
-  readAuthLoginSession,
-  startClaudeAuthLoginSession,
-  AUTH_LOGIN_FLAVOR,
-  AUTH_LOGIN_SOURCE,
-} from '../oauth/claude-auth-login.mjs'
+import { AUTH_LOGIN_FLAVOR } from '../oauth/claude-auth-login.mjs'
 import {
   canOfficialCc,
   isApiKeyMode,
@@ -94,7 +124,7 @@ import { readCatalogSync, syncClaudeCatalog, syncGptCatalog } from './catalog-mo
 import { setPriceOverride, listPriceOverrides, syncModelsDev } from './price-catalog.mjs'
 import { buildPricing } from './pricing-view.mjs'
 import { publicKeyView } from './api-keys.mjs'
-import { assertVmScope, normalizeKeyScope } from './key-scope.mjs'
+import { assertVmScope, normalizeGroupType, normalizeKeyScope } from './key-scope.mjs'
 import {
   assertVmPoolExists,
   createVmPool,
@@ -107,9 +137,11 @@ import { publicEndpointView, fetchUpstreamModels, API_ENDPOINT_PRESETS } from '.
 import { runAnthropicConsole, resolveConsoleProxyUrl, savedEndpointKey } from './anthropic-console.mjs'
 import { publicUserView } from './panel-users.mjs'
 import { authorizePanelRoute, mePayload, panelIdentity } from './panel-acl.mjs'
+import { createGeminiPanelHandler, isGeminiPanelPath } from '../gemini/routes.mjs'
 import {
   denyIfUserCannotDeleteVm,
   denyIfUserMissesKey,
+  panelOwnsKey,
   denyIfUserMissesProxy,
   denyIfUserMissesVm,
   userMissesVmId,
@@ -134,6 +166,7 @@ import {
   setActiveVm,
   clearActiveVm,
   setScheduleOff,
+  setTenantScheduleOff,
   setScheduleHold,
   markUnschedulable,
   clearUnschedulable,
@@ -148,6 +181,7 @@ import {
   bindVmProxy,
   adoptVmProxyBinding,
   patchVmRecord,
+  parseVmDisplayName,
   vmHasClaudeCredential,
   vmHasSchedulableCredential,
   persistAllowedModels,
@@ -165,12 +199,13 @@ import {
   migrateScheduleRecord,
 } from '../pool/schedule-state.mjs'
 import { fillVmTimezoneFromExit, syncVmTimezoneFromProxy } from '../vm/proxy-timezone.mjs'
+import { proxyScheme } from '../vm/proxy-pool.mjs'
 import { validTimezone } from '../core/timezone.mjs'
 import { stampVmKind, isCodexVm } from '../vm/vm-kind.mjs'
 import { parseAllowedModelsPatch } from '../pool/slot-model-gate.mjs'
 import { parseScheduleLevelInput, manualScheduleLevelOf } from '../pool/credential-weight.mjs'
 import { parseActiveHoursInput } from '../pool/active-hours.mjs'
-import { parseVmQuotaOverride } from '../pool/vm-quota-override.mjs'
+import { keepTenantExactGates, parseVmQuotaOverride } from '../pool/vm-quota-override.mjs'
 import { validateOpenAIQuotaPatch, normalizeOpenAIQuotaPolicy } from '../pool/openai-quota-policy.mjs'
 import { validateInferenceWebsocketPatch } from '../protocol/codex-route.mjs'
 import {
@@ -180,19 +215,22 @@ import {
   parseSlotEnginePolicyPatch,
   parseSlotPolicyTargets,
   resolveInferenceEngine,
+  resolveCragKernelVersion,
   resolveKernelDataplane,
   SESSION_SLOT_MAX,
   SESSION_SLOT_MIN,
   validateInferenceRoutingPatch,
 } from '../vm/slot-engine.mjs'
-import { validateTelemetryRoutingPatch } from '../vm/worker-telemetry.mjs'
+import { telemetryDefaultEnabled, validateTelemetryRoutingPatch } from '../vm/native-telemetry.mjs'
 import { makeError, ErrorType, ErrorCode } from '../core/errors.mjs'
 import * as panel from './panel-api.mjs'
 import { GATEWAY_CAPABILITIES } from '../vm/execution-context.mjs'
 import { withVmLock, atomicWriteJson, isValidVmId, invalidateVmSlotReadCache } from '../vm/vm-file.mjs'
 import { snapshotDatabaseMetrics } from '../db/database-metrics.mjs'
+import { queryActiveUsage } from '../oauth/active-usage-query.mjs'
 import { getUsageCache } from '../oauth/usage-cache.mjs'
 import { getDb, getDbPath } from '../db/database.mjs'
+import { usagePoolEnabled, usageRead } from '../db/sqlite-pool.mjs'
 import {
   readLocalVersion,
   loadChangelog,
@@ -200,8 +238,26 @@ import {
   readHostUpgradeStatus,
   startHostUpgrade,
 } from './release.mjs'
-import { downloadReleaseKernel, kernelReleaseHttpStatus } from './release-kernel.mjs'
+import { downloadReleaseKernel, kernelReleaseHttpStatus, listKernelReleaseVersions } from './release-kernel.mjs'
+import {
+  cragReleasePin,
+  describeKernelCatalog,
+  listKernelReleases,
+  pullKernelRelease,
+  selectKernelRelease,
+} from './kernel-catalog.mjs'
+import {
+  hasKernelInstallSafetyHold,
+  installKernelTargets,
+  cancelKernelInstall,
+  listActiveKernelInstalls,
+  releaseKernelInstallSafetyHold,
+  retainKernelInstallSafetyHold,
+  validateKernelTargets,
+} from '../vm/kernel-install.mjs'
+import { withSlotMaintenance } from '../vm/slot-maintenance.mjs'
 import { clearActiveVmFromDb, removeVmFromDb } from '../vm/vm-db-sync.mjs'
+import { renameVmId } from '../vm/vm-rename.mjs'
 import { normalizeCredentialMode } from '../oauth/credential-mode.mjs'
 import { reloadActiveVm } from '../core/config.mjs'
 import {
@@ -210,8 +266,8 @@ import {
   normalizeTimezone,
   nextNumericIndex,
   padVm,
+  discardSlotContainer,
   STANDARD_LOCALE,
-  syncWorkerTelemetry,
 } from '../vm/vm-runtime.mjs'
 import {
   startSlotReady,
@@ -222,18 +278,22 @@ import {
   switchInheritedInferenceEngines,
   slotExec,
 } from '../vm/slot-runtime.mjs'
-import { recreateVmFiles, seedFreshCliHome } from '../vm/vm-recreate.mjs'
-import { diagnoseSlotServices, powerOnSlot, recoverSlot } from '../vm/slot-recovery.mjs'
+import { preflightFreshClaudeKernels, recreateVmFiles, seedFreshCliHome } from '../vm/vm-recreate.mjs'
+import { diagnoseSlotServices, powerOnSlot, recoverSlot, redactSecrets } from '../vm/slot-recovery.mjs'
 import { commitVmPackage, exportVmPackage, parseVmPackage } from '../vm/vm-package.mjs'
-import { preflightNode } from '../cluster/placement.mjs'
+import { slotMigrationBusy, slotMigrationJob, startSlotMigration } from '../cluster/slot-migration.mjs'
+import { isNativeNodeVm, preflightNode, vmNodeId } from '../cluster/placement.mjs'
+import { stageFreshClaudeKernels } from '../cluster/remote-slot-files.mjs'
+import { cragSlotPayload } from '../cluster/slot-image.mjs'
+import { normalizeAutoPlacement, pickPlacement, readLocalHost, requestedPlacement } from '../cluster/auto-placement.mjs'
 import { probeLocalKvm } from '../vm/kvm-host.mjs'
 import { normalizeVmConfig, resolveMachineSpec, validateVmConfigPatch } from '../vm/machine-spec.mjs'
 import { raiseDockerSlotMemory } from '../vm/docker-slot-memory.mjs'
-import { RUNTIME_KVM } from '../vm/runtime-kind.mjs'
+import { isKvmRuntime, RUNTIME_KVM } from '../vm/runtime-kind.mjs'
 import { hostProxyUrlForVm, slotHost } from '../vm/slot-host.mjs'
 import { syncIpv6ProxyEgress } from '../vm/proxy-policy-runtime.mjs'
 import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
-import { writeSlotSeedFiles } from '../vm/slot-seed.mjs'
+import { initializeSlotSeedFiles, writeSlotSeedFiles } from '../vm/slot-seed.mjs'
 import {
   egressEnabled,
   ensureProxyEgress,
@@ -262,8 +322,8 @@ import {
   captureWrapSample,
   describeWrapSample,
   makeWrapSample,
+  materializeResolvedKernel,
   materializeSlotDataplane,
-  materializeWrapCli,
   replaceCragKernelBinary,
   replaceKernelBinary,
   replaceCliNodeBinary,
@@ -275,15 +335,41 @@ import {
 import { inspectClusterPayloadChanges, refreshClusterSlotPayloads } from '../cluster/remote-slot.mjs'
 import { readRawBody as defaultReadRawBody } from '../http/respond.mjs'
 import { corsHeadersForRequest } from '../http/cors.mjs'
+import {
+  createCragShopHandler,
+  cragShopRoute,
+  isCragDeviceShopPath,
+  isCragShopPath,
+  sameOriginPost,
+} from './crag-shop.mjs'
+import { createCragSubscriptionHandler, cragSubscriptionRoute } from './crag-subscription-routes.mjs'
 import { restartRustKernel, syncClaudeKernelConfigs, writeKernelConfig } from '../transport/rust-kernel-supervisor.mjs'
 
-import { countTokensViaWorker } from '../transport/go-worker-client.mjs'
+import { countTokensViaWorker, syncClaudeClientCredentials } from '../transport/go-worker-client.mjs'
 import { apiKeyBetaHeader, setupTokenBetaHeader } from '../protocol/claude-code-betas.mjs'
 import { rustKernelHealth, toPublicKernelHealth } from '../transport/rust-kernel-client.mjs'
+import {
+  activateCragLicense,
+  checkCragLicense,
+  CragLicenseError,
+  distributeCragUniversalGrant,
+  getCragLicense,
+  projectCragUniversalVm,
+  redeemCragDeviceVoucher,
+  resolveCragVoucherKind,
+} from '../vm/crag-license.mjs'
+import { applyNativeTelemetry } from '../vm/fleet-update.mjs'
 import { codexKernelHealth } from '../transport/codex-kernel-client.mjs'
 import { normalizeHealthProbeConfig } from './health-probe.mjs'
 import { normalizeUsageProbeConfig } from '../oauth/usage-probe-monitor.mjs'
-import { mergeNotifyConfig, publicNotifyConfig, publicRoutingNotify, sendNotifyTest } from './notify.mjs'
+import {
+  isNotifyChannel,
+  mergeNotifyConfig,
+  publicNotifyConfig,
+  publicRoutingNotify,
+  sendNotifyTest,
+  validateNotifyRoutingPatch,
+} from './notify.mjs'
 import { UsageLogsView } from '../db/repos/usage-logs-view.mjs'
 import {
   applyOnboardingAction,
@@ -297,12 +383,7 @@ import {
   vmStepFacts,
 } from './onboarding.mjs'
 import { applyUsageProfile } from './usage-profile.mjs'
-import {
-  StatisticsRepo,
-  USER_ROLE_DIMENSIONS,
-  normalizeDimension,
-  normalizeRange,
-} from '../db/repos/statistics-repo.mjs'
+import { StatisticsRepo, normalizeDimension, normalizeRange } from '../db/repos/statistics-repo.mjs'
 
 /** Tenants always see their own rows; other roles may narrow by `user_id`. */
 function logsOwner(req, u) {
@@ -310,6 +391,8 @@ function logsOwner(req, u) {
 }
 
 const LOCAL_PROXY_MISMATCH_MESSAGE = '本地代理只能绑定到它所在 VPS 上的槽位'
+// Room for a full allowed_models list (200 names) next to the other key fields.
+const API_KEY_BODY_MAX = 32 * 1024
 
 function clusterNodesOf(ctx) {
   try {
@@ -381,6 +464,8 @@ function usageLogFilters(req, u) {
     endpoint: get('endpoint'),
     protocol: get('protocol'),
     status_code: get('status_code'),
+    upstream_400: get('upstream_400') === '1',
+    request_id: get('request_id'),
     exclude_status_200: get('exclude_status_200') === '1',
     model_mismatch: get('model_mismatch') === '1',
     min_attempt_count: get('min_attempt_count'),
@@ -395,10 +480,6 @@ function usageLogFilters(req, u) {
   }
 }
 
-/**
- * Validated statistics params. `user` may only group by key/model: user and
- * vm groupings would reveal other tenants or the pool layout.
- */
 function statsParams(req, u, dimensionKey) {
   const isUser = panelIdentity(req).role === 'user'
   const rawRange = u.searchParams.get('range')
@@ -407,8 +488,14 @@ function statsParams(req, u, dimensionKey) {
   if (!range) return { error: `invalid range: ${rawRange}` }
   const dimension = rawDim ? normalizeDimension(rawDim) : 'model'
   if (!dimension) return { error: `invalid ${dimensionKey}: ${rawDim}` }
-  if (isUser && !USER_ROLE_DIMENSIONS.includes(dimension)) return { error: `${dimensionKey} not allowed: ${dimension}` }
-  return { range, dimension, tz: u.searchParams.get('tz') || 'UTC', owner_user_id: logsOwner(req, u) }
+  if (isUser && !tenantStatisticsDimensions(u, dimensionKey).includes(dimension))
+    return { error: `${dimensionKey} not allowed: ${dimension}` }
+  return {
+    range,
+    dimension,
+    tz: u.searchParams.get('tz') || 'UTC',
+    owner_user_id: globalStatisticsRequested(u) ? null : logsOwner(req, u),
+  }
 }
 
 async function commitImportedCodexVm({
@@ -504,21 +591,92 @@ function mergeKernelReports(local, cluster) {
   }
 }
 
-// The entrypoint auto-sync and the panel upgrade can both ask at once; a slot must not be recreated twice concurrently.
+// Startup auto-sync and panel upgrades share the same queue so a slot is not recreated concurrently.
 let kernelSyncTail = Promise.resolve()
 
-function syncInstalledKernels(args) {
-  const run = kernelSyncTail.then(() => runKernelSync(args))
+/** Acquire an exact VM scope in canonical order; callers inside must not re-enter it. */
+function withKernelVmLocks(project, ids, operation) {
+  const ordered = [...new Set(ids)].sort()
+  const enter = (index) =>
+    index === ordered.length
+      ? operation()
+      : withVmLock(path.join(project, 'vms', `${ordered[index]}.json`), () => enter(index + 1))
+  return enter(0)
+}
+
+function kernelSyncIds(project, body = {}) {
+  const wanted = Array.isArray(body.ids) ? new Set(body.ids.map(String)) : null
+  return listVms(project)
+    .filter((vm) => !wanted || wanted.has(vm.id))
+    .map((vm) => vm.id)
+}
+
+export function syncInstalledKernels(args, operation = runKernelSync) {
+  // Snapshot at admission, not after waiting for another sync or installer.
+  const ids = kernelSyncIds(args.project, args.body)
+  const exact = { ...args, body: { ...args.body, ids } }
+  const run = kernelSyncTail.then(() => withKernelVmLocks(args.project, ids, () => operation(exact)))
   kernelSyncTail = run.catch(() => {})
   return run
 }
 
-async function runKernelSync({ project, routingConfig, body = {}, refreshCluster = refreshClusterSlotPayloads }) {
+async function teardownSlot(
+  vm,
+  subscription,
+  destroy = (requireConfirmation) => destroySlot(vm, { requireConfirmation }),
+) {
+  try {
+    return subscription?.teardown ? await subscription.teardown(vm, destroy) : await destroy(false)
+  } catch {
+    return { ok: false, code: 'vm_teardown_unconfirmed', error: 'Could not safely finish VM teardown' }
+  }
+}
+
+/**
+ * Force delete of a slot whose node is gone: the manager must confirm the node is
+ * unreachable. Only local relays are dropped; the node container is never touched,
+ * and a held CRAG permit is released as if the node had confirmed the teardown.
+ */
+async function forgetNodeSlot(vm, subscription, manager) {
+  const nodeId = vmNodeId(vm)
+  if (!nodeId) {
+    return { ok: false, httpStatus: 400, code: 'force_delete_local_slot', error: '本机槽位不能强制删除' }
+  }
+  if (!manager?.confirmNodeUnreachable) {
+    return { ok: false, httpStatus: 503, code: 'cluster_unavailable', error: '集群未初始化' }
+  }
+  let node
+  try {
+    node = await manager.confirmNodeUnreachable(nodeId)
+  } catch (err) {
+    return { ok: false, httpStatus: err.status || 500, code: err.code || 'node_check_failed', error: err.message }
+  }
+  const gone = await teardownSlot(vm, subscription, async () => {
+    // Local relay sockets only; a leftover one must not block forgetting the slot.
+    try {
+      await manager.dropSlotRelays?.(vm.id)
+    } catch {}
+    return { ok: true, action: 'skipped', teardownConfirmed: true }
+  })
+  return gone.ok ? { ...gone, node } : gone
+}
+
+async function runKernelSync({
+  project,
+  routingConfig,
+  body = {},
+  refreshCluster = refreshClusterSlotPayloads,
+  restartKernel = restartRustKernel,
+  subscription,
+}) {
   const all = listVms(project)
   const wanted = Array.isArray(body.ids) ? new Set(body.ids.map(String)) : null
-  const selected = wanted ? all.filter((vm) => wanted.has(vm.id)) : all
+  // Panel summaries omit private runtime state, including a previously failed restart.
+  const selected = (wanted ? all.filter((vm) => wanted.has(vm.id)) : all)
+    .map((vm) => getVm(project, vm.id))
+    .filter(Boolean)
   // Local slots bind the new binaries. Cluster slots bake the same kernel, CLIs
-  // and kin-worker telemetry into a content-hashed image, then recreate onto it.
+  // and OAuth helpers into a content-hashed image, then recreate onto it.
   const localVms = selected.filter((vm) => !slotHost(vm).bakedKernel)
   const clusterVms = selected.filter((vm) => slotHost(vm).bakedKernel)
   const checkOnly = body.restart === false
@@ -536,7 +694,7 @@ async function runKernelSync({ project, routingConfig, body = {}, refreshCluster
       if (resolveInferenceEngine(vm, routingConfig) !== 'rust') continue
       writeKernelConfig(project, vm, { routing: routingConfig, timezone: vm.timezone })
       const exec = slotExec(project, vm)
-      item.kernel = await restartRustKernel(exec).catch((e) => ({
+      item.kernel = await restartKernel(exec).catch((e) => ({
         ok: false,
         error: String(e?.message || e).slice(0, 200),
       }))
@@ -554,7 +712,7 @@ async function runKernelSync({ project, routingConfig, body = {}, refreshCluster
   if (traits) {
     for (const vm of localVms) {
       if (isCodexVm(vm)) continue
-      const gone = await destroySlot(vm)
+      const gone = await teardownSlot(vm, subscription)
       if (!gone.ok) {
         const item = (local.items || []).find((row) => row.id === vm.id)
         if (item) {
@@ -602,8 +760,21 @@ function slotProxyHint(px = {}, label = null) {
 }
 
 export function createPanelHandler(ctx) {
+  const geminiPanel = createGeminiPanelHandler({
+    json: ctx.json,
+    readBody: ctx.readBody,
+    proxyPool: () => ctx.proxyPool,
+    terminal: ctx.geminiTerminal,
+  })
   // A checkout can change under a live Node process; report its boot version.
   const runningVersion = readLocalVersion(ctx.cfg?.paths?.project)
+  const kernelInstallJobs = new Map()
+  const pruneKernelInstallJobs = () => {
+    const now = Date.now()
+    for (const [id, job] of kernelInstallJobs) {
+      if (job.expiresAt <= now) kernelInstallJobs.delete(id)
+    }
+  }
   const responseRequests = new WeakMap()
   const json = (res, status, payload, ...rest) => {
     const req = responseRequests.get(res)
@@ -612,6 +783,7 @@ export function createPanelHandler(ctx) {
     }
     return ctx.json(res, status, payload, ...rest)
   }
+
   const hostUnsupported = (res, vm, cap) => {
     if (slotHost(vm).supports(cap)) return false
     json(res, 409, {
@@ -625,6 +797,28 @@ export function createPanelHandler(ctx) {
   const refreshCluster = ctx.refreshClusterSlotPayloads || refreshClusterSlotPayloads
   const requireAuth = (...args) => ctx.requireAuth(...args)
   const cfg = ctx.cfg
+  const handleCragShop =
+    ctx.handleCragShop ??
+    createCragShopHandler({
+      getDb: ctx.getDb,
+      subscription: ctx.cragSubscription,
+      isCurrentAdmin: (req) => {
+        const record = ctx.panelUsers.getByUsername(req.panelUser)
+        if (record) return record.enabled && record.role === 'admin' && req.panelBuyerOwner === `panel:${record.id}`
+        return req.panelBuyerOwner === `configured-admin:${req.panelUser}`
+      },
+      dataDir: cfg?.paths?.data,
+      publicBaseUrl: cfg?.base_url,
+      json,
+      readRawBody,
+    })
+  const handleCragSubscription = createCragSubscriptionHandler({
+    subscription: ctx.cragSubscription,
+    getVm: (id) => (isValidVmId(id) ? getVm(cfg.paths.project, id) : null),
+    publicBaseUrl: cfg?.base_url,
+    json,
+    readRawBody,
+  })
   let egressAudit = ctx.egressAudit
   const auditService = () =>
     (egressAudit ||= createEgressAuditService({ projectRoot: cfg.paths.project, dataDir: cfg.paths.data }))
@@ -642,6 +836,14 @@ export function createPanelHandler(ctx) {
   const stats = ctx.stats
   const persistRoutingPatch = (...args) => ctx.persistRoutingPatch(...args)
   const applyVmConcurrency = (...args) => ctx.applyVmConcurrency(...args)
+  // Keep the last result per VM so slow SSH cutovers outlive an HTTP request.
+  const kernelSwitchJobs = new Map()
+  const kernelSwitchWatchdog = {
+    hold: (id) => ctx.kernelWatchdog?.hold?.(id),
+    release(id) {
+      if (!hasKernelInstallSafetyHold(cfg.paths.project, id, ctx.kernelWatchdog)) ctx.kernelWatchdog?.release?.(id)
+    },
+  }
   const applyVmRpm = (...args) => ctx.applyVmRpm(...args)
   const applyVmSessionSlots = (...args) => ctx.applyVmSessionSlots(...args)
   const inheritVmScheduling = (...args) => ctx.inheritVmScheduling(...args)
@@ -720,23 +922,33 @@ export function createPanelHandler(ctx) {
     return { ok: true, via, node_id: host.nodeId || null, proxy_id: proxy.id || null, geo: r.geo }
   }
 
-  async function bringUpImportedVm(id) {
+  async function bringUpImportedVm(id, { bindSubscription = false } = {}) {
     let vm = getVm(cfg.paths.project, id)
     let startError = null
     if (!vm) return { start_error: 'vm not found', official_cc_bootstrap: null, probe: null }
     if (!hasBoundExit(vm.proxy)) {
       startError = 'no_exit'
     } else {
-      const boot = await startSlotReady(vm, cfg.paths.project, { routing: ctx.routingConfig })
+      const boot = await startSlotReady(vm, cfg.paths.project, { routing: ctx.routingConfig, bindSubscription })
       vm = getVm(cfg.paths.project, id) || vm
       if (!boot?.ok) {
         startError = boot?.error || boot?.reason || 'runtime start failed'
-        vm =
-          (patchVmRecord(cfg.paths.project, id, { status: 'error' }),
-          markUnschedulable(cfg.paths.project, id, 'runtime_start_failed', {
-            message: String(startError).slice(0, 240),
-          }),
-          getVm(cfg.paths.project, id)) || vm
+        const deferredCrag =
+          resolveKernelDataplane(vm, ctx.routingConfig) === 'crag' &&
+          (/^license_/.test(boot?.code || '') ||
+            ['slot_limit_reached', 'crag_subscription_unavailable', 'crag_subscription_authority_unavailable'].includes(
+              boot?.code || '',
+            ))
+        if (deferredCrag) {
+          vm = patchVmRecord(cfg.paths.project, id, { status: 'stopped' }) || vm
+        } else {
+          vm =
+            (patchVmRecord(cfg.paths.project, id, { status: 'error' }),
+            markUnschedulable(cfg.paths.project, id, 'runtime_start_failed', {
+              message: String(startError).slice(0, 240),
+            }),
+            getVm(cfg.paths.project, id)) || vm
+        }
       } else {
         vm = patchVmRecord(cfg.paths.project, id, { status: 'running' }) || vm
       }
@@ -887,10 +1099,11 @@ export function createPanelHandler(ctx) {
 
   function normalizePanelApiKeyInput(body = {}, req) {
     const normalized = { ...body }
+    normalized.user_id = req.apiKeyKind === 'master' ? null : normalizeOwnerId(req.panelUserId)
     if (panelIdentity(req).role !== 'admin') {
-      delete normalized.user_id
       delete normalized.group_id
       delete normalized.vm_pool_id
+      delete normalized.api_endpoint_id
     }
     const hasRequestQuota = Object.prototype.hasOwnProperty.call(body, 'quota_requests')
     const hasLegacyQuota = Object.prototype.hasOwnProperty.call(body, 'quota')
@@ -910,6 +1123,21 @@ export function createPanelHandler(ctx) {
         .trim()
         .toLowerCase() === 'api'
     )
+  }
+
+  function validateKeyEndpoint(value, isApi, previous = null) {
+    if (value == null) return null
+    if (typeof value !== 'string' || !value.trim() || !isApi) {
+      throw Object.assign(new Error('请选择有效的 API 渠道'), { code: 'invalid_api_endpoint_id' })
+    }
+    const id = value.trim()
+    if (id !== previous) {
+      const endpoint = apiEndpointStore.getRaw(id)
+      if (!endpoint || endpoint.disabled) {
+        throw Object.assign(new Error('所选 API 渠道不存在或已停用'), { code: 'api_endpoint_unavailable' })
+      }
+    }
+    return id
   }
 
   /** Slots a key may be scoped to; a tenant's foreign slots read as missing. */
@@ -945,6 +1173,7 @@ export function createPanelHandler(ctx) {
     const settings = new SettingsRepo()
     const repo = new RefusalGuardsRepo()
     const devices = new RefusalDeviceBlocksRepo()
+    const sessions = new RefusalSessionBlocksRepo()
     const read = (key, fallback) => settings.get(key, fallback)
     return {
       ...refusalGuardPolicy(read),
@@ -952,6 +1181,8 @@ export function createPanelHandler(ctx) {
       items: repo.list(),
       device_count: devices.count(),
       devices: devices.list(),
+      session_count: sessions.count(),
+      sessions: sessions.list(),
     }
   }
 
@@ -966,14 +1197,43 @@ export function createPanelHandler(ctx) {
     } catch {
       vms = []
     }
+    // One snapshot for every slot in the inventory: the risk page only reads each
+    // slot's quota, and resolving them one at a time re-read the account table
+    // once per slot (#1043).
+    const accountSnap = panel.readAccountSnapshot(accountQuota)
     const inventory = buildScopeInventory(
-      vms.map((vm) => ({ ...vm, quota: panel.findAccount(accountQuota, vm)?.unified || null })),
+      vms.map((vm) => ({ ...vm, quota: panel.findAccount(accountQuota, vm, accountSnap)?.unified || null })),
       selectedKeys,
     )
     return {
       ...inventory,
       account_type_options: [],
       account_plan_type_options: [],
+    }
+  }
+
+  function withJevEndpointStatus(config) {
+    const keys = (config.endpoints || []).flatMap((endpoint) => endpoint.keys || [])
+    if (!keys.length) return config
+    try {
+      const rows = new JevUsageRepo().configuredKeyStatuses(keys)
+      const byFp = new Map(rows.map((row) => [row.key_fingerprint, row]))
+      return {
+        ...config,
+        endpoints: config.endpoints.map((endpoint) => ({
+          ...endpoint,
+          keys: endpoint.keys.map((key) => {
+            const row = byFp.get(key.key_fingerprint)
+            return {
+              ...key,
+              status: key.retired ? 'paused' : row?.status || key.status,
+              last_http_status: row?.last_http_status ?? key.last_http_status ?? null,
+            }
+          }),
+        })),
+      }
+    } catch {
+      return config
     }
   }
 
@@ -985,7 +1245,19 @@ export function createPanelHandler(ctx) {
     } catch {
       config = publicJevConfig(null)
     }
-    return { ...config, account_scope: jevScopeInventory(config.account_platform_plans) }
+    return {
+      ...withJevEndpointStatus(config),
+      account_scope: jevScopeInventory(config.account_platform_plans),
+    }
+  }
+
+  function deactivateVmSlot(id) {
+    if (getActiveVmId(cfg.paths.project) === id) {
+      clearActiveVmFromDb()
+      clearActiveVm(cfg.paths.project)
+      reloadActiveVm(cfg)
+    }
+    return { ok: true, active_vm: getActiveVmId(cfg.paths.project) }
   }
 
   function activateVmSlot(id) {
@@ -1058,17 +1330,110 @@ export function createPanelHandler(ctx) {
       if (patch.dataplane) desired.dataplane = patch.dataplane
       else delete desired.dataplane
     }
+    if (Object.prototype.hasOwnProperty.call(patch, 'crag_kernel_version')) {
+      if (patch.crag_kernel_version) desired.crag_kernel_version = patch.crag_kernel_version
+      else delete desired.crag_kernel_version
+    }
     return desired
   }
 
-  async function applySlotPolicyWithRuntime(id, patch) {
+  function applySlotPolicyWithRuntime(id, patch, options = {}) {
+    return withVmLock(path.join(cfg.paths.project, 'vms', `${id}.json`), () =>
+      applySlotPolicyWithRuntimeLocked(id, patch, options),
+    )
+  }
+
+  async function projectKvmCragSwitchLicense(current, desired, previousRouting, nextRouting) {
+    if (!isKvmRuntime(desired) || resolveKernelDataplane(desired, nextRouting) !== 'crag') return
+    if (
+      resolveKernelDataplane(current, previousRouting) === 'crag' &&
+      resolveCragKernelVersion(current, previousRouting) === resolveCragKernelVersion(desired, nextRouting)
+    )
+      return
+    try {
+      const project = ctx.kernelPolicyOps?.projectCragUniversalVm || projectCragUniversalVm
+      const projected = await project(cfg.paths.project, desired)
+      if (!projected?.ok) throw new Error(projected?.error || 'CRAG license projection failed')
+    } catch (cause) {
+      const error = new Error(`CRAG 授权同步失败：${String(cause?.message || cause).slice(0, 200)}`)
+      error.code = 'crag_license_projection_failed'
+      throw error
+    }
+  }
+
+  // PATCH already owns the full record lock, including its other metadata/config writes.
+  async function applySlotPolicyWithRuntimeLocked(
+    id,
+    patch,
+    {
+      maintenance = false,
+      previousRouting = structuredClone(ctx.routingConfig),
+      cragLicenseProjected = false,
+      releaseBinding = Object.hasOwn(patch, 'dataplane'),
+      bindSubscription = false,
+    } = {},
+  ) {
     const current = getVm(cfg.paths.project, id)
     if (!current) return { ok: false, id, code: 'vm_not_found', error: 'vm not found' }
     const desired = vmWithSlotPolicyPatch(current, patch)
-    const previousEngine = resolveInferenceEngine(current, ctx.routingConfig)
+    const previousEngine = resolveInferenceEngine(current, previousRouting)
     const targetEngine = resolveInferenceEngine(desired, ctx.routingConfig)
-    const previousDataplane = resolveKernelDataplane(current, ctx.routingConfig)
+    const previousDataplane = resolveKernelDataplane(current, previousRouting)
     const targetDataplane = resolveKernelDataplane(desired, ctx.routingConfig)
+    const previousVersion = resolveCragKernelVersion(current, previousRouting)
+    const targetVersion = resolveCragKernelVersion(desired, ctx.routingConfig)
+    const dataplaneChanged = previousDataplane !== targetDataplane
+    const versionChanged =
+      previousVersion !== targetVersion && (previousDataplane === 'crag' || targetDataplane === 'crag')
+    const retryFailedRuntime =
+      current.unschedulable?.reason === 'runtime_start_failed' &&
+      (releaseBinding || Object.hasOwn(patch, 'crag_kernel_version'))
+    const kernelSwitch = dataplaneChanged || versionChanged || retryFailedRuntime
+    const releaseRequested =
+      releaseBinding &&
+      targetDataplane !== 'crag' &&
+      !isCodexVm(desired) &&
+      typeof ctx.cragSubscription?.releaseStoppedBinding === 'function'
+    if (kernelSwitch && targetDataplane === 'crag' && targetVersion === 'v2') {
+      if (isNativeNodeVm(desired)) {
+        return { ok: false, id, code: 'native_crag_unsupported', error: 'crag 数据面暂不支持 macOS 原生节点' }
+      }
+    }
+    if ((kernelSwitch || releaseRequested) && current.status === 'running' && !maintenance) {
+      return withSlotMaintenance({
+        projectRoot: cfg.paths.project,
+        id,
+        watchdog: kernelSwitchWatchdog,
+        poolScheduler: ctx.poolScheduler,
+        operation: () =>
+          applySlotPolicyWithRuntimeLocked(id, patch, {
+            maintenance: true,
+            previousRouting,
+            cragLicenseProjected,
+            releaseBinding,
+            bindSubscription,
+          }),
+      })
+    }
+    if (!cragLicenseProjected) {
+      try {
+        await projectKvmCragSwitchLicense(current, desired, previousRouting, ctx.routingConfig)
+      } catch (error) {
+        return { ok: false, id, code: error.code, error: error.message }
+      }
+    }
+    if (kernelSwitch && !isCodexVm(desired)) {
+      try {
+        const initialize = ctx.kernelPolicyOps?.initializeSlotSeedFiles || initializeSlotSeedFiles
+        await initialize(cfg.paths.project, desired, slotHost(desired))
+      } catch {
+        return { ok: false, id, code: 'kernel_seed_failed', error: 'Claude Code 初始化配置生成或发布失败' }
+      }
+    }
+    const restartFailed = (result) => {
+      markUnschedulable(cfg.paths.project, id, 'runtime_start_failed', { code: result.code })
+      return result
+    }
     let switched = null
     if (Object.prototype.hasOwnProperty.call(patch, 'inference_engine') && previousEngine !== targetEngine) {
       switched = await switchSlotInferenceEngine(desired, cfg.paths.project, targetEngine)
@@ -1076,36 +1441,211 @@ export function createPanelHandler(ctx) {
         return { ok: false, id, code: switched.code || 'engine_switch_failed', error: switched.error, switch: switched }
       }
     }
+    let stoppedForRelease = false
+    let bindingRelease
     try {
-      const saved = persistSlotEnginePolicy(cfg.paths.project, id, patch)
+      let saved = persistSlotEnginePolicy(cfg.paths.project, id, patch)
       if (!saved) return { ok: false, id, code: 'vm_not_found', error: 'vm not found' }
-      if (
-        !isCodexVm(saved) &&
-        (Object.prototype.hasOwnProperty.call(patch, 'persona_preset') || previousDataplane !== targetDataplane)
-      ) {
-        if (previousDataplane !== targetDataplane) {
-          const laid = materializeSlotDataplane(cfg.paths.project, saved, targetDataplane || 'wrap')
+      if (releaseRequested) {
+        try {
+          bindingRelease = await ctx.cragSubscription.releaseStoppedBinding(saved, {
+            stop: async () => {
+              const halt = await (ctx.kernelPolicyOps?.stopSlot || stopSlot)(saved)
+              if (!halt?.ok) return halt
+              stoppedForRelease = true
+              try {
+                saved = patchVmRecord(cfg.paths.project, id, (record) => {
+                  record.status = 'stopped'
+                  record.runtime = { ...record.runtime, ...halt.runtime, stopped: true, pid: null, ip: null }
+                })
+              } catch {
+                if (current.status === 'running')
+                  retainKernelInstallSafetyHold(cfg.paths.project, id, ctx.kernelWatchdog)
+                throw Object.assign(new Error('Stopped slot state could not be persisted'), {
+                  code: 'kernel_stop_persist_failed',
+                })
+              }
+              if (!saved) throw Object.assign(new Error('vm not found'), { code: 'vm_not_found' })
+              return halt
+            },
+          })
+        } catch (error) {
+          return restartFailed({
+            ok: false,
+            id,
+            stopped: stoppedForRelease,
+            code: error.code || 'crag_subscription_release_failed',
+            error:
+              error.code === 'kernel_stop_persist_failed'
+                ? '虚拟机已停止，但停止状态写入失败；自动恢复保持暂停，请修复记录权限后重试或手动启动。'
+                : 'CRAG 订阅绑定未能完成释放，请同步订阅状态后重试。',
+          })
+        }
+      }
+      if (!isCodexVm(saved) && (Object.prototype.hasOwnProperty.call(patch, 'persona_preset') || kernelSwitch)) {
+        if (kernelSwitch) {
+          // KVM also refreshes its preinstalled CRAG package here. Release with the
+          // old package's verified public key before that package can be replaced.
+          const laid = materializeSlotDataplane(cfg.paths.project, saved, targetDataplane || 'wrap', {
+            routing: ctx.routingConfig,
+          })
           if (!laid.ok) {
-            persistSlotEnginePolicy(cfg.paths.project, id, { dataplane: current.dataplane || '' })
-            return { ok: false, id, code: laid.code || 'dataplane_materialize_failed', error: laid.error }
+            if (!stoppedForRelease && !bindingRelease?.released) {
+              persistSlotEnginePolicy(cfg.paths.project, id, {
+                dataplane: current.dataplane || '',
+                crag_kernel_version: current.crag_kernel_version || '',
+              })
+            }
+            const failed = {
+              ok: false,
+              id,
+              stopped: stoppedForRelease,
+              code: laid.code || 'dataplane_materialize_failed',
+              error: laid.error,
+            }
+            return stoppedForRelease ? restartFailed(failed) : failed
           }
         }
-        writeKernelConfig(cfg.paths.project, saved, { routing: ctx.routingConfig })
-        if (previousDataplane !== targetDataplane && saved.status === 'running') {
+        const write = ctx.kernelPolicyOps?.writeKernelConfig || writeKernelConfig
+        write(cfg.paths.project, saved, { routing: ctx.routingConfig })
+      }
+      if (!isCodexVm(saved) && (kernelSwitch || stoppedForRelease) && current.status === 'running') {
+        const remoteDocker =
+          Boolean(String(saved.node_id || '').trim()) && !isKvmRuntime(saved) && !isNativeNodeVm(saved)
+        const recreateNative =
+          !isKvmRuntime(saved) &&
+          (remoteDocker || previousDataplane === 'crag' || targetDataplane === 'crag' || stoppedForRelease)
+        let deferredStart = null
+        // Both directions must replace CRAG's creation-only sandbox and command.
+        if (recreateNative || stoppedForRelease) {
+          const booted = await (ctx.kernelPolicyOps?.startSlotReady || startSlotReady)(saved, cfg.paths.project, {
+            recreate: recreateNative,
+            routing: ctx.routingConfig,
+            bindSubscription,
+          })
+          if (!booted?.ok || booted.rust_ok === false || booted.rust?.ok === false || booted.kernel?.ok === false) {
+            const bootCode = booted?.code || booted?.rust?.code || booted?.rust?.reason || 'kernel_restart_failed'
+            const bootError = booted?.error || booted?.rust?.error || booted?.rust?.reason || 'kernel recreate failed'
+            const isDeferredCrag =
+              targetDataplane === 'crag' &&
+              (/^license_/.test(bootCode) ||
+                [
+                  'slot_limit_reached',
+                  'crag_subscription_unavailable',
+                  'crag_subscription_authority_unavailable',
+                ].includes(bootCode))
+            if (!isDeferredCrag) {
+              return restartFailed({
+                ok: false,
+                id,
+                code: bootCode,
+                error: bootError,
+              })
+            }
+            const halt = await (ctx.kernelPolicyOps?.stopSlot || stopSlot)(saved).catch(() => null)
+            saved =
+              patchVmRecord(cfg.paths.project, id, (record) => {
+                record.status = 'stopped'
+                record.runtime = {
+                  ...record.runtime,
+                  ...(halt?.runtime || {}),
+                  stopped: true,
+                  pid: null,
+                  ip: null,
+                }
+              }) || saved
+            deferredStart = {
+              stopped: true,
+              deferred_start: true,
+              deferred_reason: bootCode,
+              start_error: bootError,
+            }
+          } else if (stoppedForRelease) {
+            saved = patchVmRecord(cfg.paths.project, id, (record) => {
+              record.status = 'running'
+              record.runtime = { ...record.runtime, ...(booted.runtime || booted.docker?.runtime), stopped: false }
+            })
+            if (!saved) throw Object.assign(new Error('vm not found'), { code: 'vm_not_found' })
+          }
+        } else {
           const exec = slotExec(cfg.paths.project, saved)
-          const restarted = await restartRustKernel(exec).catch((e) => ({
+          const restarted = await (ctx.kernelPolicyOps?.restartRustKernel || restartRustKernel)(
+            exec,
+            bindSubscription ? { bindSubscription: true } : undefined,
+          ).catch((e) => ({
             ok: false,
             error: String(e?.message || e).slice(0, 200),
           }))
           if (!restarted?.ok) {
-            return {
-              ok: false,
-              id,
-              code: 'kernel_restart_failed',
-              error: restarted?.error || 'kernel restart failed',
+            const bootCode = restarted?.code || restarted?.reason || 'kernel_restart_failed'
+            const bootError = restarted?.error || restarted?.reason || 'kernel restart failed'
+            const isDeferredCrag =
+              targetDataplane === 'crag' &&
+              isKvmRuntime(saved) &&
+              (/^license_/.test(bootCode) ||
+                [
+                  'slot_limit_reached',
+                  'crag_subscription_unavailable',
+                  'crag_subscription_authority_unavailable',
+                ].includes(bootCode))
+            if (isDeferredCrag) {
+              const halt = await (ctx.kernelPolicyOps?.stopSlot || stopSlot)(saved).catch(() => null)
+              saved =
+                patchVmRecord(cfg.paths.project, id, (record) => {
+                  record.status = 'stopped'
+                  record.runtime = {
+                    ...record.runtime,
+                    ...(halt?.runtime || {}),
+                    stopped: true,
+                    pid: null,
+                    ip: null,
+                  }
+                }) || saved
+              deferredStart = {
+                stopped: true,
+                deferred_start: true,
+                deferred_reason: bootCode,
+                start_error: bootError,
+              }
+            } else {
+              return restartFailed({
+                ok: false,
+                id,
+                code: 'kernel_restart_failed',
+                error: bootError,
+              })
             }
           }
         }
+        ctx.kernelWatchdog?.reset?.(id)
+        panel.resetVmCircuit({ cfg, poolScheduler: ctx.poolScheduler, id })
+        if (getVm(cfg.paths.project, id)?.unschedulable?.reason === 'runtime_start_failed') {
+          clearUnschedulable(cfg.paths.project, id, { by: 'operator' })
+        }
+        if (deferredStart) {
+          if (hasKernelInstallSafetyHold(cfg.paths.project, id, ctx.kernelWatchdog)) {
+            releaseKernelInstallSafetyHold(cfg.paths.project, id, ctx.kernelWatchdog)
+          }
+          return {
+            ok: true,
+            id,
+            vm: saved,
+            configured_engine: saved.inference_engine || null,
+            resolved_engine: resolveInferenceEngine(saved, ctx.routingConfig),
+            dataplane: saved.dataplane || null,
+            resolved_dataplane: resolveKernelDataplane(saved, ctx.routingConfig),
+            active_engine: switched?.active_engine || targetEngine,
+            runtime: switched?.runtime || null,
+            ...(bindingRelease?.reclaim_pending && { reclaim_pending: true }),
+            ...deferredStart,
+          }
+        }
+      }
+      if (
+        (kernelSwitch || stoppedForRelease) &&
+        hasKernelInstallSafetyHold(cfg.paths.project, id, ctx.kernelWatchdog)
+      ) {
+        releaseKernelInstallSafetyHold(cfg.paths.project, id, ctx.kernelWatchdog)
       }
       return {
         ok: true,
@@ -1117,10 +1657,15 @@ export function createPanelHandler(ctx) {
         resolved_dataplane: resolveKernelDataplane(saved, ctx.routingConfig),
         active_engine: switched?.active_engine || targetEngine,
         runtime: switched?.runtime || null,
+        ...(bindingRelease?.reclaim_pending && { reclaim_pending: true }),
       }
     } catch (error) {
+      if (kernelSwitch && (current.status === 'running' || stoppedForRelease || bindingRelease?.released)) {
+        markUnschedulable(cfg.paths.project, id, 'runtime_start_failed', { code: 'kernel_switch_failed' })
+      }
       let rollback = null
-      if (switched) rollback = await switchSlotInferenceEngine(current, cfg.paths.project, previousEngine)
+      if (switched && !stoppedForRelease && !bindingRelease?.released)
+        rollback = await switchSlotInferenceEngine(current, cfg.paths.project, previousEngine)
       return {
         ok: false,
         id,
@@ -1169,9 +1714,9 @@ export function createPanelHandler(ctx) {
       projectRoot: cfg.paths.project,
       previousEngine: previous,
       targetEngine: target,
-      commit: () => {
+      commit: async () => {
         try {
-          return persistRoutingPatch(body)
+          return await persistRoutingPatch(body)
         } catch (error) {
           restoreRoutingRuntime(previousRoutingConfig)
           if (body.pool || body.failover) initPoolRuntime()
@@ -1193,6 +1738,21 @@ export function createPanelHandler(ctx) {
       proxy_required: true,
       worker: health,
       credential: health.credential || null,
+    }
+  }
+
+  async function readUsage(kind, method, args) {
+    if (!usagePoolEnabled()) return null
+    try {
+      return await usageRead({
+        kind,
+        method,
+        args,
+        mutedErrorClasses: requestLog?.mutedErrorClasses || [],
+      })
+    } catch (err) {
+      console.warn(`[sqlite-pool] ${kind}.${method}: ${err?.message || err}`)
+      return null
     }
   }
 
@@ -1233,7 +1793,7 @@ export function createPanelHandler(ctx) {
       const body = await readBody(req, cfg.limits.max_body_bytes)
       let applied
       try {
-        applied = persistRoutingPatch(body)
+        applied = await persistRoutingPatch(body)
       } catch (error) {
         if (error instanceof TypeError || error instanceof RangeError) {
           return json(res, 400, {
@@ -1282,6 +1842,12 @@ export function createPanelHandler(ctx) {
       if (!getVm(cfg.paths.project, id)) return json(res, 404, { error: { message: 'vm not found' } })
       return json(res, 200, activateVmSlot(id))
     }
+    if (req.method === 'POST' && /^\/admin\/vms\/[^/]+\/deactivate$/.test(p)) {
+      if (!requireAuth(req, res)) return
+      const id = p.split('/')[3]
+      if (!getVm(cfg.paths.project, id)) return json(res, 404, { error: { message: 'vm not found' } })
+      return json(res, 200, deactivateVmSlot(id))
+    }
     if (req.method === 'POST' && /^\/admin\/vms\/[^/]+\/probe$/.test(p)) {
       if (!requireAuth(req, res)) return
       const id = p.split('/')[3]
@@ -1329,20 +1895,17 @@ export function createPanelHandler(ctx) {
     }
 
     // ========== Panel login (public) ==========
-    if (req.method === 'POST' && p === '/api/panel/login') {
-      const body = await readBody(req, 4096)
-      const username = body.username || body.user || body.u || ''
-      const password = body.password || body.pass || body.p || ''
-      const authed = verifyPanelLogin(username, password)
-      if (!authed) {
-        return json(res, 401, { ok: false, error: { message: '用户名或密码错误', type: 'auth' } })
-      }
-      if (authed.source === 'env') {
+    // Hands out the session cookie. Shared by the password-only path and by the
+    // second step of two-factor sign-in, which has no password to replay.
+    const grantPanelSession = (authed, { password = '' } = {}) => {
+      let buyerId = authed?.id
+      if (authed.source === 'env' && password) {
         try {
-          panelUsers.bootstrapFromEnv({ username: authed.username, password })
+          buyerId = panelUsers.bootstrapFromEnv({ username: authed.username, password })?.id
         } catch {}
       }
-      const token = createPanelSession(authed.username, { role: authed.role })
+      const buyer = buyerId ? { id: buyerId } : authed.source === 'env' ? { configuredAdmin: true } : undefined
+      const token = createPanelSession(authed.username, { role: authed.role, buyer })
       const secure = panelCookieSecure(req)
       res.setHeader('Set-Cookie', panelSessionCookie(token, { secure }))
       const me = { user: authed.username, role: authed.role }
@@ -1356,12 +1919,105 @@ export function createPanelHandler(ctx) {
         expires_in: 7 * 24 * 3600,
       })
     }
+    const twoFactorFailure = (err) =>
+      json(res, err instanceof TwoFactorError ? err.status : 400, {
+        ok: false,
+        error: {
+          message: String(err?.message || '验证失败'),
+          code: err instanceof TwoFactorError ? err.code : 'totp_failed',
+          type: 'auth',
+        },
+      })
+
+    if (req.method === 'POST' && p === '/api/panel/login') {
+      const body = await readBody(req, 4096)
+      const username = body.username || body.user || body.u || ''
+      const password = body.password || body.pass || body.p || ''
+      const authed = verifyPanelLogin(username, password)
+      if (!authed) {
+        return json(res, 401, { ok: false, error: { message: '用户名或密码错误', type: 'auth' } })
+      }
+      let needsCode = false
+      try {
+        needsCode = isTwoFactorEnabled(authed.username)
+      } catch (e) {
+        return twoFactorFailure(e)
+      }
+      if (needsCode) {
+        // A client may post the code up front; otherwise it gets a challenge
+        // and posts it to /api/panel/login/totp. No session until a code lands.
+        const code = body.code || body.totp || body.otp || ''
+        if (!code) {
+          const challenge = issueTwoFactorChallenge(authed.username, {
+            claims: { role: authed.role, id: authed.id || null, source: authed.source || 'db' },
+          })
+          return json(res, 401, {
+            ok: false,
+            totp_required: true,
+            challenge: challenge.challenge,
+            expires_in: challenge.expires_in,
+            error: { message: '请输入两步验证码', code: 'totp_required', type: 'auth' },
+          })
+        }
+        try {
+          verifyTwoFactorCode(authed.username, code)
+        } catch (e) {
+          return twoFactorFailure(e)
+        }
+      }
+      return grantPanelSession(authed, { password })
+    }
+    if (req.method === 'POST' && p === '/api/panel/login/totp') {
+      const body = await readBody(req, 4096)
+      let name = ''
+      let claims = {}
+      try {
+        const opened = consumeTwoFactorChallenge(body.challenge || body.token || '')
+        name = opened.username
+        claims = opened.claims
+      } catch (e) {
+        return twoFactorFailure(e)
+      }
+      // Both sign-in steps must belong to the same account, even when a name is reused.
+      const fresh = panelUsers.getByUsername(name)
+      if (claims.source === 'db' ? !fresh || fresh.id !== claims.id : !!fresh) {
+        return json(res, 401, {
+          ok: false,
+          error: { message: '验证会话无效，请重新登录', code: 'totp_challenge_invalid', type: 'auth' },
+        })
+      }
+      if (fresh && fresh.enabled === false) {
+        return json(res, 403, { ok: false, error: { message: '账号已停用', code: 'user_disabled', type: 'auth' } })
+      }
+      try {
+        verifyTwoFactorCode(name, body.code || body.totp || body.otp || '')
+      } catch (e) {
+        return twoFactorFailure(e)
+      }
+      return grantPanelSession({
+        username: fresh?.username || name,
+        role: fresh?.role || claims.role || 'admin',
+        id: fresh?.id || claims.id || null,
+        source: fresh ? 'db' : claims.source === 'env' ? 'env' : 'db',
+      })
+    }
     if (req.method === 'POST' && p === '/api/panel/logout') {
       const tok = extractPanelToken(req)
       if (tok) revokePanelSession(tok)
       const secure = panelCookieSecure(req)
       res.setHeader('Set-Cookie', clearPanelSessionCookie({ secure }))
       return json(res, 200, { ok: true })
+    }
+
+    if (isCragShopPath(p)) {
+      res.setHeader('Cache-Control', 'no-store')
+      const route = cragShopRoute(req.method, p)
+      if (isCragDeviceShopPath(p)) return handleCragShop(req, res, url, route)
+      if (!requireAuth(req, res, { buyer: true })) return true
+      if (route && !authorizePanelRoute(req.method, p, panelIdentity(req).role).ok) {
+        return json(res, 403, { ok: false, error: { code: 'forbidden', message: 'Forbidden' } })
+      }
+      return handleCragShop(req, res, url, route)
     }
 
     if (p.startsWith('/api/panel')) {
@@ -1387,6 +2043,60 @@ export function createPanelHandler(ctx) {
         const payload = { ...me, version }
         return json(res, 200, { ok: true, ...payload, data: payload })
       }
+      // ========== Two-factor for the signed-in account ==========
+      // Before the RBAC gate on purpose: every role manages its own 2FA. A
+      // master API key is not an account, so it has nothing to manage here.
+      if (p === '/api/panel/2fa' || p.startsWith('/api/panel/2fa/')) {
+        const mutationError = companyPanelMutationError(req)
+        if (mutationError) return json(res, mutationError.status, { ok: false, error: mutationError })
+        const self = String(req.panelUser || '')
+        if (!self || req.apiKeyKind) {
+          return json(res, 403, {
+            ok: false,
+            error: { code: 'panel_session_required', message: '请使用面板账号登录后再管理两步验证' },
+          })
+        }
+        // Changing a second factor must prove the first one again, so a
+        // hijacked session cannot silently rebind or remove it.
+        const reauth = (body) => {
+          const password = body?.password || body?.pass || ''
+          if (!password) throw new TwoFactorError('请输入当前密码', 'password_required', 400)
+          if (!verifyPanelLogin(self, password)) throw new TwoFactorError('当前密码不正确', 'password_invalid', 403)
+        }
+        try {
+          if (req.method === 'GET' && p === '/api/panel/2fa') {
+            return json(res, 200, panel.ok(twoFactorStatus(self)))
+          }
+          if (req.method === 'POST' && p === '/api/panel/2fa/setup') {
+            const body = await readBody(req, 4096).catch(() => ({}))
+            reauth(body)
+            return json(res, 200, panel.ok(beginTwoFactorSetup(self, { issuer: 'vm2api', account: self })))
+          }
+          if (req.method === 'POST' && p === '/api/panel/2fa/enable') {
+            const body = await readBody(req, 4096).catch(() => ({}))
+            const result = confirmTwoFactorSetup(self, body?.code || body?.totp || body?.otp || '')
+            // Other sessions were opened without a second factor; make them re-authenticate.
+            revokePanelSessionsForUser(self, { exceptToken: extractPanelToken(req) })
+            return json(res, 200, panel.ok({ ...twoFactorStatus(self), ...result }))
+          }
+          if (req.method === 'POST' && p === '/api/panel/2fa/disable') {
+            const body = await readBody(req, 4096).catch(() => ({}))
+            reauth(body)
+            verifyTwoFactorCode(self, body?.code || body?.totp || body?.otp || '')
+            disableTwoFactor(self)
+            return json(res, 200, panel.ok({ ...twoFactorStatus(self), disabled: true }))
+          }
+          if (req.method === 'POST' && p === '/api/panel/2fa/recovery') {
+            const body = await readBody(req, 4096).catch(() => ({}))
+            reauth(body)
+            const result = regenerateRecoveryCodes(self)
+            return json(res, 200, panel.ok({ ...twoFactorStatus(self), ...result }))
+          }
+        } catch (e) {
+          return twoFactorFailure(e)
+        }
+        return json(res, 404, { ok: false, error: { code: 'not_found', message: 'Not found' } })
+      }
       const gate = authorizePanelRoute(req.method, p, panelIdentity(req).role)
       if (!gate.ok) {
         return json(
@@ -1400,6 +2110,10 @@ export function createPanelHandler(ctx) {
           }).body,
         )
       }
+      if (isGeminiPanelPath(p)) return geminiPanel(req, res, p)
+      const subscriptionRoute = cragSubscriptionRoute(req.method, p)
+      if (subscriptionRoute) return handleCragSubscription(req, res, subscriptionRoute)
+
       if (
         denyIfUserMissesVm(req, res, {
           projectRoot: cfg.paths.project,
@@ -1412,6 +2126,26 @@ export function createPanelHandler(ctx) {
       }
       const mutationError = panelIdentity(req).role === 'user' ? companyPanelMutationError(req) : null
       if (mutationError) return json(res, mutationError.status, { ok: false, error: mutationError })
+      if (req.method === 'PATCH' && p === '/api/panel/me') {
+        if (panelIdentity(req).role !== 'user' || !req.panelUserId) {
+          return json(res, 403, { ok: false, error: { code: 'forbidden', message: '当前权限无法执行此操作' } })
+        }
+        const body = await readBody(req, 4096).catch(() => null)
+        const session = verifyPanelSession(extractPanelToken(req))
+        if (session?.user !== req.panelUser || session?.role !== 'user') {
+          return json(res, 401, { ok: false, error: { code: 'session_expired', message: '请重新登录' } })
+        }
+        try {
+          const username = updateTenantAccount(panelUsers, { userId: req.panelUserId, username: session.user }, body)
+          revokePanelSessionsForUser(session.user)
+          if (username !== session.user) revokePanelSessionsForUser(username)
+          res.setHeader('Set-Cookie', clearPanelSessionCookie({ secure: panelCookieSecure(req) }))
+          return json(res, 200, panel.ok({ user: username }))
+        } catch (error) {
+          if (!error.status && !['invalid_username', 'invalid_password'].includes(error.code)) throw error
+          return json(res, error.status || 400, { ok: false, error: { code: error.code, message: error.message } })
+        }
+      }
       if ((req.method === 'GET' || req.method === 'POST') && /^\/api\/panel\/vms\/[^/]+\/egress-audit$/.test(p)) {
         try {
           const vmId = p.split('/')[4]
@@ -1462,6 +2196,111 @@ export function createPanelHandler(ctx) {
           })
         }
       }
+      // Cold slot moves are administrator-only (not a tenant placement edit).
+      const migrationRoute = /^\/api\/panel\/vms\/([^/]+)\/migration$/.exec(p)
+      if (migrationRoute && ['GET', 'POST'].includes(req.method)) {
+        const id = migrationRoute[1]
+        if (!isValidVmId(id))
+          return json(res, 400, { ok: false, error: { code: 'invalid_vm_id', message: '非法槽位 ID' } })
+        if (!getVm(cfg.paths.project, id))
+          return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: '槽位不存在' } })
+        if (req.method === 'GET') return json(res, 200, panel.ok(slotMigrationJob(cfg.paths.project, id)))
+        try {
+          const body = await readBody(req, 8192)
+          const { job } = startSlotMigration({
+            projectRoot: cfg.paths.project,
+            id,
+            body,
+            routing: ctx.routingConfig,
+            proxyPool,
+            watchdog: ctx.kernelWatchdog,
+            poolScheduler: ctx.poolScheduler,
+            ops: ctx.slotMigrationOps,
+          })
+          return json(res, 202, panel.ok(job))
+        } catch (err) {
+          return json(res, err.status || 500, {
+            ok: false,
+            error: { code: err.code || 'migration_failed', message: redactSecrets(err.message) },
+          })
+        }
+      }
+      const movingVm = /^\/api\/panel\/vms\/([^/]+)(?:\/|$)/.exec(p)?.[1]
+      if (req.method !== 'GET' && movingVm && isValidVmId(movingVm) && slotMigrationBusy(cfg.paths.project, movingVm)) {
+        return json(res, 409, {
+          ok: false,
+          error: { code: 'migration_busy', message: '槽位迁移中或待人工恢复，暂不能修改' },
+        })
+      }
+      const kernelSwitchRoute = /^\/api\/panel\/vms\/([^/]+)\/kernel-switch$/.exec(p)
+      if (kernelSwitchRoute && ['GET', 'POST'].includes(req.method)) {
+        const id = kernelSwitchRoute[1]
+        if (!isValidVmId(id))
+          return json(res, 400, { ok: false, error: { code: 'invalid_vm_id', message: '非法槽位 ID' } })
+        const vm = getVm(cfg.paths.project, id)
+        if (!vm) return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: '槽位不存在' } })
+        if (req.method === 'GET') return json(res, 200, panel.ok(kernelSwitchJobs.get(id) || null))
+        if (kernelSwitchJobs.get(id)?.status === 'running')
+          return json(res, 409, {
+            ok: false,
+            error: { code: 'kernel_switch_in_progress', message: '该槽位正在切换内核，请等待完成' },
+          })
+        const body = await readBody(req, 4096)
+        if (!['crag', 'wrap'].includes(body?.dataplane))
+          return json(res, 400, { ok: false, error: { code: 'invalid_dataplane', message: '请选择 cli-node 或 CRAG' } })
+        const parsed = parseSlotEnginePolicyPatch({
+          dataplane: body.dataplane,
+          crag_kernel_version: body.dataplane === 'crag' ? (body.crag_kernel_version ?? 'v2') : '',
+        })
+        if (!parsed.ok)
+          return json(res, 400, { ok: false, error: { code: 'invalid_kernel_policy', message: parsed.error } })
+        if (isCodexVm(vm) || isNativeNodeVm(vm))
+          return json(res, 400, {
+            ok: false,
+            error: { code: 'kernel_switch_unsupported', message: '当前槽位不支持切换 Claude 内核' },
+          })
+        // readBody yielded: reserve only after checking the latest admission state.
+        if (kernelSwitchJobs.get(id)?.status === 'running')
+          return json(res, 409, {
+            ok: false,
+            error: { code: 'kernel_switch_in_progress', message: '该槽位正在切换内核，请等待完成' },
+          })
+        const switchIdentity = panelIdentity(req)
+        const bindSubscription =
+          !req.apiKeyKind &&
+          switchIdentity.role === 'admin' &&
+          !!switchIdentity.user &&
+          sameOriginPost(req, cfg.base_url)
+        const job = {
+          id: randomUUID(),
+          vm_id: id,
+          ...parsed.patch,
+          status: 'running',
+          started_at: new Date().toISOString(),
+          finished_at: null,
+          error: null,
+        }
+        kernelSwitchJobs.set(id, job)
+        setImmediate(async () => {
+          try {
+            const result = await applySlotPolicyWithRuntime(id, parsed.patch, { bindSubscription })
+            if (!result.ok) throw Object.assign(new Error(result.error || '内核切换失败'), { code: result.code })
+            job.status = 'succeeded'
+            if (result.reclaim_pending) job.reclaim_pending = true
+            if (result.deferred_start) {
+              job.deferred_start = true
+              job.deferred_reason = result.deferred_reason || null
+              job.start_error = result.start_error || null
+            }
+          } catch (error) {
+            job.status = 'failed'
+            job.error = { code: error.code || 'kernel_switch_failed', message: redactSecrets(error.message) }
+          } finally {
+            job.finished_at = new Date().toISOString()
+          }
+        })
+        return json(res, 202, panel.ok({ ...job }))
+      }
       if ((req.method === 'GET' || req.method === 'PUT') && p === '/api/panel/onboarding') {
         if (req.method === 'PUT') {
           const body = await readBody(req, 4096).catch(() => ({}))
@@ -1477,7 +2316,7 @@ export function createPanelHandler(ctx) {
             const state = loadOnboardingState(settings)
             let next
             if (body?.action === 'profile') {
-              applyUsageProfile({
+              await applyUsageProfile({
                 mode: body?.mode,
                 persistRouting: (patch) => persistRoutingPatch(patch),
                 settings,
@@ -1543,7 +2382,13 @@ export function createPanelHandler(ctx) {
         return json(res, result.status, panel.ok(result.data))
       }
       if (req.method === 'GET' && p === '/api/panel/users') {
-        return json(res, 200, panel.ok({ items: panelUsers.list() }))
+        const items = panelUsers.list()
+        const twoFactor = twoFactorEnabledFor(items.map((item) => item.username))
+        return json(
+          res,
+          200,
+          panel.ok({ items: items.map((item) => ({ ...item, two_factor: !!twoFactor.get(item.username) })) }),
+        )
       }
       if (req.method === 'POST' && p === '/api/panel/users') {
         const body = await readBody(req, 8192).catch(() => ({}))
@@ -1554,6 +2399,7 @@ export function createPanelHandler(ctx) {
             role: body.role || 'user',
             enabled: body.enabled !== false,
             vm_create_quota: body.vm_create_quota,
+            concurrency: body.concurrency,
           })
           return json(res, 201, panel.ok({ item: publicUserView(rec) }))
         } catch (e) {
@@ -1602,6 +2448,18 @@ export function createPanelHandler(ctx) {
           })
         }
       }
+      if (req.method === 'DELETE' && /^\/api\/panel\/users\/[^/]+\/2fa$/.test(p)) {
+        // Admin unlock for a user who lost both the authenticator and the
+        // recovery codes. 2FA is cleared, so the next sign-in is password-only.
+        const id = p.split('/')[4]
+        const target = panelUsers.getById(id)
+        if (!target) return json(res, 404, { ok: false, error: { message: 'user not found', code: 'not_found' } })
+        const reset = disableTwoFactor(target.username)
+        // Sessions predating the reset keep a second factor the account no
+        // longer has; make the user sign in again.
+        revokePanelSessionsForUser(target.username)
+        return json(res, 200, panel.ok({ username: target.username, reset }))
+      }
       if (req.method === 'GET' && p === '/api/panel/vm-pools') {
         return json(res, 200, panel.ok({ pools: vmPoolsFor(apiKeyStore.db).list() }))
       }
@@ -1648,30 +2506,50 @@ export function createPanelHandler(ctx) {
       }
       if (req.method === 'GET' && p === '/api/panel/api-keys') {
         const snap = apiKeyStore.snapshot()
-        if (panelIdentity(req).role === 'user') {
-          const mine = (snap.keys || []).filter(
-            (k) => normalizeOwnerId(k.user_id) === normalizeOwnerId(req.panelUserId),
-          )
-          return json(res, 200, {
-            ok: true,
-            total: mine.length,
-            active: mine.filter((k) => k.status === 'active').length,
-            keys: mine,
-          })
-        }
-        return json(res, 200, { ok: true, ...snap })
+        const mine = (snap.keys || []).filter((key) => panelOwnsKey(req, key))
+        return json(res, 200, {
+          ok: true,
+          total: mine.length,
+          active: mine.filter((k) => k.status === 'active').length,
+          keys: mine,
+        })
       }
       if (req.method === 'GET' && /^\/api\/panel\/api-keys\/[^/]+\/stats$/.test(p)) {
         const id = p.split('/')[4]
         if (denyIfUserMissesKey(req, res, { apiKeyStore, json, keyId: id })) return true
         const rec = apiKeyStore.getById(id)
         if (!rec) return json(res, 404, { ok: false, error: { message: 'api key not found' } })
-        const usage_stats = requestLog?.keyUsageStats?.({ apiKeyId: id, days: 30 }) || null
+        const usage_stats =
+          requestLog?.keyUsageStats?.({
+            apiKeyId: id,
+            days: 30,
+            owner_user_id: panelIdentity(req).role === 'user' ? req.panelUserId : null,
+          }) || null
         return json(res, 200, { ok: true, item: publicKeyView(rec, { reveal: false }), usage_stats })
       }
       if (req.method === 'POST' && p === '/api/panel/api-keys') {
-        const body = await readBody(req, 8192).catch(() => ({}))
         const ident = panelIdentity(req)
+        const body = await readBody(req, ident.role === 'user' ? 8192 : API_KEY_BODY_MAX).catch(() =>
+          ident.role === 'user' ? null : {},
+        )
+        if (ident.role === 'user') {
+          try {
+            const input = tenantKeyCreateInput({
+              body,
+              ownerId: req.panelUserId,
+              store: apiKeyStore,
+              vms: keyScopeVms(req),
+              defaultConcurrency: ctx.routingConfig?.concurrency?.default_key_concurrency ?? 12,
+            })
+            const rec = apiKeyStore.create(input)
+            return json(res, 201, { ok: true, item: publicKeyView(rec, { reveal: true }) })
+          } catch (e) {
+            return json(res, e.status || 400, {
+              ok: false,
+              error: { code: e.code || 'create_failed', message: String(e.message || e) },
+            })
+          }
+        }
         if (ident.role !== 'admin' && body?.vm_pool_id != null && String(body.vm_pool_id).trim() !== '') {
           return json(res, 403, {
             ok: false,
@@ -1685,15 +2563,24 @@ export function createPanelHandler(ctx) {
           })
         }
         const input = normalizePanelApiKeyInput(body, req)
+        if (!input.user_id && req.apiKeyKind !== 'master') {
+          return json(res, 403, {
+            ok: false,
+            error: { code: 'key_owner_required', message: 'API key owner is required' },
+          })
+        }
         try {
-          const scopeInput = { group_type: body?.group_type, allowed_vms: body?.allowed_vms }
+          const isApi = isApiCategory(body?.category)
+          const scopeInput = { group_type: body?.group_type, allowed_vms: body?.allowed_vms, category: body?.category }
           if (ident.role === 'admin' && Object.prototype.hasOwnProperty.call(body || {}, 'vm_pool_id')) {
             scopeInput.vm_pool_id = body.vm_pool_id
           }
-          const scope = normalizeKeyScope(scopeInput)
+          const scope = normalizeKeyScope(scopeInput, { isApi })
           const pools = vmPoolsFor(apiKeyStore.db)
-          if (scope.vm_pool_id) assertVmPoolExists(pools, scope.vm_pool_id)
-          else assertVmScope(keyScopeVms(req), scope)
+          if (!isApi) {
+            if (scope.vm_pool_id) assertVmPoolExists(pools, scope.vm_pool_id)
+            else assertVmScope(keyScopeVms(req), scope)
+          }
           const defaultConc = Number(
             ctx.routingConfig?.concurrency?.default_key_concurrency ??
               ctx.routingConfig?.concurrency?.default_max_per_account ??
@@ -1703,12 +2590,13 @@ export function createPanelHandler(ctx) {
             name: body?.name,
             key: body?.key || body?.custom_key || undefined,
             category: body?.category,
-            user_id:
-              panelIdentity(req).role === 'user' ? req.panelUserId || null : body?.user_id || req.panelUserId || null,
+            api_endpoint_id: validateKeyEndpoint(input.api_endpoint_id, isApi),
+            user_id: input.user_id,
             group_id: input.group_id,
             group_type: scope.group_type,
             allowed_vms: scope.allowed_vms,
             vm_pool_id: scope.vm_pool_id,
+            allowed_models: body?.allowed_models,
             max_concurrency: body?.max_concurrency ?? defaultConc,
             default_concurrency: defaultConc,
             quota_requests: input.quota_requests,
@@ -1739,8 +2627,24 @@ export function createPanelHandler(ctx) {
       if (req.method === 'PATCH' && /^\/api\/panel\/api-keys\/[^/]+$/.test(p)) {
         const id = p.split('/').pop()
         if (denyIfUserMissesKey(req, res, { apiKeyStore, json, keyId: id })) return true
-        const body = await readBody(req, 8192).catch(() => ({}))
         const ident = panelIdentity(req)
+        const body = await readBody(req, ident.role === 'user' ? 8192 : API_KEY_BODY_MAX).catch(() =>
+          ident.role === 'user' ? null : {},
+        )
+        // Ownership may be revoked while the request body is arriving.
+        if (denyIfUserMissesKey(req, res, { apiKeyStore, json, keyId: id })) return true
+        if (ident.role === 'user') {
+          try {
+            const rec = apiKeyStore.update(id, tenantKeyInput(body))
+            return json(res, 200, { ok: true, item: publicKeyView(rec, { reveal: false }) })
+          } catch (e) {
+            return json(res, e.status || 400, {
+              ok: false,
+              error: { code: e.code || 'update_failed', message: String(e.message || e) },
+            })
+          }
+        }
+        const currentRec = apiKeyStore.getById(id)
         if (ident.role !== 'admin' && body?.vm_pool_id != null && String(body.vm_pool_id).trim() !== '') {
           return json(res, 403, {
             ok: false,
@@ -1755,19 +2659,28 @@ export function createPanelHandler(ctx) {
         }
         try {
           const input = normalizePanelApiKeyInput(body || {}, req)
-          const currentRec = apiKeyStore.getById(id)
-          const scopeInput = { group_type: body?.group_type, allowed_vms: body?.allowed_vms }
+          const isApi = isApiCategory(body?.category ?? currentRec?.category)
+          if (Object.hasOwn(input, 'api_endpoint_id')) {
+            input.api_endpoint_id = validateKeyEndpoint(input.api_endpoint_id, isApi, currentRec?.api_endpoint_id)
+          }
+          const scopeInput = {
+            group_type: body?.group_type,
+            allowed_vms: body?.allowed_vms,
+            category: isApi ? 'api' : 'oauth',
+          }
           if (ident.role === 'admin' && Object.prototype.hasOwnProperty.call(body || {}, 'vm_pool_id')) {
             scopeInput.vm_pool_id = body.vm_pool_id
           }
-          const scope = normalizeKeyScope(scopeInput, { partial: true, current: currentRec })
+          const scope = normalizeKeyScope(scopeInput, { partial: true, current: currentRec, isApi })
           if (scope) {
             if (ident.role !== 'admin' && currentRec?.vm_pool_id) {
               scope.vm_pool_id = currentRec.vm_pool_id
             }
             const pools = vmPoolsFor(apiKeyStore.db)
-            if (scope.vm_pool_id) assertVmPoolExists(pools, scope.vm_pool_id)
-            else assertVmScope(keyScopeVms(req), scope)
+            if (!isApi) {
+              if (scope.vm_pool_id) assertVmPoolExists(pools, scope.vm_pool_id)
+              else assertVmScope(keyScopeVms(req), scope)
+            }
             input.group_type = scope.group_type
             input.allowed_vms = scope.allowed_vms
             input.vm_pool_id = scope.vm_pool_id
@@ -1814,6 +2727,13 @@ export function createPanelHandler(ctx) {
       if (req.method === 'POST' && /^\/api\/panel\/api-keys\/[^/]+\/reset-quota$/.test(p)) {
         const id = p.split('/')[4]
         if (denyIfUserMissesKey(req, res, { apiKeyStore, json, keyId: id })) return true
+        if (panelIdentity(req).role === 'user') {
+          const body = await readBody(req, 2048).catch(() => null)
+          if (!body || Array.isArray(body) || typeof body !== 'object' || Object.keys(body).length !== 0) {
+            return json(res, 403, { ok: false, error: { code: 'key_reset_input_forbidden', message: '仅允许重置密钥用量计数' } })
+          }
+          if (denyIfUserMissesKey(req, res, { apiKeyStore, json, keyId: id })) return true
+        }
         const rec = apiKeyStore.update(id, { reset_quota: true })
         if (!rec) return json(res, 404, { ok: false, error: { message: 'api key not found' } })
         return json(res, 200, { ok: true, item: publicKeyView(rec, { reveal: false }) })
@@ -1821,7 +2741,7 @@ export function createPanelHandler(ctx) {
       if (req.method === 'DELETE' && /^\/api\/panel\/api-keys\/[^/]+$/.test(p)) {
         const id = p.split('/').pop()
         if (denyIfUserMissesKey(req, res, { apiKeyStore, json, keyId: id })) return true
-        const ok = apiKeyStore.remove(id)
+        const ok = apiKeyStore.remove(id, { preserveHistory: panelIdentity(req).role === 'user' })
         if (!ok) return json(res, 404, { ok: false, error: { message: 'api key not found' } })
         return json(res, 200, { ok: true, deleted: id })
       }
@@ -1843,11 +2763,11 @@ export function createPanelHandler(ctx) {
           const result = await fetchUpstreamModels({
             cfg,
             kind: body?.kind,
-            protocol: body?.protocol,
+            protocol: body?.protocol || saved?.protocol,
             base_url: body?.base_url || saved?.base_url,
             api_key: body?.api_key || saved?.api_key,
             proxy_url: proxyUrl,
-            headers: body?.headers,
+            headers: body?.headers ?? saved?.headers,
             auth_scheme: body?.auth_scheme || body?.authScheme || saved?.auth_scheme,
             forward: ctx.forwardApi,
           })
@@ -1886,6 +2806,7 @@ export function createPanelHandler(ctx) {
           const proxyUrl = body?.proxy_id ? resolveConsoleProxyUrl(proxyPool, body.proxy_id) : ''
           const rec = apiEndpointStore.update(id, body || {})
           if (!rec) return json(res, 404, { ok: false, error: { message: 'endpoint not found' } })
+          if (Array.isArray(body?.fetched_models)) apiEndpointStore.mergeFetchedModels(id, body.fetched_models)
           const keyId = String(body?.key_id || '').trim()
           const apiKey = String(body?.api_key || '').trim()
           if (keyId) {
@@ -1931,8 +2852,27 @@ export function createPanelHandler(ctx) {
             api_key: key.api_key,
             proxy_url: key.proxy_url,
             headers: ep.headers,
+            forward: ctx.forwardApi,
           })
           const apply = body?.apply !== false
+          if (apply) {
+            const current = apiEndpointStore.getRaw(id)
+            if (!current) return json(res, 404, { ok: false, error: { message: 'endpoint not found' } })
+            const currentKey = current.api_key_entries.find((item) => item.id === key.id && !item.disabled)
+            if (
+              current.base_url !== ep.base_url ||
+              current.kind !== ep.kind ||
+              current.protocol !== ep.protocol ||
+              JSON.stringify(current.headers) !== JSON.stringify(ep.headers) ||
+              currentKey?.api_key !== key.api_key ||
+              currentKey.proxy_url !== key.proxy_url
+            ) {
+              return json(res, 409, {
+                ok: false,
+                error: { message: '渠道配置已变更，请重新获取模型', code: 'endpoint_changed' },
+              })
+            }
+          }
           const rec = apply ? apiEndpointStore.mergeFetchedModels(id, result.models) : ep
           if (apply) apiScheduler.reload(apiEndpointStore.listRaw())
           return json(res, 200, {
@@ -1978,7 +2918,7 @@ export function createPanelHandler(ctx) {
         const item = publicEndpointView(ep)?.api_key_entries?.find((k) => k.id === kid)
         return json(res, 200, { ok: true, item })
       }
-      if (req.method === 'POST' && p === '/api/panel/anthropic/messages') {
+      if (req.method === 'POST' && /^\/api\/panel\/(?:api|anthropic)\/messages$/.test(p)) {
         const body = await readBody(req, 64 * 1024).catch(() => ({}))
         try {
           const result = await runAnthropicConsole({
@@ -2064,9 +3004,10 @@ export function createPanelHandler(ctx) {
           status_code: listed.status_code || (/^\d+$/.test(legacyStatus || '') ? legacyStatus : null),
           errors_only: legacyStatus === 'error',
         }
-        const { items, total, capped } = new UsageLogsView(getDb(), {
-          mutedErrorClasses: requestLog?.mutedErrorClasses,
-        }).exportRows(filters)
+        const exported =
+          (await readUsage('view', 'exportRows', [filters])) ||
+          new UsageLogsView(getDb(), { mutedErrorClasses: requestLog?.mutedErrorClasses }).exportRows(filters)
+        const { items, total, capped } = exported
         const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '')
         const body = format === 'csv' ? logsToCsv(items) : logsToJsonl(items)
         const filename = `vm2api-logs-${stamp}.${format}`
@@ -2093,14 +3034,36 @@ export function createPanelHandler(ctx) {
         const until = u.searchParams.get('until') || null
         const tenant = panelIdentity(req).role === 'user'
         const owner_user_id = tenant ? req.panelUserId : u.searchParams.get('user_id') || null
+        let totals
+        let buckets
+        let window
+        if (usagePoolEnabled()) {
+          try {
+            const jobs = [
+              usageRead({ kind: 'repo', method: 'aggregate', args: [{ since, until, bucket, owner_user_id }] }),
+              usageRead({ kind: 'repo', method: 'windowStats', args: [{ since, until, owner_user_id }] }),
+            ]
+            if (!tenant) jobs.unshift(usageRead({ kind: 'repo', method: 'totals' }))
+            const out = await Promise.all(jobs)
+            if (tenant) [buckets, window] = out
+            else [totals, buckets, window] = out
+          } catch (err) {
+            console.warn(`[sqlite-pool] repo.stats: ${err?.message || err}`)
+          }
+        }
+        if (buckets === undefined) {
+          totals = tenant ? null : requestLog.totals()
+          buckets = requestLog.aggregate({ since, until, bucket, owner_user_id })
+          window = requestLog.windowStats({ since, until, owner_user_id })
+        }
         return json(res, 200, {
           ok: true,
           bucket,
           since,
           until,
-          totals: tenant ? null : requestLog.totals(),
-          buckets: requestLog.aggregate({ since, until, bucket, owner_user_id }),
-          window: requestLog.windowStats({ since, until, owner_user_id }),
+          totals: totals ?? null,
+          buckets,
+          window,
           muted_error_classes: requestLog.snapshot().muted_error_classes,
           config: tenant ? null : requestLog.snapshot(),
         })
@@ -2135,37 +3098,43 @@ export function createPanelHandler(ctx) {
       // Lives beside /request-logs (offset + snake_case, still used by error
       // collection and export); this surface never COUNTs the table.
       const usageLogsView = () => new UsageLogsView(getDb(), { mutedErrorClasses: requestLog?.mutedErrorClasses })
+      const readView = async (method, ...args) =>
+        (await readUsage('view', method, args)) ?? usageLogsView()[method](...args)
       const tenantId = () => (panelIdentity(req).role === 'user' ? req.panelUserId : null)
       if (req.method === 'GET' && p === '/api/panel/usage-logs') {
         const u = new URL(req.url, 'http://x')
-        return json(res, 200, panel.ok(usageLogsView().listBatch(usageLogFilters(req, u))))
+        return json(res, 200, panel.ok(await readView('listBatch', usageLogFilters(req, u))))
       }
       if (req.method === 'GET' && p === '/api/panel/usage-logs/summary') {
         const u = new URL(req.url, 'http://x')
-        return json(res, 200, panel.ok(usageLogsView().summary(usageLogFilters(req, u))))
+        return json(res, 200, panel.ok(await readView('summary', usageLogFilters(req, u))))
       }
       if (req.method === 'GET' && p === '/api/panel/usage-logs/filter-options') {
-        return json(res, 200, panel.ok(usageLogsView().filterOptions({ owner_user_id: tenantId() })))
+        return json(res, 200, panel.ok(await readView('filterOptions', { owner_user_id: tenantId() })))
       }
       if (req.method === 'GET' && p === '/api/panel/usage-logs/session-suggestions') {
         const u = new URL(req.url, 'http://x')
         const q = u.searchParams.get('q') || ''
         const limit = u.searchParams.get('limit')
-        return json(res, 200, panel.ok(usageLogsView().sessionSuggestions({ q, limit, owner_user_id: tenantId() })))
+        return json(res, 200, panel.ok(await readView('sessionSuggestions', { q, limit, owner_user_id: tenantId() })))
       }
       if (req.method === 'GET' && p === '/api/panel/usage-logs/active-sessions') {
         const u = new URL(req.url, 'http://x')
         const minutes = u.searchParams.get('minutes')
         const limit = u.searchParams.get('limit')
-        return json(res, 200, panel.ok(usageLogsView().activeSessions({ minutes, limit, owner_user_id: tenantId() })))
+        return json(res, 200, panel.ok(await readView('activeSessions', { minutes, limit, owner_user_id: tenantId() })))
       }
       if (req.method === 'GET' && p === '/api/panel/usage-logs/overview') {
         const u = new URL(req.url, 'http://x')
         const tz = u.searchParams.get('tz') || 'UTC'
-        return json(res, 200, panel.ok(usageLogsView().overview({ tz, owner_user_id: tenantId() })))
+        const owner_user_id = globalStatisticsRequested(u) ? null : tenantId()
+        return json(res, 200, panel.ok(await readView('overview', { tz, owner_user_id })))
       }
 
       // ---- Statistics page ----
+      if (req.method === 'GET' && p === '/api/panel/statistics/vm-batches') {
+        return json(res, 200, panel.ok(vmDeliveryBatchStatistics(getDb())))
+      }
       if (req.method === 'GET' && p === '/api/panel/statistics') {
         const u = new URL(req.url, 'http://x')
         const q = statsParams(req, u, 'dimension')
@@ -2179,11 +3148,10 @@ export function createPanelHandler(ctx) {
         if (q.error) return json(res, 400, { ok: false, error: { message: q.error } })
         const { range, dimension: scope, tz, owner_user_id } = q
         const limit = u.searchParams.get('limit')
-        return json(
-          res,
-          200,
-          panel.ok(new StatisticsRepo(getDb()).leaderboard({ range, scope, limit, tz, owner_user_id })),
-        )
+        const db = getDb()
+        const board = new StatisticsRepo(db).leaderboard({ range, scope, limit, tz, owner_user_id })
+        const tenantUserBoard = scope === 'user' && panelIdentity(req).role === 'user'
+        return json(res, 200, panel.ok(tenantUserBoard ? tenantUserLeaderboard(db, board) : board))
       }
 
       if (req.method === 'GET' && p === '/api/panel/billing') {
@@ -2357,6 +3325,7 @@ export function createPanelHandler(ctx) {
           panel.ok({
             vm: normalizeVmConfig(ctx.routingConfig?.vm),
             kvm,
+            crag_supported: process.platform === 'linux' && process.arch === 'x64',
           }),
         )
       }
@@ -2371,8 +3340,199 @@ export function createPanelHandler(ctx) {
           ids: Array.isArray(body.ids) ? body.ids : null,
           concurrency: body.concurrency,
           routing: ctx.routingConfig,
+          telemetryLifecycle: { watchdog: ctx.kernelWatchdog, poolScheduler: ctx.poolScheduler },
         })
         return json(res, 200, panel.ok(report))
+      }
+      if (req.method === 'GET' && p === '/api/panel/kernels') {
+        const vms = keyScopeVms(req).filter((vm) => !isCodexVm(vm))
+        const licenses = Object.create(null)
+        const installLicenses = Object.create(null)
+        const installations = Object.create(null)
+        for (const summary of vms) {
+          const vm = getVm(cfg.paths.project, summary.id)
+          if (!vm) continue
+          // Inventory is read-only: only the explicit activation endpoint creates identities.
+          const { license } = getCragLicense(cfg.paths.project, vm, { initialize: false })
+          licenses[vm.id] = license
+          installLicenses[vm.id] = getCragLicense(cfg.paths.project, vm, { preferInstalled: false }).license
+          if (summary.kernel_installation) installations[vm.id] = summary.kernel_installation
+        }
+        return json(
+          res,
+          200,
+          panel.ok({
+            kernels: describeKernelCatalog(cfg.paths.project),
+            crag_pin: cragReleasePin(cfg.paths.project),
+            licenses,
+            install_licenses: installLicenses,
+            installations,
+          }),
+        )
+      }
+      if (req.method === 'GET' && p === '/api/panel/kernels/releases') {
+        try {
+          const releases = await listKernelReleaseVersions({ fetchImpl: ctx.fetchImpl })
+          return json(res, 200, panel.ok(releases))
+        } catch {
+          return json(res, 502, {
+            ok: false,
+            error: { code: 'kernel_releases_unavailable', message: '暂时无法读取发行版本' },
+          })
+        }
+      }
+      // Several cached releases side by side.
+      if (req.method === 'GET' && p === '/api/panel/kernels/cached') {
+        const result = listKernelReleases(cfg.paths.project, url.searchParams.get('kernel') || 'crag')
+        if (!result.ok)
+          return json(res, 400, {
+            ok: false,
+            error: { code: result.code, message: result.error },
+          })
+        return json(res, 200, panel.ok({ releases: result.releases }))
+      }
+      if (req.method === 'POST' && p === '/api/panel/kernels/select') {
+        const body = await readBody(req, 8 * 1024)
+        const result = selectKernelRelease(cfg.paths.project, {
+          kernel: body?.kernel,
+          tag: body?.tag,
+        })
+        if (!result.ok) {
+          const status =
+            result.code === 'kernel_pull_busy' ? 409 : result.code === 'kernel_release_not_cached' ? 404 : 400
+          return json(res, status, {
+            ok: false,
+            error: { code: result.code, message: result.error },
+          })
+        }
+        return json(res, 200, panel.ok({ kernel: result.kernel, release: result.release }))
+      }
+      if (req.method === 'POST' && p === '/api/panel/kernels/pull') {
+        const body = await readBody(req, 8 * 1024)
+        if (
+          !body ||
+          !['cli-node', 'crag'].includes(body.kernel) ||
+          (body.tag != null && typeof body.tag !== 'string') ||
+          (body.latest != null && typeof body.latest !== 'boolean')
+        ) {
+          return json(res, 400, {
+            ok: false,
+            error: { code: 'kernel_target_invalid', message: '请选择 cli-node 或 CRAG' },
+          })
+        }
+        const result = await pullKernelRelease(
+          cfg.paths.project,
+          // The manual two-step flow still tracks the newest release. Only a
+          // caller that explicitly asks for `latest: false` gets the pin.
+          { kernel: body.kernel, tag: body.tag || '', latest: body.latest !== false },
+          { fetchImpl: ctx.fetchImpl },
+        )
+        if (!result.ok)
+          return json(res, kernelReleaseHttpStatus(result.code), {
+            ok: false,
+            error: { code: result.code, message: result.error },
+          })
+        return json(
+          res,
+          200,
+          panel.ok({ kernel: result.kernel, ...(result.release ? { release: result.release } : {}) }),
+        )
+      }
+      if (req.method === 'POST' && ['/api/panel/kernels/install', '/api/panel/kernels/crag-update'].includes(p)) {
+        const body = await readBody(req, 32 * 1024)
+        const selection = validateKernelTargets(cfg.paths.project, body?.targets)
+        if (!selection.ok)
+          return json(res, selection.status, { ok: false, error: { code: selection.code, message: selection.error } })
+        const identity = panelIdentity(req)
+        const mayBindSubscription =
+          req.apiKeyKind === 'master' ||
+          (!req.apiKeyKind && identity.role === 'admin' && !!identity.user && sameOriginPost(req, cfg.base_url))
+        if (!mayBindSubscription && body.targets.some((target) => target.reissue === true)) {
+          return json(res, 403, {
+            ok: false,
+            error: { code: 'forbidden', message: '只有从面板确认安装的管理员才能绑定订阅许可。' },
+          })
+        }
+        // Check the entire explicit scope before the first target can be stopped.
+        if (body.targets.some((target) => userMissesVmId(req, cfg.paths.project, target.id))) {
+          return json(res, 403, { ok: false, error: { code: 'forbidden', message: '无权管理所选虚拟机' } })
+        }
+        const updateExisting = p === '/api/panel/kernels/crag-update'
+        if (
+          updateExisting &&
+          body.targets.some((target) => target.kernel !== 'crag' || !(target.payload_tag || target.expected_tag))
+        ) {
+          return json(res, 400, {
+            ok: false,
+            error: { code: 'kernel_target_invalid', message: '更新必须指定 CRAG 发行版本' },
+          })
+        }
+        const install = () =>
+          installKernelTargets({
+            projectRoot: cfg.paths.project,
+            targets: body.targets.map((target) => ({ ...target, update_existing: updateExisting })),
+            routing: ctx.routingConfig,
+            watchdog: ctx.kernelWatchdog,
+            poolScheduler: ctx.poolScheduler,
+            ops: ctx.kernelInstallOps,
+            cragSubscription: mayBindSubscription ? ctx.cragSubscription : undefined,
+            releaseStoppedBinding: ctx.cragSubscription?.releaseStoppedBinding?.bind(ctx.cragSubscription),
+          })
+        if (body.background === true) {
+          pruneKernelInstallJobs()
+          if (kernelInstallJobs.size >= 256)
+            return json(res, 429, {
+              ok: false,
+              error: { code: 'kernel_install_queue_full', message: '内核安装任务过多，请稍后再试。' },
+            })
+          const jobId = randomUUID()
+          const targets = body.targets.map(({ id, kernel }) => ({ id, kernel }))
+          const job = { targets, state: 'running', expiresAt: Infinity }
+          kernelInstallJobs.set(jobId, job)
+          install()
+            .then((report) => {
+              job.state = 'completed'
+              job.report = report
+              for (const item of report.items || [])
+                console.log(
+                  `[kernel-install] background ${item.id} ${item.kernel} ${item.ok ? 'ok' : `failed ${item.code || ''}`}`,
+                )
+            })
+            .catch(() => {
+              job.state = 'unknown'
+              console.warn(`[kernel-install] background job ${jobId} did not return a result`)
+            })
+            .finally(() => {
+              job.expiresAt = Date.now() + 15 * 60_000
+            })
+          return json(res, 202, panel.ok({ background: true, job_id: jobId, targets }))
+        }
+        return json(res, 200, panel.ok(await install()))
+      }
+      if (req.method === 'GET' && p === '/api/panel/kernels/install') {
+        const jobId = url.searchParams.get('job_id')
+        if (jobId !== null) {
+          pruneKernelInstallJobs()
+          const job = kernelInstallJobs.get(jobId)
+          if (!job || job.targets.some(({ id }) => userMissesVmId(req, cfg.paths.project, id)))
+            return json(res, 404, {
+              ok: false,
+              error: { code: 'kernel_install_job_missing', message: '未找到安装结果，请核对槽位后再操作。' },
+            })
+          return json(res, 200, panel.ok({ state: job.state, ...(job.report && { report: job.report }) }))
+        }
+        const items = listActiveKernelInstalls().filter((item) => !userMissesVmId(req, cfg.paths.project, item.id))
+        return json(res, 200, panel.ok({ items }))
+      }
+      if (req.method === 'POST' && p === '/api/panel/kernels/install/cancel') {
+        const body = await readBody(req, 8 * 1024).catch(() => ({}))
+        const id = typeof body?.id === 'string' ? body.id : ''
+        if (!id) return json(res, 400, { ok: false, error: { code: 'vm_id_required', message: '请选择虚拟机' } })
+        if (userMissesVmId(req, cfg.paths.project, id))
+          return json(res, 403, { ok: false, error: { code: 'forbidden', message: '无权管理所选虚拟机' } })
+        const result = cancelKernelInstall(id)
+        if (!result.ok) return json(res, 404, { ok: false, error: { code: result.code, message: result.error } })
+        return json(res, 200, panel.ok(result))
       }
       if (req.method === 'GET' && p === '/api/panel/wrap-cli') {
         const sample = describeWrapSample(cfg.paths.project)
@@ -2401,42 +3561,149 @@ export function createPanelHandler(ctx) {
         if (!targets.ok) {
           return json(res, 400, { ok: false, error: { message: targets.error } })
         }
-        const previous = structuredClone(ctx.routingConfig)
-        try {
-          if (targets.all) {
-            persistRoutingPatch({
-              inference: {
-                ...(ctx.routingConfig.inference || {}),
-                dataplane: parsed.value,
-              },
-            })
-          } else {
-            for (const id of targets.ids) {
-              persistSlotEnginePolicy(cfg.paths.project, id, { dataplane: parsed.value })
-            }
-          }
-        } catch (error) {
-          ctx.routingConfig = previous
-          return json(res, 503, {
-            ok: false,
-            error: { code: 'dataplane_persist_failed', message: String(error?.message || error) },
-          })
-        }
-        const report = await syncInstalledKernels({
-          project: cfg.paths.project,
-          routingConfig: ctx.routingConfig,
-          body: {
-            ids: targets.all ? undefined : targets.ids,
-            restart: body.restart !== false,
+        return await syncInstalledKernels(
+          {
+            project: cfg.paths.project,
+            restartKernel: ctx.kernelPolicyOps?.restartRustKernel,
+            body: { ids: targets.all ? undefined : targets.ids, restart: body.restart !== false },
           },
-        })
-        return json(
-          res,
-          report.ok ? 200 : 503,
-          panel.ok({
-            dataplane: parsed.value,
-            ...report,
-          }),
+          async (syncArgs) => {
+            const previous = structuredClone(ctx.routingConfig)
+            if (body.restart !== false) {
+              const nextRouting = targets.all
+                ? { ...ctx.routingConfig, inference: { ...ctx.routingConfig.inference, dataplane: parsed.value } }
+                : ctx.routingConfig
+              const dpIdentity = panelIdentity(req)
+              const bindSubscription =
+                !req.apiKeyKind && dpIdentity.role === 'admin' && !!dpIdentity.user && sameOriginPost(req, cfg.base_url)
+              for (const id of syncArgs.body.ids) {
+                const vm = getVm(cfg.paths.project, id)
+                const desired = targets.all ? vm : vmWithSlotPolicyPatch(vm, { dataplane: parsed.value })
+                if (resolveKernelDataplane(desired, nextRouting) === 'crag' && isNativeNodeVm(desired)) {
+                  return json(res, 400, {
+                    ok: false,
+                    error: { code: 'remote_unsupported', message: 'CRAG 切核暂不支持 macOS 原生槽' },
+                  })
+                }
+              }
+              let switchAll = async () => {
+                // Publish every KVM grant before changing the inherited default or any slot policy.
+                for (const id of syncArgs.body.ids) {
+                  const vm = getVm(cfg.paths.project, id)
+                  const desired = targets.all ? vm : vmWithSlotPolicyPatch(vm, { dataplane: parsed.value })
+                  await projectKvmCragSwitchLicense(vm, desired, previous, nextRouting)
+                }
+                if (targets.all) await persistRoutingPatch({ inference: nextRouting.inference })
+                const items = []
+                for (const id of syncArgs.body.ids) {
+                  const switched = await applySlotPolicyWithRuntimeLocked(
+                    id,
+                    targets.all ? {} : { dataplane: parsed.value },
+                    {
+                      maintenance: true,
+                      previousRouting: previous,
+                      cragLicenseProjected: true,
+                      releaseBinding: true,
+                      bindSubscription,
+                    },
+                  )
+                  items.push({
+                    id,
+                    ok: switched.ok,
+                    code: switched.code,
+                    error: switched.error,
+                    ...(switched.reclaim_pending && { reclaim_pending: true }),
+                    ...(switched.deferred_start && {
+                      deferred_start: true,
+                      deferred_reason: switched.deferred_reason || null,
+                      start_error: switched.start_error || null,
+                    }),
+                  })
+                }
+                const failed = items.filter((item) => !item.ok).length
+                return {
+                  ok: failed === 0,
+                  total: items.length,
+                  ok_count: items.length - failed,
+                  failed_count: failed,
+                  items,
+                }
+              }
+              for (const id of [...syncArgs.body.ids].reverse()) {
+                if (getVm(cfg.paths.project, id)?.status !== 'running') continue
+                const operation = switchAll
+                switchAll = () =>
+                  withSlotMaintenance({
+                    projectRoot: cfg.paths.project,
+                    id,
+                    watchdog: kernelSwitchWatchdog,
+                    poolScheduler: ctx.poolScheduler,
+                    operation,
+                  })
+              }
+              try {
+                const report = await switchAll()
+                return json(res, report.ok ? 200 : 503, panel.ok({ dataplane: parsed.value, ...report }))
+              } catch (error) {
+                ctx.routingConfig = previous
+                return json(res, 503, {
+                  ok: false,
+                  error: {
+                    code: error?.code === 'crag_license_projection_failed' ? error.code : 'dataplane_persist_failed',
+                    message: String(error?.message || error),
+                  },
+                })
+              }
+            }
+            try {
+              const nextRouting = targets.all
+                ? { ...previous, inference: { ...previous.inference, dataplane: parsed.value } }
+                : previous
+              const initialize = ctx.kernelPolicyOps?.initializeSlotSeedFiles || initializeSlotSeedFiles
+              for (const id of syncArgs.body.ids) {
+                const vm = getVm(cfg.paths.project, id)
+                if (!vm || isCodexVm(vm)) continue
+                const desired = targets.all ? vm : vmWithSlotPolicyPatch(vm, { dataplane: parsed.value })
+                if (resolveKernelDataplane(vm, previous) === resolveKernelDataplane(desired, nextRouting)) continue
+                if (checkCragLicense(cfg.paths.project, desired, nextRouting).ok)
+                  await initialize(cfg.paths.project, desired, slotHost(desired))
+              }
+            } catch {
+              return json(res, 503, {
+                ok: false,
+                error: { code: 'kernel_seed_failed', message: 'Claude Code 初始化配置生成或发布失败' },
+              })
+            }
+            try {
+              if (targets.all) {
+                await persistRoutingPatch({
+                  inference: {
+                    ...(ctx.routingConfig.inference || {}),
+                    dataplane: parsed.value,
+                  },
+                })
+              } else {
+                for (const id of syncArgs.body.ids) {
+                  persistSlotEnginePolicy(cfg.paths.project, id, { dataplane: parsed.value })
+                }
+              }
+            } catch (error) {
+              ctx.routingConfig = previous
+              return json(res, 503, {
+                ok: false,
+                error: { code: 'dataplane_persist_failed', message: String(error?.message || error) },
+              })
+            }
+            const report = await runKernelSync({ ...syncArgs, routingConfig: ctx.routingConfig })
+            return json(
+              res,
+              report.ok ? 200 : 503,
+              panel.ok({
+                dataplane: parsed.value,
+                ...report,
+              }),
+            )
+          },
         )
       }
       if (req.method === 'POST' && p === '/api/panel/wrap-cli/crag-kernel') {
@@ -2463,6 +3730,7 @@ export function createPanelHandler(ctx) {
       }
       if (req.method === 'POST' && p === '/api/panel/wrap-cli/kernel/release') {
         const body = await readBody(req, 8 * 1024).catch(() => ({}))
+        const requestedIds = kernelSyncIds(cfg.paths.project, body)
         const downloaded = await downloadReleaseKernel({
           tag: body.tag,
           fetchImpl: ctx.fetchImpl,
@@ -2473,54 +3741,61 @@ export function createPanelHandler(ctx) {
             error: { code: downloaded.code, message: downloaded.error },
           })
         }
-        const replaced = replaceKernelBinary(cfg.paths.project, downloaded.bytes, {
-          source: 'github',
-          release_tag: downloaded.tag,
-        })
-        if (!replaced.ok) {
-          return json(res, 400, { ok: false, error: { code: replaced.code, message: replaced.error } })
-        }
-        const cliNode = replaceCliNodeBinary(cfg.paths.project, downloaded.cliNode?.bytes)
-        if (!cliNode.ok) {
-          return json(res, 400, { ok: false, error: { code: cliNode.code, message: cliNode.error } })
-        }
-        const ccNode = replaceCcNodeBinary(cfg.paths.project, downloaded.ccNode?.bytes)
-        if (!ccNode.ok) {
-          return json(res, 400, { ok: false, error: { code: ccNode.code, message: ccNode.error } })
-        }
-        const cragWritten = replaceCragKernelBinary(cfg.paths.project, downloaded.crag?.bytes)
-        if (!cragWritten.ok) {
-          return json(res, 400, { ok: false, error: { code: cragWritten.code, message: cragWritten.error } })
-        }
-        const report = await syncInstalledKernels({
-          project: cfg.paths.project,
-          routingConfig: ctx.routingConfig,
-          body,
-        })
-        const release = {
-          tag: downloaded.tag,
-          version: downloaded.version,
-          asset: downloaded.asset,
-          size: downloaded.size,
-          cli_node: downloaded.cliNode?.asset,
-          cli_node_size: cliNode.size,
-          cc_node: downloaded.ccNode?.asset,
-          cc_node_size: ccNode.size,
-          crag: downloaded.crag?.asset || null,
-          crag_size: cragWritten.size || 0,
-          crag_skipped: false,
-        }
-        if (!report.ok) {
-          return json(res, 400, {
-            ok: false,
-            error: {
-              code: 'kernel_sync_failed',
-              message: `已写入 ${downloaded.tag}，槽同步 ${report.ok_count}/${report.total} 失败`,
-            },
-            data: { release, kernel: replaced, sync: report },
-          })
-        }
-        return json(res, 200, panel.ok({ release, kernel: replaced, sync: report }))
+        return await syncInstalledKernels(
+          {
+            project: cfg.paths.project,
+            routingConfig: ctx.routingConfig,
+            subscription: ctx.cragSubscription,
+            body: { ...body, ids: requestedIds },
+            restartKernel: ctx.kernelPolicyOps?.restartRustKernel,
+          },
+          async (syncArgs) => {
+            const replaced = replaceKernelBinary(cfg.paths.project, downloaded.bytes, {
+              source: 'github',
+              release_tag: downloaded.tag,
+            })
+            if (!replaced.ok) {
+              return json(res, 400, { ok: false, error: { code: replaced.code, message: replaced.error } })
+            }
+            const cliNode = replaceCliNodeBinary(cfg.paths.project, downloaded.cliNode?.bytes)
+            if (!cliNode.ok) {
+              return json(res, 400, { ok: false, error: { code: cliNode.code, message: cliNode.error } })
+            }
+            const ccNode = replaceCcNodeBinary(cfg.paths.project, downloaded.ccNode?.bytes)
+            if (!ccNode.ok) {
+              return json(res, 400, { ok: false, error: { code: ccNode.code, message: ccNode.error } })
+            }
+            const cragWritten = replaceCragKernelBinary(cfg.paths.project, downloaded.crag?.bytes)
+            if (!cragWritten.ok) {
+              return json(res, 400, { ok: false, error: { code: cragWritten.code, message: cragWritten.error } })
+            }
+            const report = await runKernelSync(syncArgs)
+            const release = {
+              tag: downloaded.tag,
+              version: downloaded.version,
+              asset: downloaded.asset,
+              size: downloaded.size,
+              cli_node: downloaded.cliNode?.asset,
+              cli_node_size: cliNode.size,
+              cc_node: downloaded.ccNode?.asset,
+              cc_node_size: ccNode.size,
+              crag: downloaded.crag?.asset || null,
+              crag_size: cragWritten.size || 0,
+              crag_skipped: false,
+            }
+            if (!report.ok) {
+              return json(res, 400, {
+                ok: false,
+                error: {
+                  code: 'kernel_sync_failed',
+                  message: `已写入 ${downloaded.tag}，槽同步 ${report.ok_count}/${report.total} 失败`,
+                },
+                data: { release, kernel: replaced, sync: report },
+              })
+            }
+            return json(res, 200, panel.ok({ release, kernel: replaced, sync: report }))
+          },
+        )
       }
 
       if (req.method === 'POST' && p === '/api/panel/wrap-cli/kernel') {
@@ -2548,8 +3823,10 @@ export function createPanelHandler(ctx) {
         const report = await syncInstalledKernels({
           project: cfg.paths.project,
           routingConfig: ctx.routingConfig,
+          subscription: ctx.cragSubscription,
           body,
           refreshCluster,
+          restartKernel: ctx.kernelPolicyOps?.restartRustKernel || ctx.restartRustKernel,
         })
         return json(res, report.ok ? 200 : 400, panel.ok(report))
       }
@@ -2569,7 +3846,10 @@ export function createPanelHandler(ctx) {
           failed: failed.map(({ id, code, error }) => ({ id, code, error })),
           items: results
             .filter((item) => item.ok)
-            .map((item) => summarizeVm(item.vm, cfg.paths.project, ctx.routingConfig)),
+            .map((item) => ({
+              ...summarizeVm(item.vm, cfg.paths.project, ctx.routingConfig),
+              ...(item.reclaim_pending && { reclaim_pending: true }),
+            })),
         }
         return json(res, 200, panel.ok(report))
       }
@@ -2706,12 +3986,74 @@ export function createPanelHandler(ctx) {
         }
         return json(res, 200, panel.ok({ id, reload: reloaded }))
       }
+      if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/credentials\/sync$/.test(p)) {
+        const id = p.split('/')[4]
+        const vm = getVm(cfg.paths.project, id)
+        if (!vm) return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'VM not found' } })
+        if (isCodexVm(vm))
+          return json(res, 409, {
+            ok: false,
+            error: { code: 'credential_kind_mismatch', message: '此同步仅用于 Claude 客户端' },
+          })
+        const result = await syncClaudeClientCredentials(slotExec(cfg.paths.project, vm))
+        if (!result.ok) return json(res, result.status, result)
+        return json(res, 200, panel.ok({ synced: true }))
+      }
+      // GET /api/panel/vms/:id/desktop — browser desktop companion status
+      if (req.method === 'GET' && /^\/api\/panel\/vms\/[^/]+\/desktop$/.test(p)) {
+        const vm = getVm(cfg.paths.project, p.split('/')[4])
+        if (!vm) return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'vm not found' } })
+        try {
+          return json(res, 200, panel.ok(await slotDesktopStatus(vm)))
+        } catch (e) {
+          return json(res, 502, {
+            ok: false,
+            error: { code: 'desktop_status_failed', message: String(e?.message || e) },
+          })
+        }
+      }
+      // POST /api/panel/vms/:id/desktop {enabled} — enable / disable the browser desktop companion
+      if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/desktop$/.test(p)) {
+        const body = await readBody(req, 1024).catch(() => ({}))
+        if (typeof body?.enabled !== 'boolean') {
+          return json(res, 400, { ok: false, error: { code: 'bad_request', message: 'enabled (boolean) required' } })
+        }
+        let result
+        try {
+          result = await setSlotDesktopEnabled(cfg.paths.project, p.split('/')[4], body.enabled)
+        } catch (e) {
+          result = { ok: false, status: 502, code: 'desktop_start_failed', message: String(e?.message || e) }
+        }
+        if (!result.ok) {
+          return json(res, result.status || 409, {
+            ok: false,
+            error: { code: result.code, message: String(result.message || '').slice(0, 240) },
+          })
+        }
+        return json(res, 200, panel.ok({ enabled: result.enabled, state: result.state }))
+      }
+      // POST /api/panel/vms/:id/desktop-ticket — single-use ticket for the desktop RFB WebSocket
+      if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/desktop-ticket$/.test(p)) {
+        const issued = await ctx.slotDesktop.issueTicket(p.split('/')[4])
+        if (!issued.ok) return json(res, issued.status, { ok: false, error: issued.error })
+        return json(res, 200, panel.ok({ ticket: issued.ticket, expires_in: issued.expires_in }))
+      }
       // POST /api/panel/vms/:id/shell-ticket — single-use ticket for the slot terminal WebSocket
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/shell-ticket$/.test(p)) {
         const body = await readBody(req, 1024).catch(() => ({}))
-        const issued = await ctx.slotShell.issueTicket(p.split('/')[4], { login: body.login === true })
+        const issued = await ctx.slotShell.issueTicket(p.split('/')[4], {
+          login: body.login === true,
+        })
         if (!issued.ok) return json(res, issued.status, { ok: false, error: issued.error })
-        return json(res, 200, panel.ok({ ticket: issued.ticket, expires_in: issued.expires_in }))
+        return json(
+          res,
+          200,
+          panel.ok({
+            ticket: issued.ticket,
+            expires_in: issued.expires_in,
+            ...(issued.cli_bin ? { cli_bin: issued.cli_bin } : {}),
+          }),
+        )
       }
       // POST /api/panel/vms/:id/collect-identity
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/collect-identity$/.test(p)) {
@@ -2737,7 +4079,8 @@ export function createPanelHandler(ctx) {
         const body = await readBody(req, 8192).catch(() => ({}))
         const nextOwner =
           body.user_id === null || body.user_id === '' ? null : normalizeOwnerId(body.user_id || body.owner_user_id)
-        if (nextOwner && !panelUsers.getById(nextOwner)) {
+        const assignee = nextOwner ? panelUsers.getById(nextOwner) : null
+        if (nextOwner && !assignee) {
           return json(res, 404, { ok: false, error: { message: 'user not found' } })
         }
         const currentOrigin = vm.origin || VM_ORIGIN.platform
@@ -2748,8 +4091,101 @@ export function createPanelHandler(ctx) {
           })
         }
         const origin = assignOriginForOwner(nextOwner, { previousOrigin: currentOrigin, actorRole: 'admin' })
+        let delivery
+        if (body.delivery_batch !== undefined) {
+          if (assignee?.role !== 'user' || isCodexVm(vm) || vm.gemini) {
+            return json(res, 400, { ok: false, error: { message: '交付批次仅适用于分配给租户的 Claude VM' } })
+          }
+          delivery = prepareVmDelivery(vm, body.delivery_batch, getDb())
+          if (delivery.error) return json(res, delivery.status, { ok: false, error: { message: delivery.error } })
+        }
         const saved = persistVmOwner(cfg.paths.project, id, { ownerUserId: nextOwner, origin })
+        if (!saved) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+        delivery?.save()
         return json(res, 200, panel.ok({ vm: summarizeVm(saved, cfg.paths.project, ctx.routingConfig) }))
+      }
+
+      if (['GET', 'POST'].includes(req.method) && /^\/api\/panel\/vms\/[^/]+\/crag-license$/.test(p)) {
+        res.setHeader?.('Cache-Control', 'no-store')
+        if (panelIdentity(req).role !== 'admin')
+          return json(res, 403, {
+            ok: false,
+            error: { code: 'forbidden', message: 'CRAG activation requires an administrator.' },
+          })
+        const vm = getVm(cfg.paths.project, p.split('/')[4])
+        if (!vm) return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'vm not found' } })
+        if (isCodexVm(vm) || isNativeNodeVm(vm))
+          return json(res, 400, {
+            ok: false,
+            error: {
+              code: 'crag_v2_unsupported_placement',
+              message: isCodexVm(vm) ? '请选择 Claude 虚拟机' : 'CRAG v2 不支持 macOS 原生节点',
+            },
+          })
+        const deviceUnsupported = Boolean(vm.node_id) || isKvmRuntime(vm)
+        try {
+          if (req.method === 'GET')
+            return json(res, 200, panel.ok(getCragLicense(cfg.paths.project, vm, { initialize: true })))
+          const body = await readBody(req, 32768)
+          const registrationCode = typeof body?.registration_code === 'string' ? body.registration_code.trim() : ''
+          const online = registrationCode.startsWith('CRAGR1.')
+          if (deviceUnsupported && !online && !registrationCode.startsWith('CRAGU1.')) {
+            return json(res, 400, {
+              ok: false,
+              error: {
+                code: 'crag_v2_unsupported_placement',
+                message: '设备注册码需要本机 Linux Docker 槽；也可使用 CRAGU1 离线码。',
+              },
+            })
+          }
+          if (
+            online &&
+            req.apiKeyKind !== 'master' &&
+            (req.apiKeyKind || !panelIdentity(req).user || !sameOriginPost(req, cfg.base_url))
+          ) {
+            return json(res, 403, {
+              ok: false,
+              error: { code: 'license_redeem_origin', message: 'Same origin required.' },
+            })
+          }
+          let activated
+          if (online) {
+            const kind = await resolveCragVoucherKind(cfg.paths.project, vm, registrationCode, ctx.fetchCragDeviceGrant)
+            if (kind === 'host') {
+              activated = await ctx.cragSubscription.activateVoucher(vm.id, registrationCode)
+            } else {
+              if (deviceUnsupported) {
+                return json(res, 400, {
+                  ok: false,
+                  error: { code: 'crag_v2_unsupported_placement', message: '设备兑换码需要本机 Linux Docker 槽。' },
+                })
+              }
+              activated = await redeemCragDeviceVoucher(cfg.paths.project, vm, registrationCode, {
+                getTarget: () => getVm(cfg.paths.project, vm.id),
+                routing: ctx.routingConfig,
+                fetchImpl: ctx.fetchCragDeviceGrant,
+              })
+            }
+          } else {
+            activated = activateCragLicense(cfg.paths.project, vm, registrationCode)
+          }
+          if (activated.license?.scope === 'kernel') await distributeCragUniversalGrant(cfg.paths.project)
+          return json(res, 200, panel.ok(activated))
+        } catch (error) {
+          const typed =
+            error instanceof CragLicenseError ||
+            (Number.isInteger(error?.status) &&
+              error.status >= 400 &&
+              error.status <= 599 &&
+              /^[a-z][a-z0-9_]{1,63}$/.test(error?.code || ''))
+          return json(res, typed ? error.status : 400, {
+            ok: false,
+            error: {
+              code: typed ? error.code : 'license_invalid',
+              message: error instanceof CragLicenseError ? error.message : 'CRAG activation did not complete.',
+            },
+          })
+        }
       }
 
       // GET /api/panel/vms/:id
@@ -2769,341 +4205,455 @@ export function createPanelHandler(ctx) {
           role: ident.role,
         })
         if (result.status) return json(res, result.status, result.body)
+        const lifecycle = vmDeliveryLifecycle(getVm(cfg.paths.project, id), getDb)
+        if (lifecycle) result.data.delivery_lifecycle = lifecycle
         return json(res, 200, result)
+      }
+      if (req.method === 'PATCH' && /^\/api\/panel\/vms\/[^/]+\/quota-thresholds$/.test(p)) {
+        const id = p.split('/')[4]
+        if (!isValidVmId(id)) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+        const body = await readBody(req, 1024).catch(() => null)
+        return withVmLock(path.join(cfg.paths.project, 'vms', `${id}.json`), () => {
+          const vm = getVm(cfg.paths.project, id)
+          const isTenant = panelIdentity(req).role === 'user'
+          const owner = normalizeOwnerId(req.panelUserId)
+          if (!vm || (isTenant && (!owner || vmOwnerId(vm) !== owner))) {
+            return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          }
+          if (isCodexVm(vm)) {
+            return json(res, 400, {
+              ok: false,
+              error: { code: 'gpt_quota_override_forbidden', message: 'GPT 槽使用全局闸线' },
+            })
+          }
+          const parsed = mergeTenantVmQuotaThresholds(vm.policy?.quota, body)
+          if (!parsed.ok) {
+            return json(res, 400, { ok: false, error: { code: 'invalid_quota_thresholds', message: parsed.error } })
+          }
+          const saved = applyVmQuotaOverride(id, parsed.value)
+          if (!saved) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          return json(res, 200, panel.ok({ vm_id: id }))
+        })
       }
       // PATCH /api/panel/vms/:id — hot concurrency / allowed models (no VM restart)
       if (req.method === 'PATCH' && /^\/api\/panel\/vms\/[^/]+$/.test(p)) {
         const id = p.split('/').pop()
         const body = await readBody(req, 8192).catch(() => ({}))
-        const currentVm = getVm(cfg.paths.project, id)
-        if (!currentVm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        const strictInteger = (value, min, max, label, { nullable = false } = {}) => {
-          if (nullable && value === null) return null
-          if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value)) {
-            throw new TypeError(`${label} must be an integer`)
-          }
-          if (value < min || value > max) throw new RangeError(`${label} must be between ${min} and ${max}`)
-          return value
-        }
-        const hasConcurrency =
-          Object.prototype.hasOwnProperty.call(body || {}, 'max_concurrency') ||
-          Object.prototype.hasOwnProperty.call(body || {}, 'maxConcurrency')
-        const hasRpm =
-          Object.prototype.hasOwnProperty.call(body || {}, 'max_rpm') ||
-          Object.prototype.hasOwnProperty.call(body || {}, 'maxRpm')
-        const next = Object.prototype.hasOwnProperty.call(body || {}, 'max_concurrency')
-          ? body.max_concurrency
-          : body.maxConcurrency
-        const nextRpm = Object.prototype.hasOwnProperty.call(body || {}, 'max_rpm') ? body.max_rpm : body.maxRpm
-        const hasMaxSessions = body && Object.prototype.hasOwnProperty.call(body, 'max_sessions')
-        // Explicit null = drop the slot's pin and follow its tier / global default again.
-        const inheritConc = body?.max_concurrency === null
-        const inheritRpm = body?.max_rpm === null
-        const hasSessionSlots = body && Object.prototype.hasOwnProperty.call(body, 'session_slots')
-        const hasQuotaOverride = body && Object.prototype.hasOwnProperty.call(body, 'quota_override')
-        const hasModels = body && Object.prototype.hasOwnProperty.call(body, 'allowed_models')
-        const hasAuthScheme = body && (body.auth_scheme != null || body.authScheme != null)
-        const hasScheduleLevel = body && Object.prototype.hasOwnProperty.call(body, 'schedule_level')
-        const hasActiveHours = body && Object.prototype.hasOwnProperty.call(body, 'active_hours')
-        const hasTimezone = body && Object.prototype.hasOwnProperty.call(body, 'timezone')
-        const hasWeight = body && Object.prototype.hasOwnProperty.call(body, 'weight')
-        const hasMemory =
-          body &&
-          (Object.prototype.hasOwnProperty.call(body, 'memory') ||
-            (body.machine &&
-              typeof body.machine === 'object' &&
-              !Array.isArray(body.machine) &&
-              Object.prototype.hasOwnProperty.call(body.machine, 'memory')))
-        // `timezone_follow_proxy: true` re-attaches the slot to its exit node's
-        // zone, undoing an earlier hand-pinned value.
-        const followProxyTz = body?.timezone_follow_proxy === true || body?.timezoneFollowProxy === true
-        const hasSlotPolicy =
-          body &&
-          (Object.prototype.hasOwnProperty.call(body, 'inference_engine') ||
-            Object.prototype.hasOwnProperty.call(body, 'persona_preset'))
-        if (
-          !hasConcurrency &&
-          !hasRpm &&
-          !inheritConc &&
-          !inheritRpm &&
-          !hasSessionSlots &&
-          !hasMaxSessions &&
-          !hasQuotaOverride &&
-          !hasModels &&
-          !hasAuthScheme &&
-          !hasSlotPolicy &&
-          !hasScheduleLevel &&
-          !hasActiveHours &&
-          !hasTimezone &&
-          !hasWeight &&
-          !hasMemory &&
-          !followProxyTz
-        ) {
-          return json(res, 400, {
-            ok: false,
-            error: {
-              message:
-                'max_concurrency, max_rpm, max_sessions, session_slots, quota_override, allowed_models, auth_scheme, inference_engine, persona_preset, schedule_level, active_hours, timezone, weight, machine.memory or timezone_follow_proxy required',
-            },
-          })
-        }
-        try {
-          if (hasConcurrency && next !== null) strictInteger(next, 1, 256, 'max_concurrency')
-          if (hasRpm && nextRpm !== null) strictInteger(nextRpm, 0, 1_000_000, 'max_rpm')
-          if (hasSessionSlots && body.session_slots !== null)
-            strictInteger(body.session_slots, SESSION_SLOT_MIN, SESSION_SLOT_MAX, 'session_slots')
-          if (hasMaxSessions && body.max_sessions !== null) strictInteger(body.max_sessions, 0, 256, 'max_sessions')
-          // null puts the slot back on the default weight of 1
-          if (hasWeight && body.weight !== null) strictInteger(body.weight, 1, 100, 'weight')
-        } catch (error) {
-          return json(res, 400, {
-            ok: false,
-            error: { code: 'invalid_scheduling_value', message: error.message },
-          })
-        }
-        const parsedScheduleLevel = hasScheduleLevel ? parseScheduleLevelInput(body.schedule_level) : null
-        if (parsedScheduleLevel && !parsedScheduleLevel.ok) {
-          return json(res, 400, { ok: false, error: { message: parsedScheduleLevel.error } })
-        }
-        const parsedActiveHours = hasActiveHours ? parseActiveHoursInput(body.active_hours) : null
-        if (parsedActiveHours && !parsedActiveHours.ok) {
-          return json(res, 400, { ok: false, error: { message: parsedActiveHours.error } })
-        }
-        const parsedQuotaOverride = hasQuotaOverride ? parseVmQuotaOverride(body.quota_override) : null
-        if (parsedQuotaOverride && !parsedQuotaOverride.ok) {
-          return json(res, 400, { ok: false, error: { message: parsedQuotaOverride.error } })
-        }
-        if (parsedQuotaOverride) {
-          if (isCodexVm(currentVm)) {
-            return json(res, 400, {
-              ok: false,
-              error: { code: 'gpt_quota_override_forbidden', message: 'GPT slots do not use Claude quota tiers' },
+        return await withVmLock(path.join(cfg.paths.project, 'vms', `${id}.json`), async () => {
+          const currentVm = getVm(cfg.paths.project, id)
+          if (!currentVm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          const requestedId =
+            body && Object.prototype.hasOwnProperty.call(body, 'id') ? String(body.id ?? '').trim() : ''
+          if (requestedId && requestedId !== id) {
+            const renamed = renameVmId(cfg.paths.project, id, requestedId, {
+              discardContainer: discardSlotContainer,
             })
-          }
-        }
-        if (hasSessionSlots && isCodexVm(currentVm)) {
-          return json(res, 400, {
-            ok: false,
-            error: { code: 'gpt_session_slots_forbidden', message: 'GPT slots do not use native session slots' },
-          })
-        }
-        if (hasMaxSessions && !isCodexVm(currentVm)) {
-          return json(res, 400, {
-            ok: false,
-            error: { code: 'claude_max_sessions_forbidden', message: 'Claude 槽不使用 OpenAI 会话容量上限' },
-          })
-        }
-        if (hasAuthScheme && hostUnsupported(res, currentVm, 'auth_scheme')) return
-        if (
-          hasSlotPolicy &&
-          Object.prototype.hasOwnProperty.call(body, 'inference_engine') &&
-          (isCodexVm(currentVm) || hostUnsupported(res, currentVm, 'engine_switch'))
-        ) {
-          if (isCodexVm(currentVm)) {
-            return json(res, 400, {
-              ok: false,
-              error: { code: 'gpt_engine_forbidden', message: 'GPT slots do not use go or rust inference engines' },
+            if (!renamed.ok) {
+              return json(res, renamed.status || 400, {
+                ok: false,
+                error: { code: renamed.code || 'vm_rename_failed', message: renamed.message || '改编号失败' },
+              })
+            }
+            const detail = await panel.buildVmDetail({
+              cfg,
+              accountQuota,
+              id: renamed.id,
+              routingConfig: ctx.routingConfig,
+              poolScheduler: ctx.poolScheduler,
+              requestLog,
+              proxyPool,
+              kernelHealth: panelKernelHealth,
+              clusterNodes: clusterNodesOf(ctx),
+              role: panelIdentity(req).role,
             })
+            return json(res, 200, detail)
           }
-          return
-        }
-        if (hasModels) {
-          const parsed = parseAllowedModelsPatch(body.allowed_models, { vm: currentVm })
-          if (!parsed.ok) return json(res, 400, { ok: false, error: { message: parsed.error } })
-        }
-        if (hasSlotPolicy) {
-          const parsed = parseSlotEnginePolicyPatch(body)
-          if (!parsed.ok) return json(res, 400, { ok: false, error: { message: parsed.error } })
-        }
-        let timezoneSync = null
-        if (hasTimezone) {
-          // Any IANA zone is allowed — the US presets are UI defaults, not a
-          // whitelist. Reject only what Intl (and therefore the container TZ)
-          // cannot resolve, so a typo never reaches `docker run -e TZ=`.
-          const zone = validTimezone(body.timezone)
-          if (!zone) {
+          const strictInteger = (value, min, max, label, { nullable = false } = {}) => {
+            if (nullable && value === null) return null
+            if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value)) {
+              throw new TypeError(`${label} must be an integer`)
+            }
+            if (value < min || value > max) throw new RangeError(`${label} must be between ${min} and ${max}`)
+            return value
+          }
+          const hasConcurrency =
+            Object.prototype.hasOwnProperty.call(body || {}, 'max_concurrency') ||
+            Object.prototype.hasOwnProperty.call(body || {}, 'maxConcurrency')
+          const hasRpm =
+            Object.prototype.hasOwnProperty.call(body || {}, 'max_rpm') ||
+            Object.prototype.hasOwnProperty.call(body || {}, 'maxRpm')
+          const next = Object.prototype.hasOwnProperty.call(body || {}, 'max_concurrency')
+            ? body.max_concurrency
+            : body.maxConcurrency
+          const nextRpm = Object.prototype.hasOwnProperty.call(body || {}, 'max_rpm') ? body.max_rpm : body.maxRpm
+          const hasMaxSessions = body && Object.prototype.hasOwnProperty.call(body, 'max_sessions')
+          // Explicit null = drop the slot's pin and follow its tier / global default again.
+          const inheritConc = body?.max_concurrency === null
+          const inheritRpm = body?.max_rpm === null
+          const hasSessionSlots = body && Object.prototype.hasOwnProperty.call(body, 'session_slots')
+          const hasQuotaOverride = body && Object.prototype.hasOwnProperty.call(body, 'quota_override')
+          const hasModels = body && Object.prototype.hasOwnProperty.call(body, 'allowed_models')
+          const hasAuthScheme = body && (body.auth_scheme != null || body.authScheme != null)
+          const hasScheduleLevel = body && Object.prototype.hasOwnProperty.call(body, 'schedule_level')
+          const hasActiveHours = body && Object.prototype.hasOwnProperty.call(body, 'active_hours')
+          const hasTimezone = body && Object.prototype.hasOwnProperty.call(body, 'timezone')
+          const hasWeight = body && Object.prototype.hasOwnProperty.call(body, 'weight')
+          const hasName = body && Object.prototype.hasOwnProperty.call(body, 'name')
+          const hasMemory =
+            body &&
+            (Object.prototype.hasOwnProperty.call(body, 'memory') ||
+              (body.machine &&
+                typeof body.machine === 'object' &&
+                !Array.isArray(body.machine) &&
+                Object.prototype.hasOwnProperty.call(body.machine, 'memory')))
+          // `timezone_follow_proxy: true` re-attaches the slot to its exit node's
+          // zone, undoing an earlier hand-pinned value.
+          const followProxyTz = body?.timezone_follow_proxy === true || body?.timezoneFollowProxy === true
+          const hasSlotPolicy =
+            body &&
+            (Object.prototype.hasOwnProperty.call(body, 'inference_engine') ||
+              Object.prototype.hasOwnProperty.call(body, 'persona_preset') ||
+              Object.prototype.hasOwnProperty.call(body, 'dataplane') ||
+              Object.prototype.hasOwnProperty.call(body, 'crag_kernel_version'))
+          if (
+            !hasConcurrency &&
+            !hasRpm &&
+            !inheritConc &&
+            !inheritRpm &&
+            !hasSessionSlots &&
+            !hasMaxSessions &&
+            !hasQuotaOverride &&
+            !hasModels &&
+            !hasAuthScheme &&
+            !hasSlotPolicy &&
+            !hasScheduleLevel &&
+            !hasActiveHours &&
+            !hasTimezone &&
+            !hasWeight &&
+            !hasName &&
+            !hasMemory &&
+            !followProxyTz
+          ) {
             return json(res, 400, {
               ok: false,
               error: {
-                type: 'invalid_request_error',
-                code: 'invalid_timezone',
-                message: '时区必须是有效的 IANA 名称，如 Asia/Tokyo',
-                param: 'timezone',
+                message:
+                  'max_concurrency, max_rpm, max_sessions, session_slots, quota_override, allowed_models, auth_scheme, inference_engine, persona_preset, dataplane, crag_kernel_version, schedule_level, active_hours, timezone, weight, name, machine.memory or timezone_follow_proxy required',
               },
             })
           }
-          timezoneSync = { timezone: zone, source: 'manual' }
-        } else if (followProxyTz) {
-          const synced = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, id, {
-            force: true,
-            persist: false,
-          })
-          if (!synced.ok) {
+          let nextName = null
+          if (hasName) {
+            const parsedName = parseVmDisplayName(body.name)
+            if (!parsedName.ok) {
+              return json(res, 400, {
+                ok: false,
+                error: {
+                  type: 'invalid_request_error',
+                  code: 'invalid_name',
+                  message: parsedName.error,
+                  param: 'name',
+                },
+              })
+            }
+            nextName = parsedName.value
+          }
+          try {
+            if (hasConcurrency && next !== null) strictInteger(next, 1, 256, 'max_concurrency')
+            if (hasRpm && nextRpm !== null) strictInteger(nextRpm, 0, 1_000_000, 'max_rpm')
+            if (hasSessionSlots && body.session_slots !== null)
+              strictInteger(body.session_slots, SESSION_SLOT_MIN, SESSION_SLOT_MAX, 'session_slots')
+            if (hasMaxSessions && body.max_sessions !== null) strictInteger(body.max_sessions, 0, 256, 'max_sessions')
+            // null puts the slot back on the default weight of 1
+            if (hasWeight && body.weight !== null) strictInteger(body.weight, 1, 100, 'weight')
+          } catch (error) {
             return json(res, 400, {
               ok: false,
-              error: {
-                type: 'invalid_request_error',
-                code: synced.reason || 'proxy_timezone_unknown',
-                message: '未能从代理节点取到时区，请先检测代理地理位置',
-              },
+              error: { code: 'invalid_scheduling_value', message: error.message },
             })
           }
-          timezoneSync = { applied: false, timezone: synced.timezone, source: 'proxy_geo' }
-        }
-        if (hasConcurrency && next !== null) {
-          const vm = applyVmConcurrency(id, next, { override: true })
-          if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        }
-        if (hasRpm && nextRpm !== null) {
-          const vm = applyVmRpm(id, nextRpm, { override: true })
-          if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        }
-        if ((hasConcurrency && next === null) || (hasRpm && nextRpm === null)) {
-          const vm = inheritVmScheduling(id, {
-            concurrency: hasConcurrency && next === null,
-            rpm: hasRpm && nextRpm === null,
-          })
-          if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        }
-        if (hasSessionSlots) {
-          if (body.session_slots === null) {
-            inheritVmScheduling(id, { sessionSlots: true })
-          } else {
-            const vm = applyVmSessionSlots(id, normalizeSessionSlots(body.session_slots), { override: true })
-            if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          const parsedScheduleLevel = hasScheduleLevel ? parseScheduleLevelInput(body.schedule_level) : null
+          if (parsedScheduleLevel && !parsedScheduleLevel.ok) {
+            return json(res, 400, { ok: false, error: { message: parsedScheduleLevel.error } })
           }
-        }
-        if (hasMaxSessions) {
-          if (body.max_sessions === null) {
-            const vm = inheritVmScheduling(id, { maxSessions: true })
-            if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-          } else {
-            const vm = ctx.applyVmMaxSessions(id, body.max_sessions, { override: true })
-            if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          const parsedActiveHours = hasActiveHours ? parseActiveHoursInput(body.active_hours) : null
+          if (parsedActiveHours && !parsedActiveHours.ok) {
+            return json(res, 400, { ok: false, error: { message: parsedActiveHours.error } })
           }
-        }
-        if (parsedQuotaOverride) {
-          const vm = applyVmQuotaOverride(id, parsedQuotaOverride.value)
-          if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        }
-        if (hasModels) {
-          const parsed = parseAllowedModelsPatch(body.allowed_models, { vm: currentVm })
-          const vm = persistAllowedModels(cfg.paths.project, id, parsed.value)
-          if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        }
-        if (hasAuthScheme) {
-          const vm = persistSlotAuthScheme(cfg.paths.project, id, body.auth_scheme || body.authScheme)
-          if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        }
-        let slotPolicyResult = null
-        if (hasSlotPolicy) {
-          const parsed = parseSlotEnginePolicyPatch(body)
-          slotPolicyResult = await applySlotPolicyWithRuntime(id, parsed.patch)
-          if (!slotPolicyResult.ok) {
-            const status =
-              slotPolicyResult.code === 'vm_not_found'
-                ? 404
-                : slotPolicyResult.code === 'gpt_engine_forbidden'
-                  ? 400
-                  : 503
-            return json(res, status, {
+          const parsedQuotaOverride = hasQuotaOverride ? parseVmQuotaOverride(body.quota_override) : null
+          if (parsedQuotaOverride && !parsedQuotaOverride.ok) {
+            return json(res, 400, { ok: false, error: { message: parsedQuotaOverride.error } })
+          }
+          if (parsedQuotaOverride) {
+            if (isCodexVm(currentVm)) {
+              return json(res, 400, {
+                ok: false,
+                error: { code: 'gpt_quota_override_forbidden', message: 'GPT slots do not use Claude quota tiers' },
+              })
+            }
+          }
+          if (hasSessionSlots && isCodexVm(currentVm)) {
+            return json(res, 400, {
               ok: false,
-              error: {
-                code: slotPolicyResult.code,
-                message: slotPolicyResult.error || 'inference engine switch failed',
-              },
+              error: { code: 'gpt_session_slots_forbidden', message: 'GPT slots do not use native session slots' },
             })
           }
-        }
-        if (parsedScheduleLevel) {
-          const vm = persistVmScheduleLevel(cfg.paths.project, id, parsedScheduleLevel.value)
-          if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        }
-        if (parsedActiveHours) {
-          const vm = persistVmActiveHours(cfg.paths.project, id, parsedActiveHours.value)
-          if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        }
-        if (hasTimezone) {
-          const vm = persistVmTimezone(cfg.paths.project, id, timezoneSync.timezone, { source: 'manual' })
-          if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-          const kernel = projectSlotKernelConfig(vm)
-          timezoneSync.applied = true
-          timezoneSync.kernel_hot = kernel?.changed === true
-        } else if (followProxyTz) {
-          const synced = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, id, { force: true })
-          timezoneSync = { applied: synced.applied, timezone: synced.timezone, source: 'proxy_geo' }
-          if (synced.applied) {
-            const kernel = projectSlotKernelConfig({ id })
+          if (hasMaxSessions && !isCodexVm(currentVm)) {
+            return json(res, 400, {
+              ok: false,
+              error: { code: 'claude_max_sessions_forbidden', message: 'Claude 槽不使用 OpenAI 会话容量上限' },
+            })
+          }
+          if (hasAuthScheme && hostUnsupported(res, currentVm, 'auth_scheme')) return
+          if (
+            hasSlotPolicy &&
+            Object.prototype.hasOwnProperty.call(body, 'inference_engine') &&
+            (isCodexVm(currentVm) || hostUnsupported(res, currentVm, 'engine_switch'))
+          ) {
+            if (isCodexVm(currentVm)) {
+              return json(res, 400, {
+                ok: false,
+                error: { code: 'gpt_engine_forbidden', message: 'GPT slots do not use go or rust inference engines' },
+              })
+            }
+            return
+          }
+          if (hasModels) {
+            const parsed = parseAllowedModelsPatch(body.allowed_models, { vm: currentVm })
+            if (!parsed.ok) return json(res, 400, { ok: false, error: { message: parsed.error } })
+          }
+          if (hasSlotPolicy) {
+            const parsed = parseSlotEnginePolicyPatch(body)
+            if (!parsed.ok) return json(res, 400, { ok: false, error: { message: parsed.error } })
+          }
+          let timezoneSync = null
+          if (hasTimezone) {
+            // Any IANA zone is allowed — the US presets are UI defaults, not a
+            // whitelist. Reject only what Intl (and therefore the container TZ)
+            // cannot resolve, so a typo never reaches `docker run -e TZ=`.
+            const zone = validTimezone(body.timezone)
+            if (!zone) {
+              return json(res, 400, {
+                ok: false,
+                error: {
+                  type: 'invalid_request_error',
+                  code: 'invalid_timezone',
+                  message: '时区必须是有效的 IANA 名称，如 Asia/Tokyo',
+                  param: 'timezone',
+                },
+              })
+            }
+            timezoneSync = { timezone: zone, source: 'manual' }
+          } else if (followProxyTz) {
+            const synced = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, id, {
+              force: true,
+              persist: false,
+            })
+            if (!synced.ok) {
+              return json(res, 400, {
+                ok: false,
+                error: {
+                  type: 'invalid_request_error',
+                  code: synced.reason || 'proxy_timezone_unknown',
+                  message: '未能从代理节点取到时区，请先检测代理地理位置',
+                },
+              })
+            }
+            timezoneSync = { applied: false, timezone: synced.timezone, source: 'proxy_geo' }
+          }
+          if (hasConcurrency && next !== null) {
+            const vm = applyVmConcurrency(id, next, { override: true })
+            if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          }
+          if (hasRpm && nextRpm !== null) {
+            const vm = applyVmRpm(id, nextRpm, { override: true })
+            if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          }
+          if ((hasConcurrency && next === null) || (hasRpm && nextRpm === null)) {
+            const vm = inheritVmScheduling(id, {
+              concurrency: hasConcurrency && next === null,
+              rpm: hasRpm && nextRpm === null,
+            })
+            if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          }
+          if (hasSessionSlots) {
+            if (body.session_slots === null) {
+              inheritVmScheduling(id, { sessionSlots: true })
+            } else {
+              const vm = applyVmSessionSlots(id, normalizeSessionSlots(body.session_slots), { override: true })
+              if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+            }
+          }
+          if (hasMaxSessions) {
+            if (body.max_sessions === null) {
+              const vm = inheritVmScheduling(id, { maxSessions: true })
+              if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+            } else {
+              const vm = ctx.applyVmMaxSessions(id, body.max_sessions, { override: true })
+              if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+            }
+          }
+          if (parsedQuotaOverride) {
+            const vm = applyVmQuotaOverride(id, keepTenantExactGates(currentVm.policy?.quota, parsedQuotaOverride.value))
+            if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          }
+          if (hasModels) {
+            const parsed = parseAllowedModelsPatch(body.allowed_models, { vm: currentVm })
+            const vm = persistAllowedModels(cfg.paths.project, id, parsed.value)
+            if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          }
+          if (hasAuthScheme) {
+            const vm = persistSlotAuthScheme(cfg.paths.project, id, body.auth_scheme || body.authScheme)
+            if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          }
+          let slotPolicyResult = null
+          if (hasSlotPolicy) {
+            const parsed = parseSlotEnginePolicyPatch(body)
+            const patchIdentity = panelIdentity(req)
+            const bindSubscription =
+              !req.apiKeyKind &&
+              patchIdentity.role === 'admin' &&
+              !!patchIdentity.user &&
+              sameOriginPost(req, cfg.base_url)
+            slotPolicyResult = await applySlotPolicyWithRuntimeLocked(id, parsed.patch, { bindSubscription })
+            if (!slotPolicyResult.ok) {
+              const status =
+                slotPolicyResult.code === 'vm_not_found'
+                  ? 404
+                  : slotPolicyResult.code?.startsWith('license_')
+                    ? 403
+                    : slotPolicyResult.code === 'gpt_engine_forbidden'
+                      ? 400
+                      : 503
+              return json(res, status, {
+                ok: false,
+                error: {
+                  code: slotPolicyResult.code,
+                  message: slotPolicyResult.error || 'inference engine switch failed',
+                },
+              })
+            }
+          }
+          if (parsedScheduleLevel) {
+            const vm = persistVmScheduleLevel(cfg.paths.project, id, parsedScheduleLevel.value)
+            if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          }
+          if (parsedActiveHours) {
+            const vm = persistVmActiveHours(cfg.paths.project, id, parsedActiveHours.value)
+            if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          }
+          if (hasTimezone) {
+            const vm = persistVmTimezone(cfg.paths.project, id, timezoneSync.timezone, { source: 'manual' })
+            if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+            const kernel = projectSlotKernelConfig(vm)
+            timezoneSync.applied = true
             timezoneSync.kernel_hot = kernel?.changed === true
+          } else if (followProxyTz) {
+            const synced = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, id, { force: true })
+            timezoneSync = { applied: synced.applied, timezone: synced.timezone, source: 'proxy_geo' }
+            if (synced.applied) {
+              const kernel = projectSlotKernelConfig({ id })
+              timezoneSync.kernel_hot = kernel?.changed === true
+            }
           }
-        }
-        if (hasWeight) {
-          const nextWeight = body.weight === null ? 1 : body.weight
-          const vm = patchVmRecord(cfg.paths.project, id, (record) => ({
-            policy: { ...(record.policy || {}), weight: nextWeight },
-          }))
-          if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        }
-        let memoryRaiseResult = null
-        if (hasMemory) {
-          const requestedMemory =
-            body.machine && typeof body.machine === 'object' && !Array.isArray(body.machine)
-              ? body.machine.memory
-              : body.memory
-          const liveVm = getVm(cfg.paths.project, id) || currentVm
-          const raiseMemory = ctx.raiseDockerSlotMemory || raiseDockerSlotMemory
-          const raised = raiseMemory(cfg.paths.project, liveVm, requestedMemory, {
-            routing: ctx.routingConfig,
-          })
-          if (!raised.ok) {
-            const status =
-              raised.code === 'vm_not_found'
-                ? 404
-                : raised.code === 'invalid_memory' ||
-                    raised.code === 'memory_not_increased' ||
-                    raised.code === 'kvm_memory_raise_forbidden'
-                  ? 400
-                  : 502
-            return json(res, status, {
-              ok: false,
-              error: {
-                code: raised.code,
-                message: raised.message,
-                requested: raised.requested ?? requestedMemory ?? null,
-                container_memory: raised.container_memory ?? null,
-                current: raised.current ?? null,
-              },
+          if (nextName != null && nextName !== String(currentVm.name || '')) {
+            const renamed = patchVmRecord(cfg.paths.project, id, { name: nextName })
+            if (!renamed) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          }
+          if (hasWeight) {
+            const nextWeight = body.weight === null ? 1 : body.weight
+            const vm = patchVmRecord(cfg.paths.project, id, (record) => ({
+              policy: { ...(record.policy || {}), weight: nextWeight },
+            }))
+            if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          }
+          let memoryRaiseResult = null
+          if (hasMemory) {
+            const requestedMemory =
+              body.machine && typeof body.machine === 'object' && !Array.isArray(body.machine)
+                ? body.machine.memory
+                : body.memory
+            const liveVm = getVm(cfg.paths.project, id) || currentVm
+            const raiseMemory = ctx.raiseDockerSlotMemory || raiseDockerSlotMemory
+            const raised = await raiseMemory(cfg.paths.project, liveVm, requestedMemory, {
+              routing: ctx.routingConfig,
             })
+            if (!raised.ok) {
+              const status =
+                raised.code === 'vm_not_found'
+                  ? 404
+                  : raised.code === 'invalid_memory' ||
+                      raised.code === 'memory_not_increased' ||
+                      raised.code === 'kvm_memory_raise_forbidden'
+                    ? 400
+                    : 502
+              return json(res, status, {
+                ok: false,
+                error: {
+                  code: raised.code,
+                  message: raised.message,
+                  requested: raised.requested ?? requestedMemory ?? null,
+                  container_memory: raised.container_memory ?? null,
+                  current: raised.current ?? null,
+                  application_state: raised.application_state ?? null,
+                  config_unchanged: raised.config_unchanged ?? null,
+                  rollback_attempted: raised.rollback_attempted ?? false,
+                  rollback_succeeded: raised.rollback_succeeded ?? false,
+                  before_memory: raised.before_memory ?? null,
+                  before_swap_bytes: raised.before_swap_bytes ?? null,
+                  observed_memory_swap: raised.observed_memory_swap ?? null,
+                },
+              })
+            }
+            memoryRaiseResult = {
+              previous: raised.previous,
+              memory: raised.memory,
+              container_memory: raised.container_memory,
+            }
           }
-          memoryRaiseResult = {
-            previous: raised.previous,
-            memory: raised.memory,
-            container_memory: raised.container_memory,
+          const detail = await panel.buildVmDetail({
+            cfg,
+            accountQuota,
+            id,
+            routingConfig: ctx.routingConfig,
+            poolScheduler: ctx.poolScheduler,
+            requestLog,
+            proxyPool,
+            kernelHealth: panelKernelHealth,
+            clusterNodes: clusterNodesOf(ctx),
+            role: panelIdentity(req).role,
+          })
+          if (slotPolicyResult && detail?.data) {
+            if (slotPolicyResult.reclaim_pending) detail.data.reclaim_pending = true
+            if (slotPolicyResult.deferred_start) {
+              detail.data.deferred_start = true
+              detail.data.deferred_reason = slotPolicyResult.deferred_reason || null
+              detail.data.start_error = slotPolicyResult.start_error || null
+            }
+            detail.data.engine_switch = {
+              configured_engine: slotPolicyResult.configured_engine,
+              resolved_engine: slotPolicyResult.resolved_engine,
+              active_engine: slotPolicyResult.active_engine,
+              runtime: slotPolicyResult.runtime,
+            }
           }
-        }
-        const detail = await panel.buildVmDetail({
-          cfg,
-          accountQuota,
-          id,
-          routingConfig: ctx.routingConfig,
-          poolScheduler: ctx.poolScheduler,
-          requestLog,
-          proxyPool,
-          kernelHealth: panelKernelHealth,
-          clusterNodes: clusterNodesOf(ctx),
-          role: panelIdentity(req).role,
+          if (timezoneSync && detail?.data) detail.data.timezone_sync = timezoneSync
+          if (memoryRaiseResult && detail?.data) detail.data.memory_raise = memoryRaiseResult
+          return json(res, 200, detail)
         })
-        if (slotPolicyResult && detail?.data) {
-          detail.data.engine_switch = {
-            configured_engine: slotPolicyResult.configured_engine,
-            resolved_engine: slotPolicyResult.resolved_engine,
-            active_engine: slotPolicyResult.active_engine,
-            runtime: slotPolicyResult.runtime,
-          }
-        }
-        if (timezoneSync && detail?.data) detail.data.timezone_sync = timezoneSync
-        if (memoryRaiseResult && detail?.data) detail.data.memory_raise = memoryRaiseResult
-        return json(res, 200, detail)
+      }
+      // Explicit quota refresh: no inference request or cached-success response.
+      if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/usage\/query$/.test(p)) {
+        const id = p.split('/')[4]
+        const tenant = panelIdentity(req).role === 'user'
+        const result = await queryActiveUsage({
+          projectRoot: cfg.paths.project,
+          vm: getVm(cfg.paths.project, id),
+          accountQuota,
+          poolScheduler: ctx.poolScheduler,
+          tenantUserId: tenant ? req.panelUserId ?? null : undefined,
+        })
+        return json(res, result.status, result.body)
       }
       // POST /api/panel/vms/:id/probe
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/probe$/.test(p)) {
@@ -3169,10 +4719,23 @@ export function createPanelHandler(ctx) {
       }
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/claude-reset\/redeem$/.test(p)) {
         const id = p.split('/')[4]
+        // A body that cannot be read must not fall back to the server's next grant.
+        let body
+        try {
+          body = (await readBody(req, 4096)) || {}
+        } catch (error) {
+          return json(res, 400, {
+            ok: false,
+            error: { code: 'invalid_request', message: String(error?.message || 'invalid JSON body') },
+          })
+        }
         const result = await panel.buildClaudeResetRedeem({
           cfg,
           id,
+          accountQuota,
+          poolScheduler: ctx.poolScheduler,
           idempotencyKey: req.headers['idempotency-key'],
+          card: body.card,
         })
         if (result.status) return json(res, result.status, result.body)
         return json(res, 200, result)
@@ -3198,10 +4761,20 @@ export function createPanelHandler(ctx) {
         return await handleVmTestScheduleSync(req, res)
       }
 
-      // POST /api/panel/vms/:id/test-chat — sub2api-style model connectivity test
+      // POST /api/panel/vms/:id/test-chat — test model connectivity through this VM
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/test-chat$/.test(p)) {
         const id = p.split('/')[4]
         const body = await readBody(req, 64 * 1024).catch(() => ({}))
+        const tenantTest = panelIdentity(req).role === 'user'
+        if (tenantTest && denyIfUserMissesVm(req, res, { projectRoot: cfg.paths.project, json, path: p })) return true
+        const testKey = tenantTest
+          ? tenantTestKey({ store: apiKeyStore, userId: req.panelUserId, vm: getVm(cfg.paths.project, id) })
+          : cfg.api_key
+        if (!testKey)
+          return json(res, 409, {
+            ok: false,
+            error: { code: 'test_key_required', message: '请先创建可调用此 VM 的有效 Key，并确认额度与并发可用' },
+          })
         const result = await runVmTestChat({
           projectRoot: cfg.paths.project,
           vmId: id,
@@ -3211,7 +4784,8 @@ export function createPanelHandler(ctx) {
           reasoning_effort: body.reasoning_effort || body.effort,
           timeoutMs: body.timeout_ms || body.timeoutMs,
           baseUrl: `http://127.0.0.1:${cfg.port}`,
-          apiKey: cfg.api_key,
+          apiKey: testKey,
+          allowCredentialRefresh: !tenantTest,
           accountQuota,
         })
         return json(res, 200, panel.ok(result))
@@ -3262,7 +4836,7 @@ export function createPanelHandler(ctx) {
         return json(res, 200, panel.ok({ restored: restored.length }))
       }
 
-      // POST /api/panel/vms/:id/schedulable — sub2api-style schedule toggle
+      // POST /api/panel/vms/:id/schedulable — enable or disable scheduling for this VM
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/schedulable$/.test(p)) {
         const id = p.split('/')[4]
         if (!getVm(cfg.paths.project, id)) {
@@ -3278,19 +4852,35 @@ export function createPanelHandler(ctx) {
         if (typeof body?.schedulable !== 'boolean') {
           return json(res, 400, { ok: false, error: { message: 'schedulable required' } })
         }
-        const currentVm = getVm(cfg.paths.project, id)
-        const credentialFailure =
-          /oauth_revoked|oauth_invalid_grant|invalid_grant|refresh_token_missing|token has been revoked/i.test(
-            `${currentVm?.claude?.refresh_error || ''} ${currentVm?.schedule_disabled_reason || ''}`,
-          )
-        if (body.schedulable && credentialFailure) {
-          return json(res, 409, {
-            ok: false,
-            error: { code: 'credential_unavailable', message: '凭证已失效或吊销，请重新导入凭证后再开启调度' },
-          })
+        let summary
+        if (panelIdentity(req).role === 'user') {
+          if (Object.keys(body).length !== 1) {
+            return json(res, 400, { ok: false, error: { message: '仅允许设置 schedulable' } })
+          }
+          try {
+            summary = setTenantScheduleOff(cfg.paths.project, id, req.panelUserId, !body.schedulable)
+          } catch (error) {
+            if (!['vm_not_found', 'schedule_operator_off'].includes(error.code)) throw error
+            return json(res, error.status, { ok: false, error: { code: error.code, message: error.message } })
+          }
+        } else {
+          const currentVm = getVm(cfg.paths.project, id)
+          const credentialFailure =
+            /oauth_revoked|oauth_invalid_grant|invalid_grant|refresh_token_missing|token has been revoked/i.test(
+              `${currentVm?.claude?.refresh_error || ''} ${currentVm?.schedule_disabled_reason || ''}`,
+            )
+          if (body.schedulable && credentialFailure) {
+            return json(res, 409, {
+              ok: false,
+              error: { code: 'credential_unavailable', message: '凭证已失效或吊销，请重新导入凭证后再开启调度' },
+            })
+          }
+          const reason = body.schedulable ? null : body.reason || 'disabled'
+          summary = setScheduleOff(cfg.paths.project, id, !body.schedulable, { reason, preserveStatus: true })
         }
-        const reason = body.schedulable ? null : body.reason || 'disabled'
-        const summary = setScheduleOff(cfg.paths.project, id, !body.schedulable, { reason, preserveStatus: true })
+        if (!summary) {
+          return json(res, 404, { ok: false, error: { code: ErrorCode.VM_NOT_FOUND, message: 'vm not found' } })
+        }
         return json(
           res,
           200,
@@ -3338,6 +4928,21 @@ export function createPanelHandler(ctx) {
         return json(res, 200, panel.ok(activateVmSlot(id)))
       }
 
+      // POST /api/panel/vms/:id/deactivate
+      if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/deactivate$/.test(p)) {
+        const id = p.split('/')[4]
+        if (!getVm(cfg.paths.project, id)) {
+          const e = makeError({
+            type: ErrorType.NOT_FOUND,
+            code: ErrorCode.VM_NOT_FOUND,
+            message: 'vm not found',
+            status: 404,
+          })
+          return json(res, e.status, { ok: false, error: e.body.error })
+        }
+        return json(res, 200, panel.ok(deactivateVmSlot(id)))
+      }
+
       // POST /api/panel/vms/:id/update-claude-code — Claude CLI runtime was removed
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/update-claude-code$/.test(p)) {
         return json(res, 410, {
@@ -3349,64 +4954,70 @@ export function createPanelHandler(ctx) {
         })
       }
 
-      // DELETE /api/panel/vms/:id — remove VM record, cli-home, unbind proxy
+      // DELETE /api/panel/vms/:id — remove VM record, cli-home, unbind proxy.
+      // ?force=1: the slot's node is gone; skip the node teardown, still clean up here.
       if (req.method === 'DELETE' && /^\/api\/panel\/vms\/[^/]+$/.test(p)) {
         const id = p.split('/')[4]
         if (!isValidVmId(id)) {
           return json(res, 400, { ok: false, error: { message: 'invalid vm id' } })
         }
+        const force = url.searchParams.get('force') === '1'
         const vmPath = path.join(cfg.paths.project, 'vms', `${id}.json`)
-        if (!fs.existsSync(vmPath)) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        const active = getActiveVmId(cfg.paths.project)
-        if (active === id && listVms(cfg.paths.project).some((vm) => vm.id !== id)) {
-          return json(res, 409, { ok: false, error: { message: 'cannot delete active VM, switch active first' } })
-        }
-        const vm = getVm(cfg.paths.project, id)
-        if (denyIfUserCannotDeleteVm(req, res, vm, json)) return true
-        try {
-          if (vm) {
-            const gone = await destroySlot(vm)
-            // A node slot that could not be removed keeps running there with the account's credential.
-            if (!gone.ok && slotHost(vm).kind === 'node') {
-              return json(res, 409, {
-                ok: false,
-                error: { code: gone.code || 'remote_destroy_failed', message: gone.error || 'remote destroy failed' },
-              })
-            }
+        return await withVmLock(vmPath, async () => {
+          const vm = getVm(cfg.paths.project, id)
+          if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          const active = getActiveVmId(cfg.paths.project)
+          if (active === id && listVms(cfg.paths.project).some((slot) => slot.id !== id)) {
+            return json(res, 409, { ok: false, error: { message: 'cannot delete active VM, switch active first' } })
           }
-        } catch {}
-        // detach this VM only — do not unbind other slots sharing the SOCKS5
-        try {
-          proxyPool.unbindVm(id)
-        } catch {}
-        // remove cli-home
-        try {
-          fs.rmSync(path.join(cfg.paths.project, 'vms', id), { recursive: true, force: true })
-        } catch {}
-        fs.unlinkSync(vmPath)
-        invalidateVmSlotReadCache(cfg.paths.project, id)
-        try {
-          vmTestSchedule.remove(id)
-        } catch {}
-        if (active === id) {
-          clearActiveVm(cfg.paths.project)
+          if (denyIfUserCannotDeleteVm(req, res, vm, json)) return true
+          const gone = force
+            ? await forgetNodeSlot(vm, ctx.cragSubscription, ctx.clusterManager)
+            : await teardownSlot(vm, ctx.cragSubscription)
+          if (!gone.ok) {
+            return json(res, gone.httpStatus || 409, {
+              ok: false,
+              error: { code: gone.code || 'vm_destroy_failed', message: gone.error || 'VM teardown failed' },
+            })
+          }
+          // Detach this VM only — do not unbind other slots sharing the SOCKS5.
           try {
-            clearActiveVmFromDb()
+            proxyPool.unbindVm(id)
           } catch {}
           try {
-            reloadActiveVm(cfg)
+            fs.rmSync(path.join(cfg.paths.project, 'vms', id), { recursive: true, force: true })
           } catch {}
-        }
-        // drop the DB credential mirror row too
-        try {
-          removeVmFromDb(id)
-        } catch {}
-        // optional chat side files
-        try {
-          const chat = path.join(cfg.paths.project, 'vms', `${id}-chat.json`)
-          if (fs.existsSync(chat)) fs.unlinkSync(chat)
-        } catch {}
-        return json(res, 200, panel.ok({ deleted: id }))
+          fs.unlinkSync(vmPath)
+          invalidateVmSlotReadCache(cfg.paths.project, id)
+          try {
+            vmTestSchedule.remove(id)
+          } catch {}
+          if (active === id) {
+            clearActiveVm(cfg.paths.project)
+            try {
+              clearActiveVmFromDb()
+            } catch {}
+            try {
+              reloadActiveVm(cfg)
+            } catch {}
+          }
+          try {
+            removeVmFromDb(id)
+          } catch {}
+          try {
+            const chat = path.join(cfg.paths.project, 'vms', `${id}-chat.json`)
+            if (fs.existsSync(chat)) fs.unlinkSync(chat)
+          } catch {}
+          return json(
+            res,
+            200,
+            panel.ok({
+              deleted: id,
+              ...(gone.reclaim_pending && { reclaim_pending: true }),
+              ...(gone.node && { remote_teardown: 'skipped', node_state: gone.node.state }),
+            }),
+          )
+        })
       }
       // POST /api/panel/vms/:id/reset — destroy container + home, recreate same slot
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/reset$/.test(p)) {
@@ -3418,7 +5029,7 @@ export function createPanelHandler(ctx) {
         return await withVmLock(vmPath, async () => {
           if (!fs.existsSync(vmPath)) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
           const prev = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
-          const gone = await destroySlot(prev)
+          const gone = await teardownSlot(prev, mode === 'traits' ? ctx.cragSubscription : null)
           if (!gone.ok) {
             return json(res, 500, { ok: false, error: { message: gone.error || 'destroy failed', code: gone.code } })
           }
@@ -3620,42 +5231,49 @@ export function createPanelHandler(ctx) {
         )
       }
 
+      // GET /api/panel/vms/:id/health?range=24h|7d — request success / error buckets for the row detail.
+      if (req.method === 'GET' && /^\/api\/panel\/vms\/[^/]+\/health$/.test(p)) {
+        const id = p.split('/')[4]
+        const vm = getVm(cfg.paths.project, id)
+        if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+        if (!requestLog?.healthBuckets)
+          return json(res, 503, { ok: false, error: { message: 'request log unavailable' } })
+        const range = new URL(req.url || '/', 'http://localhost').searchParams.get('range') === '7d' ? '7d' : '24h'
+        const shape = range === '7d' ? { slots: 84, slotMin: 120 } : { slots: 48, slotMin: 30 }
+        const now = Date.now()
+        const start = new Date(now - shape.slots * shape.slotMin * 60_000).toISOString()
+        const buckets = requestLog.healthBuckets({ now, vmId: id, ...shape }).get(id) || null
+        return json(res, 200, {
+          range,
+          slot_min: shape.slotMin,
+          start,
+          buckets,
+          top_errors: requestLog.topErrors({ vmId: id, since: start }),
+        })
+      }
+
       // GET /api/panel/vms/:id/seed-settings
       if (req.method === 'GET' && /^\/api\/panel\/vms\/[^/]+\/seed-settings$/.test(p)) {
         const id = p.split('/')[4]
         const vm = getVm(cfg.paths.project, id)
         if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        const homeDir = path.join(cfg.paths.project, 'vms', id, 'cli-home')
-        let settings_json = null
-        let claude_setting = null
-        let kin_seed = null
-        try {
-          settings_json = JSON.parse(fs.readFileSync(path.join(homeDir, '.claude', 'settings.json'), 'utf8'))
-        } catch {}
-        try {
-          claude_setting = fs
-            .readFileSync(path.join(homeDir, '.claude', 'claude.setting'), 'utf8')
-            .replace(/\r\n?/g, '\n')
-            .replace(/\n+$/g, '')
-        } catch {
-          // Missing file stays null. The policy default is not this slot's file.
-        }
-        try {
-          kin_seed = JSON.parse(fs.readFileSync(path.join(homeDir, '.claude', 'kin-seed.json'), 'utf8'))
-        } catch {}
+        const observed = await readSeedSettings(cfg.paths.project, vm)
         const seed_policy = defaultSeedPolicy(vm.seed_policy || {})
-        if (claude_setting !== null) seed_policy.claude_setting = claude_setting
         const debug = new URL(req.url || '/', 'http://localhost').searchParams.get('debug') === '1'
         const payload = {
           vm_id: id,
           seed_policy,
           ...seedTelemetryContract(seed_policy),
-          settings_json,
-          claude_setting,
-          kin_seed,
-          cli_home: homeDir,
+          ...observed,
         }
-        if (debug) payload.telemetry_log = readTelemetryUploadLog(cfg.paths.project, id)
+        if (debug) {
+          try {
+            payload.telemetry_log = await readTelemetryUploadLog(cfg.paths.project, vm)
+          } catch {
+            payload.telemetry_log = []
+            payload.telemetry_log_error = 'telemetry_log_unavailable'
+          }
+        }
         return json(res, 200, panel.ok(payload))
       }
       // PUT /api/panel/vms/:id/seed-settings
@@ -3664,101 +5282,169 @@ export function createPanelHandler(ctx) {
         const vmPath = path.join(cfg.paths.project, 'vms', `${id}.json`)
         if (!fs.existsSync(vmPath)) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
         const body = await readBody(req, 256 * 1024)
-        const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
-        const telemetryWasOff = !isTelemetryEnabled(vm.seed_policy || {})
-        const merged = { ...(vm.seed_policy || {}), ...(body.seed_policy || {}) }
-        for (const k of ['telemetry_disabled', 'reject_client_settings', 'reject_client_metadata_identity']) {
-          if (body[k] !== undefined) merged[k] = !!body[k]
-        }
-        if (body.theme !== undefined) merged.theme = body.theme
-        if (body.extra_env !== undefined) merged.extra_env = body.extra_env
-        if (body.settings_json_override !== undefined) merged.settings_json_override = body.settings_json_override
-        if (body.claude_setting !== undefined) merged.claude_setting = body.claude_setting
-        if (body['claude.setting'] !== undefined) merged.claude_setting = body['claude.setting']
-        const next = defaultSeedPolicy(merged)
-        if (body.settings_json_override !== undefined) next.settings_json_override = body.settings_json_override
-        if (body.extra_env !== undefined) next.extra_env = body.extra_env || {}
-        const followProxyTz = body?.timezone_follow_proxy === true || body?.timezoneFollowProxy === true
-        const hasTimezone = body && Object.prototype.hasOwnProperty.call(body, 'timezone')
-        const hasLocale = body && Object.prototype.hasOwnProperty.call(body, 'locale')
-        let nextLocale = null
-        if (hasLocale) {
-          const requestedLocale = body.locale == null || body.locale === '' ? STANDARD_LOCALE : String(body.locale)
-          if (!SLOT_LOCALES.includes(requestedLocale)) {
-            return json(res, 400, {
+        return await withVmLock(`seed-settings:${vmPath}`, async () => {
+          let vm = getVm(cfg.paths.project, id)
+          if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          const patch = { ...(body.seed_policy || {}) }
+          for (const key of [
+            'telemetry_disabled',
+            'reject_client_settings',
+            'reject_client_metadata_identity',
+            'theme',
+            'extra_env',
+            'settings_json_override',
+            'claude_setting',
+          ]) {
+            if (Object.hasOwn(body, key)) patch[key] = body[key]
+          }
+          if (Object.hasOwn(body, 'claude.setting')) patch.claude_setting = body['claude.setting']
+          if (
+            isCodexVm(vm) ||
+            (slotHost(vm).native && isTelemetryEnabled(defaultSeedPolicy({ ...(vm.seed_policy || {}), ...patch })))
+          ) {
+            return json(res, 409, {
               ok: false,
-              error: { code: 'invalid_locale', message: `语言必须是 ${SLOT_LOCALES.join('、')}` },
+              error: { code: 'telemetry_unsupported', message: '此槽不支持 VM 原生遥测' },
             })
           }
-          nextLocale = requestedLocale
-        }
-        if (hasTimezone) {
-          const zone = validTimezone(body.timezone)
-          if (!zone) {
-            return json(res, 400, {
+          const followProxyTz = body.timezone_follow_proxy === true || body.timezoneFollowProxy === true
+          const hasTimezone = Object.hasOwn(body, 'timezone')
+          const hasLocale = Object.hasOwn(body, 'locale')
+          let timezone = null
+          let locale = null
+          if (hasLocale) {
+            locale = body.locale == null || body.locale === '' ? STANDARD_LOCALE : String(body.locale)
+            if (!SLOT_LOCALES.includes(locale)) {
+              return json(res, 400, {
+                ok: false,
+                error: { code: 'invalid_locale', message: `语言必须是 ${SLOT_LOCALES.join('、')}` },
+              })
+            }
+          }
+          if (hasTimezone) {
+            timezone = validTimezone(body.timezone)
+            if (!timezone) {
+              return json(res, 400, {
+                ok: false,
+                error: {
+                  type: 'invalid_request_error',
+                  code: 'invalid_timezone',
+                  message: '时区必须是有效的 IANA 名称，如 Asia/Tokyo',
+                  param: 'timezone',
+                },
+              })
+            }
+          } else if (followProxyTz) {
+            const route = JSON.stringify({ node_id: vm.node_id, proxy: vm.proxy })
+            const synced = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, id, {
+              force: true,
+              persist: false,
+            })
+            if (!synced.ok) {
+              return json(res, 400, {
+                ok: false,
+                error: {
+                  type: 'invalid_request_error',
+                  code: synced.reason || 'proxy_timezone_unknown',
+                  message: '未能从代理节点取到时区，请先检测代理地理位置',
+                },
+              })
+            }
+            vm = getVm(cfg.paths.project, id)
+            if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+            if (route !== JSON.stringify({ node_id: vm.node_id, proxy: vm.proxy })) {
+              return json(res, 409, {
+                ok: false,
+                error: { code: 'proxy_binding_changed', message: '代理绑定已变化，请重新保存时区设置' },
+              })
+            }
+            timezone = synced.timezone
+          }
+          // Only patch owned fields on the latest record, never an object held across geo/publication awaits.
+          vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+          const next = defaultSeedPolicy({ ...(vm.seed_policy || {}), ...patch })
+          const unsupported = slotHost(vm).native || isCodexVm(vm)
+          if (isCodexVm(vm) || (unsupported && isTelemetryEnabled(next))) {
+            return json(res, 409, {
               ok: false,
-              error: {
-                type: 'invalid_request_error',
-                code: 'invalid_timezone',
-                message: '时区必须是有效的 IANA 名称，如 Asia/Tokyo',
-                param: 'timezone',
-              },
+              error: { code: 'telemetry_unsupported', message: '此槽不支持 VM 原生遥测' },
             })
           }
-          const pinned = persistVmTimezone(cfg.paths.project, id, zone, { source: 'manual' })
-          if (!pinned) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-          Object.assign(vm, pinned)
-        } else if (followProxyTz) {
-          const synced = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, id, { force: true })
-          if (!synced.ok) {
-            return json(res, 400, {
-              ok: false,
-              error: {
-                type: 'invalid_request_error',
-                code: synced.reason || 'proxy_timezone_unknown',
-                message: '未能从代理节点取到时区，请先检测代理地理位置',
-              },
+          if (timezone) {
+            vm.timezone = timezone
+            vm.timezone_source = hasTimezone ? 'manual' : 'proxy_geo'
+            if (vm.fingerprint && typeof vm.fingerprint === 'object') vm.fingerprint.timezone = timezone
+          }
+          if (locale) vm.locale = locale
+          vm.seed_policy = next
+          vm.updated_at = new Date().toISOString()
+          atomicWriteJson(vmPath, vm, { mode: 0o600 })
+          let service
+          if (unsupported) {
+            service = await withVmLock(`seed-publication:${vmPath}`, async () => {
+              const outcome = {
+                ok: false,
+                wrote: false,
+                supported: false,
+                state: 'unsupported',
+                published: false,
+                applied: false,
+              }
+              const revision = (record) =>
+                JSON.stringify([record.node_id, record.runtime, record.seed_policy, record.timezone, record.locale])
+              try {
+                const host = slotHost(vm)
+                const existing = await host.seedFiles(vm, path.join(cfg.paths.project, 'vms', id))
+                const fresh = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+                if (revision(fresh) !== revision(vm)) throw new Error('seed_publication_superseded')
+                outcome.seed = writeSlotSeedFiles(cfg.paths.project, fresh, null, {
+                  existingSettings:
+                    existing.files['settings.json'] === null ? {} : JSON.parse(existing.files['settings.json']),
+                  replaceEnv: Object.hasOwn(body, 'extra_env') || Object.hasOwn(body, 'settings_json_override'),
+                })
+                outcome.wrote = outcome.seed.wrote === true
+                const result = await host.syncSeed(fresh, path.join(cfg.paths.project, 'vms', id))
+                outcome.published = result.published === true
+                if (revision(JSON.parse(fs.readFileSync(vmPath, 'utf8'))) !== revision(fresh))
+                  throw new Error('seed_publication_superseded')
+                outcome.ok = outcome.published
+              } catch {
+                outcome.code = 'seed_publish_failed'
+                outcome.error = '槽位种子配置尚未确认发布'
+              }
+              return outcome
+            })
+          } else {
+            service = await applyNativeTelemetry({
+              projectRoot: cfg.paths.project,
+              vm,
+              routing: ctx.routingConfig,
+              lifecycle: { watchdog: ctx.kernelWatchdog, poolScheduler: ctx.poolScheduler },
+              replaceEnv: Object.hasOwn(body, 'extra_env') || Object.hasOwn(body, 'settings_json_override'),
             })
           }
-          if (synced.applied) {
-            const fresh = getVm(cfg.paths.project, id)
-            if (fresh) Object.assign(vm, fresh)
-          } else if (synced.timezone) {
-            vm.timezone = synced.timezone
-            vm.timezone_source = 'proxy_geo'
-          }
-        }
-        if (nextLocale) vm.locale = nextLocale
-        vm.seed_policy = next
-        vm.updated_at = new Date().toISOString()
-        atomicWriteJson(vmPath, vm, { mode: 0o600 })
-        const written = writeSlotSeedFiles(cfg.paths.project, vm, next)
-        let service = null
-        if (
-          vm.status === 'running' &&
-          (next.telemetry_disabled !== telemetryWasOff || body.telemetry_service_restart === true)
-        ) {
-          const report = await runFleetUpdate(cfg.paths.project, {
-            action: 'telemetry',
-            ids: [id],
-            concurrency: 1,
-            routing: ctx.routingConfig,
-          })
-          service = report.items?.[0] || report
-        }
-        return json(
-          res,
-          200,
-          panel.ok({
+          const { seed: written, ...publicService } = service
+          const data = {
             vm_id: id,
             seed_policy: next,
             ...seedTelemetryContract(next),
-            settings_json: written.settings || null,
-            claude_setting: written.claude_setting || '',
-            kin_seed: written.kin_seed || null,
-            service,
-          }),
-        )
+            saved: true,
+            published: service.published === true,
+            applied: service.applied === true,
+            settings_json: written?.settings || null,
+            claude_setting: written?.claude_setting ?? null,
+            kin_seed: written?.kin_seed || null,
+            service: publicService,
+          }
+          if (!service.ok) {
+            return json(res, 502, {
+              ok: false,
+              error: { code: service.code || 'telemetry_not_applied', message: service.error || 'VM 原生配置尚未生效' },
+              data,
+            })
+          }
+          return json(res, 200, panel.ok(data))
+        })
       }
 
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/wrap-cli\/promote$/.test(p)) {
@@ -3774,54 +5460,56 @@ export function createPanelHandler(ctx) {
         const id = p.split('/')[4]
         const body = await readBody(req, 8 * 1024).catch(() => ({}))
         const mode = body.mode === 'traits' ? 'traits' : 'keep'
-        const vm = getVm(cfg.paths.project, id)
-        if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        if (isCodexVm(vm)) {
-          return json(res, 409, {
-            ok: false,
-            error: { code: 'codex_kernel_only', message: 'Codex 槽只使用控制面 Codex kernel' },
-          })
-        }
-        if (slotHost(vm).bakedKernel) {
-          const refreshed = await refreshCluster(cfg.paths.project, [vm], { routing: ctx.routingConfig })
-          const item = refreshed.items[0] || {
-            ok: false,
-            code: 'slot_payload_refresh_failed',
-            error: '集群槽换镜像失败',
-          }
-          if (!item.ok) return json(res, 400, { ok: false, error: { code: item.code, message: item.error } })
-          return json(
-            res,
-            200,
-            panel.ok({ mode, wrap: { ok: true, baked: true, image: item.image }, kernel: item.kernel }),
-          )
-        }
-        if (mode === 'traits') {
-          const gone = await destroySlot(vm)
-          if (!gone.ok)
-            return json(res, 500, { ok: false, error: { code: gone.code, message: gone.error || '重建新特征失败' } })
-          const rebuilt = recreateVmFiles(cfg.paths.project, vm, { mode: 'traits' })
-          const boot = await startSlotReady(rebuilt.vm, cfg.paths.project, {
-            recreate: true,
-            routing: ctx.routingConfig,
-          })
-          if (!boot.ok)
-            return json(res, 500, {
+        return await withVmLock(path.join(cfg.paths.project, 'vms', `${id}.json`), async () => {
+          const vm = getVm(cfg.paths.project, id)
+          if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          if (isCodexVm(vm)) {
+            return json(res, 409, {
               ok: false,
-              error: { code: boot.code, message: boot.error || '重建新特征后启动失败' },
+              error: { code: 'codex_kernel_only', message: 'Codex 槽只使用控制面 Codex kernel' },
             })
-          return json(res, 200, panel.ok({ mode, rebuild: 'traits', boot: panel.publicSlotBoot(boot) }))
-        }
-        const wrap = materializeWrapCli(cfg.paths.project, vm)
-        if (!wrap.ok) return json(res, 400, { ok: false, error: { code: wrap.code, message: wrap.error } })
-        writeKernelConfig(cfg.paths.project, vm, { routing: ctx.routingConfig })
+          }
+          if (slotHost(vm).bakedKernel) {
+            const refreshed = await refreshCluster(cfg.paths.project, [vm], { routing: ctx.routingConfig })
+            const item = refreshed.items[0] || {
+              ok: false,
+              code: 'slot_payload_refresh_failed',
+              error: '集群槽换镜像失败',
+            }
+            if (!item.ok) return json(res, 400, { ok: false, error: { code: item.code, message: item.error } })
+            return json(
+              res,
+              200,
+              panel.ok({ mode, wrap: { ok: true, baked: true, image: item.image }, kernel: item.kernel }),
+            )
+          }
+          if (mode === 'traits') {
+            const gone = await teardownSlot(vm, ctx.cragSubscription)
+            if (!gone.ok)
+              return json(res, 500, { ok: false, error: { code: gone.code, message: gone.error || '重建新特征失败' } })
+            const rebuilt = recreateVmFiles(cfg.paths.project, vm, { mode: 'traits' })
+            const boot = await startSlotReady(rebuilt.vm, cfg.paths.project, {
+              recreate: true,
+              routing: ctx.routingConfig,
+            })
+            if (!boot.ok)
+              return json(res, 500, {
+                ok: false,
+                error: { code: boot.code, message: boot.error || '重建新特征后启动失败' },
+              })
+            return json(res, 200, panel.ok({ mode, rebuild: 'traits', boot: panel.publicSlotBoot(boot) }))
+          }
+          const wrap = materializeResolvedKernel(cfg.paths.project, vm, { routing: ctx.routingConfig })
+          if (!wrap.ok) return json(res, 400, { ok: false, error: { code: wrap.code, message: wrap.error } })
+          writeKernelConfig(cfg.paths.project, vm, { routing: ctx.routingConfig })
 
-        let kernel = { ok: false, skipped: true, reason: 'engine_not_rust' }
-        if (resolveInferenceEngine(vm, ctx.routingConfig) === 'rust') {
-          kernel = await restartRustKernel(slotExec(cfg.paths.project, vm))
-        }
+          let kernel = { ok: false, skipped: true, reason: 'engine_not_rust' }
+          if (resolveInferenceEngine(vm, ctx.routingConfig) === 'rust') {
+            kernel = await restartRustKernel(slotExec(cfg.paths.project, vm))
+          }
 
-        return json(res, 200, panel.ok({ mode, wrap, kernel }))
+          return json(res, 200, panel.ok({ mode, wrap, kernel }))
+        })
       }
 
       if (req.method === 'GET' && /^\/api\/panel\/vms\/[^/]+\/official-cc-bootstrap$/.test(p)) {
@@ -3936,13 +5624,16 @@ export function createPanelHandler(ctx) {
           owner: { role: ident.role, userId: req.panelUserId },
           proxyPool,
           occupied: historic,
+          telemetryDefaultEnabled: telemetryDefaultEnabled(ctx.routingConfig),
         })
         if (!result.ok) return json(res, result.status, { ok: false, error: result.error })
         await fillTimezoneFromExit(result.vm.id)
+        const canBindSubscription =
+          !req.apiKeyKind && ident.role === 'admin' && !!ident.user && sameOriginPost(req, cfg.base_url)
         const brought =
           ctx.packageImportBringUp === false
             ? { start_error: null, official_cc_bootstrap: null, probe: null }
-            : await bringUpImportedVm(result.vm.id)
+            : await bringUpImportedVm(result.vm.id, { bindSubscription: canBindSubscription })
         const saved = getVm(cfg.paths.project, result.vm.id) || result.vm
         return json(
           res,
@@ -3991,7 +5682,22 @@ export function createPanelHandler(ctx) {
         }
         const startNow = body.start !== false && body.status !== 'stopped'
         const wantKernel = body.kernel && OS_CATALOG[body.kernel] ? body.kernel : kernelForIndex(idx)
-        const nodeId = body.node_id ? String(body.node_id) : null
+        let nodeId = body.node_id ? String(body.node_id) : null
+        const kindProbe = {}
+        stampVmKind(kindProbe, body)
+        const codexCreate = isCodexVm(kindProbe)
+        if (Object.hasOwn(body, 'dataplane') && (codexCreate || !['wrap', 'crag'].includes(body.dataplane))) {
+          return json(res, 400, {
+            ok: false,
+            error: { code: 'invalid_create_dataplane', message: '仅 Anthropic 支持选择 cli-node 或 CRAG 推理内核' },
+          })
+        }
+        const selectedCrag = body.dataplane === 'crag'
+        const unsupportedCrag = () =>
+          json(res, 409, {
+            ok: false,
+            error: { code: 'crag_v2_unsupported_placement', message: '此机器不支持 CRAG，只安装标准内核' },
+          })
         const vmDefaults = normalizeVmConfig(ctx.routingConfig?.vm)
         const requestedRuntime = body.runtime_type
         let runtime
@@ -4023,16 +5729,59 @@ export function createPanelHandler(ctx) {
           }
           throw error
         }
-        if (nodeId) {
+        // No node named: auto placement may still pick one by memory/load headroom.
+        // Only for admin Docker creates whose exit is not pinned to this host.
+        let placement = null
+        let releasePlacement = () => {}
+        const placementPolicy = normalizeAutoPlacement(ctx.routingConfig?.cluster?.auto_placement)
+        const wanted = requestedPlacement(body, placementPolicy)
+        const exitPinsHost = typeof body.proxy_id === 'string' && isLocalEgressId(body.proxy_id.trim())
+        const localCragSupported = process.platform === 'linux' && process.arch === 'x64'
+        const cragCapableNodes = new Set()
+        if (wanted.mode === 'auto' && ident.role === 'admin' && runtime !== RUNTIME_KVM && !exitPinsHost) {
+          const picked = await (ctx.pickPlacement || pickPlacement)({
+            vm: { ...kindProbe, machine },
+            vms: existing,
+            routing: ctx.routingConfig,
+            policy:
+              selectedCrag && !localCragSupported ? { ...placementPolicy, include_local: false } : placementPolicy,
+            nodes: clusterNodesOf(ctx),
+            localHost: (ctx.readLocalHost || readLocalHost)(),
+            preflight: async (id) => {
+              const checked = await preflightNode(id, { kernel: wantKernel, runtime })
+              const supported =
+                !isNativeNodeVm({ node_id: id }) && checked.checks.some((check) => check.id === 'arch' && check.ok)
+              if (checked.ok && supported) cragCapableNodes.add(id)
+              if (selectedCrag && checked.ok && !supported) {
+                return {
+                  ...checked,
+                  ok: false,
+                  checks: [...checked.checks, { id: 'crag', ok: false, level: 'error', message: '此机器不支持 CRAG' }],
+                }
+              }
+              return checked
+            },
+          })
+          if (picked.error) {
+            return json(res, picked.error.status, {
+              ok: false,
+              error: { code: picked.error.code, message: picked.error.message, placement: picked.error.report },
+            })
+          }
+          placement = picked.report
+          releasePlacement = picked.release || releasePlacement
+          nodeId = picked.node_id || null
+        }
+        if (nodeId && !placement) {
           if (ident.role !== 'admin') {
             return json(res, 403, {
               ok: false,
               error: { code: 'placement_forbidden', message: '只有管理员可以把虚拟机放到集群节点' },
             })
           }
-          const kindProbe = { node_id: nodeId }
-          stampVmKind(kindProbe, body)
-          if (isCodexVm(kindProbe) && !slotHost(kindProbe).supports('codex')) {
+          const native = isNativeNodeVm({ node_id: nodeId })
+          if (selectedCrag && native) return unsupportedCrag()
+          if (codexCreate && !slotHost({ ...kindProbe, node_id: nodeId }).supports('codex')) {
             return json(res, 400, {
               ok: false,
               error: { code: 'remote_unsupported', message: '集群节点上的虚拟机暂不支持此操作' },
@@ -4047,6 +5796,9 @@ export function createPanelHandler(ctx) {
               error: { code: e?.code || 'placement_failed', message: String(e?.message || e) },
             })
           }
+          const arch = preflight.checks.find((check) => check.id === 'arch')
+          if (selectedCrag && arch && !arch.ok) return unsupportedCrag()
+          if (!native && arch?.ok) cragCapableNodes.add(nodeId)
           if (!preflight.ok) {
             return json(res, 409, {
               ok: false,
@@ -4058,6 +5810,12 @@ export function createPanelHandler(ctx) {
             })
           }
         }
+        const cragSupported = nodeId ? cragCapableNodes.has(nodeId) : localCragSupported
+        if (selectedCrag && !cragSupported) {
+          releasePlacement()
+          return unsupportedCrag()
+        }
+        const preinstallBoth = !codexCreate && cragSupported
         // An explicit exit (e.g. local egress for a node: that VPS's own route) replaces auto-allocation.
         let pickedProxyId = typeof body.proxy_id === 'string' ? body.proxy_id.trim() : ''
         if (pickedProxyId && isLocalEgressId(pickedProxyId)) {
@@ -4106,6 +5864,22 @@ export function createPanelHandler(ctx) {
             error: { code: 'invalid_locale', message: `语言必须是 ${SLOT_LOCALES.join('、')}` },
           })
         }
+        let displayLabel = padVm(idx)
+        if (body.name != null && String(body.name).trim() !== '') {
+          const parsedName = parseVmDisplayName(body.name)
+          if (!parsedName.ok) {
+            return json(res, 400, {
+              ok: false,
+              error: {
+                type: 'invalid_request_error',
+                code: 'invalid_name',
+                message: parsedName.error,
+                param: 'name',
+              },
+            })
+          }
+          displayLabel = parsedName.value
+        }
         let generated
         try {
           generated = assignComputerFingerprint(
@@ -4130,7 +5904,7 @@ export function createPanelHandler(ctx) {
         }
         const vm = {
           id,
-          name: body.name || padVm(idx),
+          name: displayLabel,
           status: startNow ? 'running' : body.status || 'stopped',
           kernel: wantKernel,
           timezone: requestedTimezone || null,
@@ -4160,8 +5934,12 @@ export function createPanelHandler(ctx) {
           schedule_disabled_reason: 'no_credential',
           unschedulable: { reason: 'no_credential', detail: null, at: new Date().toISOString() },
           proxy_cli_enabled: body.proxy_cli_enabled === true,
+          // Desktop companion: admin-only (the toggle routes are admin-only too) and docker-only.
+          ...(!codexCreate && runtime !== RUNTIME_KVM && ident.role === 'admin' && body.desktop === true
+            ? { desktop: { enabled: true } }
+            : {}),
           proxy_required: false,
-          seed_policy: standardSeedPolicy(),
+          seed_policy: standardSeedPolicy({}, { defaultEnabled: telemetryDefaultEnabled(ctx.routingConfig) }),
           runtime: { type: runtime },
           machine,
         }
@@ -4174,6 +5952,12 @@ export function createPanelHandler(ctx) {
         }
         if (nodeId) vm.node_id = nodeId
         stampVmKind(vm, body)
+        if (!codexCreate) vm.dataplane = body.dataplane ?? 'wrap'
+        if (selectedCrag) {
+          vm.crag_kernel_version = 'v2'
+          // Do not publish a running record before the selected CRAG has passed licensing.
+          vm.status = 'stopped'
+        }
         const openaiPolicy = normalizeOpenAIQuotaPolicy(ctx.routingConfig?.codex?.quota)
         const explicitConcurrency =
           Object.prototype.hasOwnProperty.call(body, 'max_concurrency') ||
@@ -4233,11 +6017,24 @@ export function createPanelHandler(ctx) {
           vm.policy.maxRpm = explicitRpm ? rawRpm : Number(ctx.routingConfig?.concurrency?.default_max_rpm ?? 0)
           vm.policy.rpmOverride = explicitRpm
         }
+        if (preinstallBoth) {
+          const project = cfg.paths.project
+          const missing = '请在「内核」页拉取可信内核包后重试。'
+          try {
+            preflightFreshClaudeKernels(project, vm)
+            if (nodeId) cragSlotPayload(project, { required: true })
+          } catch (error) {
+            releasePlacement()
+            return json(res, 409, {
+              ok: false,
+              error: { code: error.code || 'kernel_package_missing', message: missing },
+            })
+          }
+        }
         atomicWriteJson(vmPath, vm, { mode: 0o600 })
+        // The record now books this slot's memory itself.
+        releasePlacement()
         writeGuestMachineIdFile(cfg.paths.project, id, generated.guest_machine_id)
-        try {
-          seedFreshCliHome(cfg.paths.project, vm)
-        } catch (e) {}
         let allocated = null
         let proxyError = null
         const wantProxy = body.auto_allocate_proxy === true || startNow || !!pickedProxyId
@@ -4268,31 +6065,61 @@ export function createPanelHandler(ctx) {
           vm.timezone_source = 'proxy_geo'
           if (vm.fingerprint && typeof vm.fingerprint === 'object') vm.fingerprint.timezone = zoned.timezone
         }
-        if (body.activate === true) {
+        let startError = null
+        try {
+          seedFreshCliHome(cfg.paths.project, vm, {
+            routing: ctx.routingConfig,
+            preinstallBoth: preinstallBoth && !nodeId,
+          })
+          if (preinstallBoth && nodeId) await stageFreshClaudeKernels(vm, cfg.paths.project)
+        } catch (error) {
+          const code = /^[a-z0-9_]+$/i.test(error.code || '') ? error.code : 'vm_init_failed'
+          startError = `虚拟机初始化失败（${code}）`
+          patchVmRecord(cfg.paths.project, id, { status: 'error' })
+          markUnschedulable(cfg.paths.project, id, 'runtime_start_failed', { message: startError })
+        }
+        if (!startError && body.activate === true) {
           try {
             activateVmSlot(id)
           } catch (e) {}
         }
-        let startError = null
-        if (startNow && hasExit(vm)) {
+        const createBindSubscription =
+          !req.apiKeyKind && ident.role === 'admin' && !!ident.user && sameOriginPost(req, cfg.base_url)
+        if (!startError && startNow && hasExit(vm)) {
           let boot
           try {
-            boot = await startSlotReady(vm, cfg.paths.project, { routing: ctx.routingConfig })
+            boot = await startSlotReady(vm, cfg.paths.project, {
+              routing: ctx.routingConfig,
+              bindSubscription: createBindSubscription,
+            })
           } catch (e) {
             boot = { ok: false, error: String(e?.message || e) }
           }
           if (!boot.ok) {
-            // Slot JSON is already on disk. 500 here makes the console treat
-            // create as a no-op, so the new row never refetches into the list.
-            patchVmRecord(cfg.paths.project, id, { status: 'error' })
-            markUnschedulable(cfg.paths.project, id, 'runtime_start_failed', {
-              message: String(boot.error || 'runtime start failed').slice(0, 240),
-            })
-            startError = boot.error || 'runtime start failed'
+            const deferredCrag =
+              selectedCrag &&
+              (/^license_/.test(boot.code || '') ||
+                [
+                  'slot_limit_reached',
+                  'crag_subscription_unavailable',
+                  'crag_subscription_authority_unavailable',
+                ].includes(boot.code || ''))
+            if (deferredCrag) {
+              patchVmRecord(cfg.paths.project, id, { status: 'stopped' })
+              startError = boot.error || '已创建 CRAG 槽位，当前暂未启动'
+            } else {
+              // Slot JSON is already on disk. 500 here makes the console treat
+              // create as a no-op, so the new row never refetches into the list.
+              patchVmRecord(cfg.paths.project, id, { status: 'error' })
+              markUnschedulable(cfg.paths.project, id, 'runtime_start_failed', {
+                message: String(boot.error || 'runtime start failed').slice(0, 240),
+              })
+              startError = boot.error || 'runtime start failed'
+            }
           } else {
             patchVmRecord(cfg.paths.project, id, { status: 'running' })
           }
-        } else if (startNow) {
+        } else if (!startError && startNow) {
           patchVmRecord(cfg.paths.project, id, { status: 'stopped' })
         }
         const saved = getVm(cfg.paths.project, id) || vm
@@ -4306,6 +6133,7 @@ export function createPanelHandler(ctx) {
               role: ident.role,
               nodes: clusterNodesOf(ctx),
             }),
+            ...(placement ? { placement } : {}),
             ...(startError ? { start_error: startError } : {}),
             ...(proxyError ? { proxy_error: proxyError } : {}),
           }),
@@ -4314,13 +6142,22 @@ export function createPanelHandler(ctx) {
       // POST /api/panel/vms/:id/start
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/start$/.test(p)) {
         const id = p.split('/')[4]
-        const started = await powerOnSlot({
-          projectRoot: cfg.paths.project,
-          id,
-          proxyPool,
-          routing: ctx.routingConfig,
-          fillTimezone: fillTimezoneFromExit,
-          by: 'start',
+        const identity = panelIdentity(req)
+        const bindSubscription =
+          req.apiKeyKind === 'master' ||
+          (!req.apiKeyKind && identity.role === 'admin' && !!identity.user && sameOriginPost(req, cfg.base_url))
+        const started = await withVmLock(path.join(cfg.paths.project, 'vms', `${id}.json`), async () => {
+          const result = await powerOnSlot({
+            projectRoot: cfg.paths.project,
+            id,
+            proxyPool,
+            routing: ctx.routingConfig,
+            fillTimezone: fillTimezoneFromExit,
+            by: 'start',
+            runtimeOptions: { bindSubscription },
+          })
+          if (result.ok) releaseKernelInstallSafetyHold(cfg.paths.project, id, ctx.kernelWatchdog)
+          return result
         })
         if (!started.ok) {
           return json(res, started.status, { ok: false, error: { code: started.code, message: started.error } })
@@ -4356,14 +6193,25 @@ export function createPanelHandler(ctx) {
       }
       // POST /api/panel/vms/:id/recover — power cycle (stop → start) plus a fresh diagnosis
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/recover$/.test(p)) {
-        const recovered = await recoverSlot({
-          projectRoot: cfg.paths.project,
-          id: p.split('/')[4],
-          proxyPool,
-          routing: ctx.routingConfig,
-          fillTimezone: fillTimezoneFromExit,
-          watchdog: ctx.kernelWatchdog,
-          internal: panelIdentity(req).role === 'admin',
+        const id = p.split('/')[4]
+        const recovered = await withVmLock(path.join(cfg.paths.project, 'vms', `${id}.json`), async () => {
+          const result = await recoverSlot({
+            projectRoot: cfg.paths.project,
+            id,
+            proxyPool,
+            routing: ctx.routingConfig,
+            fillTimezone: fillTimezoneFromExit,
+            watchdog: ctx.kernelWatchdog,
+            poolScheduler: ctx.poolScheduler,
+            internal: panelIdentity(req).role === 'admin',
+            ops: ctx.kernelRecoveryOps,
+          })
+          // Recovery returns outer ok even when a boot/readiness/diagnosis step failed.
+          if (result.ok && result.report?.ok === true) {
+            panel.resetVmCircuit({ cfg, poolScheduler: ctx.poolScheduler, id })
+            releaseKernelInstallSafetyHold(cfg.paths.project, id, ctx.kernelWatchdog)
+          }
+          return result
         })
         if (!recovered.ok) {
           return json(res, recovered.status, { ok: false, error: { code: recovered.code, message: recovered.error } })
@@ -4374,28 +6222,35 @@ export function createPanelHandler(ctx) {
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/stop$/.test(p)) {
         const id = p.split('/')[4]
         const vmPath = path.join(cfg.paths.project, 'vms', `${id}.json`)
-        if (!fs.existsSync(vmPath)) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
-        const halt = await stopSlot(vm)
-        if (!halt.ok) return json(res, 500, { ok: false, error: { message: halt.error || 'runtime stop failed' } })
-        vm.status = 'stopped'
-        migrateScheduleRecord(vm)
-        applyScheduleOff(vm, true, { reason: 'stopped' })
-        atomicWriteJson(vmPath, vm, { mode: 0o600 })
-        return json(
-          res,
-          200,
-          panel.ok({
-            vm: summarizeVm(vm, cfg.paths.project, ctx.routingConfig),
-            runtime: panel.publicRuntimeView(vm.runtime) || GATEWAY_CAPABILITIES.runtime,
-            kernel: GATEWAY_CAPABILITIES.kernel,
-            halt: panel.publicSlotBoot(halt),
-          }),
-        )
+        return await withVmLock(vmPath, async () => {
+          if (!fs.existsSync(vmPath)) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+          const halt = await stopSlot(vm)
+          if (!halt.ok) return json(res, 500, { ok: false, error: { message: halt.error || 'runtime stop failed' } })
+          vm.status = 'stopped'
+          migrateScheduleRecord(vm)
+          applyScheduleOff(vm, true, { reason: 'stopped' })
+          atomicWriteJson(vmPath, vm, { mode: 0o600 })
+          try {
+            recordDeliveryShutdown(vm, getDb)
+          } catch {
+            console.warn('[vm-delivery] failed to record shutdown for %s', vm.id)
+          }
+          return json(
+            res,
+            200,
+            panel.ok({
+              vm: summarizeVm(vm, cfg.paths.project, ctx.routingConfig),
+              runtime: panel.publicRuntimeView(vm.runtime) || GATEWAY_CAPABILITIES.runtime,
+              kernel: GATEWAY_CAPABILITIES.kernel,
+              halt: panel.publicSlotBoot(halt),
+            }),
+          )
+        })
       }
 
       // POST /api/panel/vms/import
-      // workflow: create VM → allocate proxy → import sessionKey (via SOCKS) → start
+      // workflow: create VM → allocate proxy → start guest/CLI → exchange in guest → import
       if (req.method === 'POST' && p === '/api/panel/vms/import') {
         const body = await readBody(req, 1024 * 1024)
         const sessionKey = body.sessionKey || body.session_key || body.sid || ''
@@ -4470,6 +6325,7 @@ export function createPanelHandler(ctx) {
           }
           const proxyUrl = slotProxy.proxyUrl
           let oauth = null
+          let oauthFromVm = false
           if (wantsApiKey) {
             const apiKey = String(apiKeyRaw || sessionKey || accessToken).trim()
             if (!looksLikeConsoleApiKey(apiKey)) {
@@ -4491,12 +6347,17 @@ export function createPanelHandler(ctx) {
               String(requestedType).toLowerCase() === 'setup_token' ||
               String(body.scope || '').toLowerCase() === 'inference'
             oauth = await sessionKeyToOAuth(String(sessionKey).trim(), {
-              proxyUrl,
               scope: inference ? 'inference' : 'full',
+              exec: slotExec(cfg.paths.project, existing),
+              projectRoot: cfg.paths.project,
+              routing: ctx.routingConfig,
+              proxyPool,
             })
+            oauthFromVm = true
             if (inference) {
               oauth.type = 'setup-token'
               oauth.mode = 'setup-token'
+              oauth.oauth_registration = 'console'
             }
           } else if (isSub2apiAccountExport(exportDoc)) {
             oauth = sub2apiAccountToOauth(exportDoc, existing)
@@ -4531,7 +6392,7 @@ export function createPanelHandler(ctx) {
             return json(res, 400, { ok: false, error: { message: 'sessionKey or access_token required' } })
           }
           if (body.auth_scheme || body.authScheme) oauth.auth_scheme = body.auth_scheme || body.authScheme
-          if (oauth.access_token && !wantsApiKey) {
+          if (oauth.access_token && !wantsApiKey && !oauthFromVm) {
             oauth = await enrichOauthIdentity(oauth, { proxyUrl })
           }
           const committed = await commitImportedOauth({
@@ -4554,6 +6415,7 @@ export function createPanelHandler(ctx) {
               oauth_email: existing.claude.email,
               has_refresh: existing.claude.has_refresh,
               official_cc_bootstrap: committed.official_cc_bootstrap || null,
+              ...(committed.telemetry_error ? { telemetry_error: committed.telemetry_error } : {}),
             }),
           )
         } catch (e) {
@@ -4596,27 +6458,13 @@ export function createPanelHandler(ctx) {
             )
           }
           const flavor = body.flavor || body.type || 'cai'
-          if (normalizeOauthFlavor(flavor) === 'claude_code') {
-            const generated = await startClaudeAuthLoginSession({
-              vm: existing,
-              projectRoot: cfg.paths.project,
-              force: body.force === true || body.force === 'true' || body.force === 1,
+          if (normalizeOauthFlavor(flavor) === AUTH_LOGIN_FLAVOR) {
+            return json(res, 409, {
+              ok: false,
+              error: { code: 'native_login_required', message: '请使用 Claude Code 授权终端生成链接' },
             })
-            const px = existing.proxy || {}
-            return json(
-              res,
-              200,
-              panel.ok({
-                ...generated,
-                proxy_hint: slotProxyHint(px, proxyPool?.labelOf(px.id)),
-              }),
-            )
           }
-          const generated = generateAuthUrl({
-            vmId: id,
-            proxyUrl: slotProxy.proxyUrl,
-            flavor,
-          })
+          const generated = generateAuthUrl({ vmId: id, proxyUrl: slotProxy.proxyUrl, flavor })
           const px = existing.proxy || {}
           return json(
             res,
@@ -4679,7 +6527,8 @@ export function createPanelHandler(ctx) {
             const oauth = await exchangeCodexAuthCode({
               sessionId: body.session_id || body.sessionId,
               code: body.code || body.auth_code || body.callback || body.callback_url,
-              proxyUrl: slotProxy.proxyUrl,
+              vm: existing,
+              proxyPool,
               vmId: id,
             })
             const committed = await commitImportedCodexVm({
@@ -4699,40 +6548,45 @@ export function createPanelHandler(ctx) {
           }
           const code = body.code || body.auth_code || ''
           const flavor = body.flavor || body.type || ''
-          const loginSession = readAuthLoginSession(cfg.paths.project, id)
           const sessionKey = String(body.session_id || body.sessionId || '')
-          const officialLogin =
-            normalizeOauthFlavor(flavor) === 'claude_code' ||
-            (loginSession?.alive &&
-              !loginSession.expired &&
-              loginSession.session_id &&
-              loginSession.session_id === sessionKey)
-          let oauth = looksLikeOfficialSetupToken(code)
-            ? await completeClaudeSetupToken({
-                projectRoot: cfg.paths.project,
-                vmId: id,
-                sessionId: sessionKey,
-                code,
-              })
-            : officialLogin
-              ? await completeClaudeAuthLogin({
-                  projectRoot: cfg.paths.project,
-                  vmId: id,
-                  sessionId: sessionKey,
-                  code,
-                })
-              : await exchangeAuthCode({
-                  sessionId: sessionKey,
-                  code,
-                  proxyUrl: slotProxy.proxyUrl,
-                  vmId: id,
-                })
-          if (looksLikeOfficialSetupToken(code) || oauth.flavor === SETUP_TOKEN_FLAVOR) {
+          let oauth
+          let oauthFromVm = false
+          if (normalizeOauthFlavor(flavor) === AUTH_LOGIN_FLAVOR || /^native-[a-f0-9]{32}$/.test(sessionKey)) {
+            return json(res, 409, {
+              ok: false,
+              error: { code: 'native_login_required', message: '请在 Claude Code 授权终端提交回调' },
+            })
+          }
+          if (looksLikeOfficialSetupToken(code)) {
+            oauth = await completeClaudeSetupToken({
+              projectRoot: cfg.paths.project,
+              vmId: id,
+              sessionId: sessionKey,
+              code,
+            })
+          } else {
+            oauthFromVm = true
+            oauth = await exchangeAuthCode({
+              sessionId: sessionKey,
+              code,
+              vmId: id,
+              exec: slotExec(cfg.paths.project, existing),
+              projectRoot: cfg.paths.project,
+              routing: ctx.routingConfig,
+              proxyPool,
+            })
+          }
+          // The paste-code mint is the CLI's own setup token: inference-only,
+          // one year, no refresh. That is `official-setup-token`; the converted
+          // setup-token mode is the one that still carries a refresh token.
+          const mintedSetupToken =
+            (normalizeOauthFlavor(flavor) === 'setup_token' ||
+              oauth.flavor === 'setup_token' ||
+              oauth.flavor === 'setup-token') &&
+            !String(oauth.refresh_token || '').trim()
+          if (looksLikeOfficialSetupToken(code) || oauth.flavor === SETUP_TOKEN_FLAVOR || mintedSetupToken) {
             oauth.type = 'official-setup-token'
             oauth.mode = 'official-setup-token'
-          } else if (oauth.flavor === AUTH_LOGIN_FLAVOR || oauth.source === AUTH_LOGIN_SOURCE) {
-            oauth.type = 'oauth'
-            oauth.mode = 'oauth'
           } else if (
             normalizeOauthFlavor(flavor) === 'setup_token' ||
             oauth.flavor === 'setup_token' ||
@@ -4742,7 +6596,7 @@ export function createPanelHandler(ctx) {
             oauth.mode = 'setup-token'
           }
           if (body.auth_scheme || body.authScheme) oauth.auth_scheme = body.auth_scheme || body.authScheme
-          if (oauth.access_token) {
+          if (oauth.access_token && !oauthFromVm) {
             oauth = await enrichOauthIdentity(oauth, { proxyUrl: slotProxy.proxyUrl })
           }
           const committed = await commitImportedOauth({
@@ -4765,17 +6619,23 @@ export function createPanelHandler(ctx) {
               oauth_email: existing.claude?.email,
               has_refresh: existing.claude?.has_refresh,
               official_cc_bootstrap: committed.official_cc_bootstrap || null,
+              ...(committed.telemetry_error ? { telemetry_error: committed.telemetry_error } : {}),
               source: oauth.source || 'oauth-auth-url',
               flavor: oauth.flavor || null,
             }),
           )
         } catch (e) {
-          const status =
-            e.code === 'session_expired' || e.code === 'session_vm_mismatch' || e.code === 'code_required' ? 400 : 502
-          return json(res, status, {
-            ok: false,
-            error: { code: e.code || 'exchange_code_failed', message: String(e.message || e).slice(0, 240) },
-          })
+          if (e.code === 'session_expired' || e.code === 'session_vm_mismatch' || e.code === 'code_required') {
+            return json(res, 400, {
+              ok: false,
+              error: { code: e.code, message: String(e.message || e).slice(0, 240) },
+            })
+          }
+          // An exchange failure carries an upstream class — throttled (429),
+          // blocked exit, refused origin — so report it like the cookie import
+          // does instead of flattening every one of them into a 502.
+          const failure = panelImportErrorPayload(e)
+          return json(res, failure.status === 500 ? 502 : failure.status, { ok: false, error: failure.error })
         }
       }
 
@@ -4818,7 +6678,7 @@ export function createPanelHandler(ctx) {
         if (!oauth?.access_token && !oauth?.refresh_token && !oauth?.api_key) {
           return json(res, 400, {
             ok: false,
-            error: { code: 'credential_required', message: 'sub2api JSON 需要 access_token、refresh_token 或 api_key' },
+            error: { code: 'credential_required', message: '账号 JSON 需要 access_token、refresh_token 或 api_key' },
           })
         }
         const committed = await commitImportedOauth({
@@ -4843,6 +6703,7 @@ export function createPanelHandler(ctx) {
             oauth_email: existing.claude?.email || null,
             has_refresh: existing.claude?.has_refresh,
             official_cc_bootstrap: committed.official_cc_bootstrap || null,
+            ...(committed.telemetry_error ? { telemetry_error: committed.telemetry_error } : {}),
           }),
         )
       }
@@ -4923,6 +6784,7 @@ export function createPanelHandler(ctx) {
             oauth_email: existing.claude?.email || null,
             has_refresh: existing.claude?.has_refresh,
             official_cc_bootstrap: committed.official_cc_bootstrap || null,
+            ...(committed.telemetry_error ? { telemetry_error: committed.telemetry_error } : {}),
           }),
         )
       }
@@ -5044,7 +6906,7 @@ export function createPanelHandler(ctx) {
       }
       // GET /api/panel/usage
       if (req.method === 'GET' && p === '/api/panel/usage') {
-        return json(res, 200, panel.buildUsage({ accountQuota, cfg, requestLog }))
+        return json(res, 200, await panel.buildUsageAsync({ accountQuota, cfg, requestLog }))
       }
       // GET /api/panel/models
       if (req.method === 'GET' && p === '/api/panel/models') {
@@ -5276,6 +7138,7 @@ export function createPanelHandler(ctx) {
         if (body?.compatibility) body.compatibility = canonicalPersonaCompat(body.compatibility)
         const previousRoutingConfig = structuredClone(ctx.routingConfig)
         try {
+          validateNotifyRoutingPatch(body)
           if (body?.codex && Object.prototype.hasOwnProperty.call(body.codex, 'quota')) {
             validateOpenAIQuotaPatch(body.codex.quota)
           }
@@ -5332,7 +7195,7 @@ export function createPanelHandler(ctx) {
         const { applied: appliedDuringSwitch, ...publicEngineRuntime } = engineRuntime
         let applied
         try {
-          applied = appliedDuringSwitch ?? persistRoutingPatch(body)
+          applied = appliedDuringSwitch ?? (await persistRoutingPatch(body))
         } catch (error) {
           restoreRoutingRuntime(previousRoutingConfig)
           return json(res, 503, {
@@ -5349,6 +7212,7 @@ export function createPanelHandler(ctx) {
             applied_rpm: applied.rpm,
             applied_session_slots: applied.session_slots,
             kernel_persona: applied.kernel_persona || null,
+            telemetry_sync: applied.telemetry_sync || null,
             inference_runtime: publicEngineRuntime,
           }),
         )
@@ -5417,6 +7281,32 @@ export function createPanelHandler(ctx) {
         new RefusalGuardsRepo().clear()
         return json(res, 200, panel.ok(refusalGuardSnapshot()))
       }
+      if (req.method === 'DELETE' && p === '/api/panel/refusal-session-blocks') {
+        const body = await readBody(req, 8 * 1024).catch(() => ({}))
+        const repo = new RefusalSessionBlocksRepo()
+        const sessionId = String(body?.session_id || '').trim()
+        if (sessionId) {
+          if (!repo.remove(sessionId)) {
+            return json(res, 404, {
+              ok: false,
+              error: { type: 'not_found_error', code: 'refusal_session_not_found', message: '会话不存在' },
+            })
+          }
+          return json(res, 200, panel.ok(refusalGuardSnapshot()))
+        }
+        if (body?.confirm !== true) {
+          return json(res, 400, {
+            ok: false,
+            error: {
+              type: 'invalid_request_error',
+              code: 'confirm_required',
+              message: '清空会话封锁须 confirm: true，或传 session_id',
+            },
+          })
+        }
+        repo.clear()
+        return json(res, 200, panel.ok(refusalGuardSnapshot()))
+      }
       if (req.method === 'DELETE' && p === '/api/panel/refusal-device-blocks') {
         const body = await readBody(req, 8 * 1024).catch(() => ({}))
         const repo = new RefusalDeviceBlocksRepo()
@@ -5452,10 +7342,12 @@ export function createPanelHandler(ctx) {
         try {
           const repo = new JevUsageRepo()
           const page = repo.list(Object.fromEntries(url.searchParams))
+          const settings = new SettingsRepo()
+          const keys = repo.configuredKeys(publicJevKeys(readJevConfig((key, fallback) => settings.get(key, fallback))))
           return json(
             res,
             200,
-            panel.ok({ ...repo.overview(), ...page, storage_errors_since_start: jevUsageStorageErrors() }),
+            panel.ok({ ...repo.overview(), ...page, keys, storage_errors_since_start: jevUsageStorageErrors() }),
           )
         } catch (error) {
           if (error instanceof TypeError)
@@ -5509,6 +7401,32 @@ export function createPanelHandler(ctx) {
           })
         }
       }
+      if (req.method === 'POST' && (p === '/api/panel/jev-intercept/probe' || p === '/api/panel/jev-intercept/quota')) {
+        const body = await readBody(req, 16 * 1024).catch(() => ({}))
+        const stored = readJevConfig((key, fallback) => new SettingsRepo().get(key, fallback))
+        const run = p.endsWith('/quota') ? probePolicyQuota : probePolicyBaseline
+        try {
+          const result = await run({
+            config: stored,
+            baseUrl: body?.base_url,
+            apiKey: body?.api_key,
+            apiKeys: body?.api_keys,
+            model: Object.hasOwn(body || {}, 'model') ? body.model : undefined,
+            timeoutMs: Number(body?.timeout_ms) || stored.timeout_ms,
+          })
+          return json(res, 200, panel.ok(result))
+        } catch (error) {
+          const code = error?.code || (p.endsWith('/quota') ? 'quota_failed' : 'probe_failed')
+          return json(res, code === 'base_url_required' ? 400 : 502, {
+            ok: false,
+            error: {
+              type: 'api_error',
+              code,
+              message: error?.message || '测试失败',
+            },
+          })
+        }
+      }
       if (req.method === 'GET' && p === '/api/panel/notify') {
         return json(
           res,
@@ -5538,22 +7456,18 @@ export function createPanelHandler(ctx) {
       if (req.method === 'POST' && p === '/api/panel/notify/test') {
         const body = await readBody(req, 64 * 1024)
         const channel = String(body.channel || '').toLowerCase()
-        if (channel !== 'email' && channel !== 'telegram' && channel !== 'wecom') {
+        if (!isNotifyChannel(channel)) {
           return json(res, 400, {
             ok: false,
             error: {
               type: 'invalid_request_error',
               code: 'missing_field',
-              message: 'channel must be email, telegram or wecom',
+              message: '请选择有效的通知渠道',
               param: 'channel',
             },
           })
         }
-        const trial = mergeNotifyConfig(ctx.routingConfig.notify, {
-          email: body.email,
-          telegram: body.telegram,
-          wecom: body.wecom,
-        })
+        const trial = mergeNotifyConfig(ctx.routingConfig.notify, { [channel]: body[channel] })
         try {
           const result = await sendNotifyTest(trial, channel, {
             baseUrl: cfg.base_url,
@@ -5607,7 +7521,22 @@ export function createPanelHandler(ctx) {
         if (bindVmId && userMissesVmId(req, cfg.paths.project, bindVmId)) {
           return json(res, 404, { ok: false, error: { message: 'vm not found' } })
         }
+        // Protocol for lines without their own scheme:// prefix. Reject unknown
+        // values rather than silently importing them as SOCKS5.
+        const defaultScheme =
+          body.default_scheme == null || body.default_scheme === '' ? 'socks5' : proxyScheme(body.default_scheme)
+        if (!defaultScheme) {
+          return json(res, 400, {
+            ok: false,
+            error: {
+              type: 'invalid_request_error',
+              code: 'invalid_scheme',
+              message: 'default_scheme must be socks5 or http',
+            },
+          })
+        }
         const result = proxyPool.importLines(text, {
+          defaultScheme,
           fields: body.proxies || body.entries || null,
           host: body.host,
           port: body.port,
@@ -5667,20 +7596,21 @@ export function createPanelHandler(ctx) {
           })
         // DNS changes must reach running egress helpers; slots stay intact.
         const egress = []
-        if (
-          ((body.dns_primary != null && body.dns_primary !== previousConfig.dns_primary) ||
-            (body.dns_disable_svcb_https != null &&
-              body.dns_disable_svcb_https !== previousConfig.dns_disable_svcb_https)) &&
-          egressEnabled() &&
-          process.env.KIN_CRS_MOCK !== '1'
-        ) {
+        const upstreamChanged = body.dns_primary != null && body.dns_primary !== previousConfig.dns_primary
+        // The pool-level SVCB/HTTPS switch is a bulk write over the proxy rows,
+        // so only the outlets it actually flipped need a new helper config —
+        // reloading the whole pool for a no-op would cut exits for nothing.
+        const flipped = new Set(result.dns_disable_svcb_https_changed || [])
+        if ((upstreamChanged || flipped.size) && egressEnabled() && process.env.KIN_CRS_MOCK !== '1') {
           const dnsUpstream = dnsUpstreamChain(result.config.dns_primary)
-          const dnsEmptyTypes = result.config.dns_disable_svcb_https ? [64, 65] : []
           for (const proxy of proxyPool.snapshot().proxies) {
             if (isLocalEgressProxy(proxy) || !proxy.bound_vm_ids?.length) continue
+            if (!upstreamChanged && !flipped.has(proxy.id)) continue
+            // dnsEmptyTypes is deliberately NOT passed: startProxyEgress reads
+            // it off each proxy, so changing the shared upstream cannot flatten
+            // every outlet onto one override.
             const r = await ensureProxyEgress(cfg.paths.project, proxyPool.getProxyByIdWithAuth(proxy.id), {
               dnsUpstream,
-              dnsEmptyTypes,
             })
             egress.push({ proxy_id: proxy.id, ok: r.ok, error: r.ok ? null : r.error })
           }
@@ -5699,7 +7629,16 @@ export function createPanelHandler(ctx) {
         // Forward only the keys the caller actually sent — update() reads
         // presence, not value, to tell "leave alone" from "clear".
         const patch = {}
-        for (const key of ['host', 'port', 'username', 'password', 'label', 'domain_forward']) {
+        for (const key of [
+          'scheme',
+          'host',
+          'port',
+          'username',
+          'password',
+          'label',
+          'domain_forward',
+          'dns_disable_svcb_https',
+        ]) {
           if (Object.prototype.hasOwnProperty.call(body, key)) patch[key] = body[key]
         }
         const result = proxyPool.update(id, patch)
@@ -5708,14 +7647,17 @@ export function createPanelHandler(ctx) {
           const type = status === 404 ? 'not_found_error' : 'invalid_request_error'
           return json(res, status, { ok: false, error: { type, code: result.error, message: result.error } })
         }
-        // Hostname mode and SOCKS upstream both live inside kin-egress.
+        // Hostname mode, SOCKS upstream and the SVCB/HTTPS DNS override all
+        // live inside kin-egress.
         // Domain-forward-only: restart the helper; slots keep the same bridge.
         // Same-id connection change: network name is unchanged so reload would
         // only docker restart — the helper must pick up the new proxy_url or
         // transparent traffic keeps the old exit.
+        // DNS-override-only: the helper's egress.json changes, but worker.json
+        // does not carry the field, so the bound slots below stay untouched.
         let egress = null
         if (
-          (result.domain_forward_changed || result.connection_changed) &&
+          (result.domain_forward_changed || result.dns_disable_svcb_https_changed || result.connection_changed) &&
           egressEnabled() &&
           process.env.KIN_CRS_MOCK !== '1' &&
           (result.proxy.bound_vm_ids || []).length
@@ -6032,12 +7974,79 @@ export function createPanelHandler(ctx) {
   }
 }
 
-function readTelemetryUploadLog(projectRoot, id) {
-  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,80}$/.test(String(id || ''))) return []
-  try {
-    const text = fs.readFileSync(path.join(projectRoot, 'vms', id, 'run', 'telemetry-upload.log'), 'utf8')
-    return text.split(/\r?\n/).filter(Boolean).slice(-40)
-  } catch {
-    return []
+async function readSeedSettings(projectRoot, vm) {
+  const host = slotHost(vm)
+  const result = {
+    settings_json: null,
+    claude_setting: null,
+    kin_seed: null,
+    cli_home: null,
+    seed_files: {
+      ok: false,
+      source: host.kind,
+      files: { settings_json: 'error', claude_setting: 'error', kin_seed: 'error' },
+    },
   }
+  try {
+    const observed = await host.seedFiles(vm, path.join(projectRoot, 'vms', vm.id))
+    result.cli_home = observed.cli_home
+    let failed = false
+    for (const [key, name] of [
+      ['settings_json', 'settings.json'],
+      ['claude_setting', 'claude.setting'],
+      ['kin_seed', 'kin-seed.json'],
+    ]) {
+      const text = observed.files[name]
+      if (text === null) {
+        result.seed_files.files[key] = 'missing'
+        continue
+      }
+      try {
+        const value = key === 'claude_setting' ? text.replace(/\r\n?/g, '\n').replace(/\n+$/g, '') : JSON.parse(text)
+        if (key !== 'claude_setting' && (!value || typeof value !== 'object' || Array.isArray(value)))
+          throw new Error('seed_file_invalid')
+        result[key] = value
+        result.seed_files.files[key] = 'present'
+      } catch {
+        failed = true
+      }
+    }
+    result.seed_files.ok = !failed
+    if (failed) result.seed_files.error = 'seed_file_invalid'
+  } catch {
+    result.seed_files.error = 'seed_files_unavailable'
+  }
+  return result
+}
+
+async function readTelemetryUploadLog(projectRoot, vm) {
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,80}$/.test(String(vm?.id || ''))) return []
+  const text = await slotHost(vm).telemetryLog(vm, path.join(projectRoot, 'vms', vm.id))
+  return String(text)
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .slice(-40)
+    .flatMap((line) => {
+      try {
+        const record = JSON.parse(line)
+        if (
+          typeof record?.at !== 'string' ||
+          typeof record?.ok !== 'boolean' ||
+          !Number.isSafeInteger(record?.events) ||
+          record.events < 0
+        )
+          return []
+        return [
+          JSON.stringify({
+            at: record.at,
+            ok: record.ok,
+            events: record.events,
+            error:
+              typeof record.error === 'string' && /^[a-z][a-z0-9_]{0,63}$/.test(record.error) ? record.error : null,
+          }),
+        ]
+      } catch {
+        return []
+      }
+    })
 }

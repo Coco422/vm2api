@@ -77,6 +77,8 @@ export async function startRealChain({
   cacheTtl = '5m',
   routingBase = null,
   timezone = 'America/New_York',
+  upstreamSse = null,
+  guidance = false,
 }) {
   const cleanups = []
   let closed = false
@@ -107,7 +109,7 @@ export async function startRealChain({
         return res.end(json(body.model))
       }
       res.writeHead(200, { 'content-type': 'text/event-stream', 'request-id': 'req_303' })
-      res.end(sse(body.model))
+      res.end(upstreamSse || sse(body.model))
     })
     await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve))
     cleanups.push(async () => {
@@ -138,6 +140,7 @@ export async function startRealChain({
       // Same projection as writeKernelConfig: cli-node hot-reads this for UA and billing.
       cli_version: profileForPreset(presetNow).cliVersion,
       default_cache_ttl: ttlNow,
+      thinking_display: 'summarized',
       cc_entrypoint: ccEntrypointFromRouting(
         routingBase || { compatibility: { persona_preset: presetNow, cache_ttl: ttlNow } },
       ),
@@ -206,6 +209,7 @@ export async function startRealChain({
             persona_preset: presetNow,
             cache_ttl: ttlNow,
             min_max_tokens: 128,
+            persona_guidance_presets: { [presetNow]: guidance },
             detect_proxied_official_cc: true,
             thinking_display: 'omitted',
             overlay_preset: 'off',

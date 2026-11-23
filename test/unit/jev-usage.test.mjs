@@ -82,7 +82,11 @@ test('same-time pagination is stable and does not double count', (t) => {
   const repo = fixture(t)
   for (let i = 0; i < 7; i++) repo.record(normalizeJevUsage(value()))
   const first = repo.list({ limit: 3 }),
-    next = repo.list({ limit: 3, cursor_created_at: first.next_cursor.created_at, cursor_id: first.next_cursor.id })
+    next = repo.list({
+      limit: 3,
+      cursor_created_at: first.next_cursor.created_at,
+      cursor_id: first.next_cursor.id,
+    })
   assert.equal(first.has_more, true)
   assert.equal(new Set([...first.rows, ...next.rows].map((x) => x.id)).size, 6)
   assert.equal(repo.overview().total.requests, 7)
@@ -170,4 +174,88 @@ test('the additive migration preserves old schema/data and permits old-version r
   db = createDatabase({ dbPath: file, migrationsDir: migrationDir })
   assert.deepEqual(db.prepare('SELECT * FROM settings').all(), beforeSettings)
   assert.equal(db.prepare('SELECT started_at FROM jev_usage_meta').get().started_at, started)
+})
+
+test('configured keys aggregate separately, include unused keys, and distinguish quota from throttling', (t) => {
+  const repo = fixture(t)
+  const a = jevKeyFingerprint('synthetic-a'),
+    b = jevKeyFingerprint('synthetic-b')
+  repo.record(normalizeJevUsage(value({ key_fingerprint: a })))
+  repo.record(
+    normalizeJevUsage(
+      value({
+        key_fingerprint: a,
+        created_at: '2026-10-25T02:01:00.000Z',
+        http_status: 402,
+        outcome: 'http_error',
+        usage: null,
+      }),
+    ),
+  )
+  repo.record(
+    normalizeJevUsage(
+      value({
+        key_fingerprint: b,
+        http_status: 429,
+        outcome: 'http_error',
+        usage: null,
+      }),
+    ),
+  )
+  const keys = repo.configuredKeys([
+    { number: 1, key_fingerprint: a, retired: false },
+    { number: 2, key_fingerprint: b, retired: true },
+    { number: 3, key_fingerprint: '000000000000', retired: false },
+  ])
+  assert.equal(keys[0].estimated_cost_nano_usd, 42000)
+  assert.equal(keys[0].requests, 2)
+  assert.equal(keys[0].unknown_cost_requests, 1)
+  assert.equal(keys[0].status, 'insufficient_balance')
+  assert.equal(keys[1].status, 'rate_limited')
+  assert.equal(keys[2].status, 'unrequested')
+  assert.equal(keys[2].last_request_at, null)
+})
+
+test('key statuses come from the latest event alone, without the usage aggregate (#1043)', (t) => {
+  const repo = fixture(t)
+  const a = jevKeyFingerprint('status-insufficient')
+  const b = jevKeyFingerprint('status-throttled')
+  for (const [fingerprint, http_status] of [
+    [a, 402],
+    [b, 429],
+  ]) {
+    repo.record(
+      normalizeJevUsage(value({ key_fingerprint: fingerprint, http_status, outcome: 'http_error', usage: null })),
+    )
+  }
+  const configured = [
+    { number: 1, key_fingerprint: a, retired: false },
+    { number: 2, key_fingerprint: b, retired: true },
+    { number: 3, key_fingerprint: '000000000000', retired: false },
+    { number: 4, key_fingerprint: '111111111111', retired: true },
+  ]
+  const statuses = repo.configuredKeyStatuses(configured)
+  assert.deepEqual(
+    statuses.map((row) => row.status),
+    ['insufficient_balance', 'rate_limited', 'unrequested', 'paused'],
+  )
+
+  // The panel and the usage page must not derive two different verdicts.
+  const full = repo.configuredKeys(configured)
+  for (const [index, row] of statuses.entries()) {
+    assert.equal(row.status, full[index].status, `status ${index}`)
+    assert.equal(row.last_http_status, full[index].last_http_status, `last_http_status ${index}`)
+    assert.equal(row.last_request_at, full[index].last_request_at, `last_request_at ${index}`)
+    assert.equal(row.key_fingerprint, configured[index].key_fingerprint)
+  }
+
+  // Status rows carry no usage totals: nothing here needs the table-wide sums.
+  for (const row of statuses) {
+    for (const name of ['requests', 'successful', 'estimated_cost_nano_usd', 'unknown_cost_requests']) {
+      assert.equal(Object.hasOwn(row, name), false, name)
+    }
+  }
+  // The usage page still gets its totals.
+  assert.equal(full[0].requests, 1)
+  assert.equal(Object.hasOwn(full[0], 'estimated_cost_nano_usd'), true)
 })

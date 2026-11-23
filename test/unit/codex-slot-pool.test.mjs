@@ -127,6 +127,18 @@ test('429 and usage_limit_reached fail over; committed hops do not', () => {
     true,
   )
   assert.equal(
+    isCodexFailoverError({ ok: false, status: 503, committed: false, body: { error: { code: 'overloaded' } } }),
+    true,
+  )
+  assert.equal(
+    isCodexFailoverError({
+      ok: false,
+      status: 413,
+      body: { error: { code: 'invalid_request', message: 'request exceeds slot memory' } },
+    }),
+    false,
+  )
+  assert.equal(
     isCodexFailoverError({ ok: false, status: 503, committed: true, body: { error: { code: 'server_error' } } }),
     false,
   )
@@ -239,6 +251,30 @@ test('a bound OpenAI session stays on its VM and a full window is skipped', () =
   assert.deepEqual(orderCodexSessionSlots(seatsOnly, { sessionKey: 'conv-z', sessionLimit: sessions }).ids, ['vm-a'])
 })
 
+test('Codex keeps a live binding before scheduling by level and weight', () => {
+  const now = Date.parse('2026-10-18T00:00:00.000Z')
+  const vms = [
+    gpt('vm-low', { schedule_level_manual: 1, weight: 1, utilization_5h: 0.1 }),
+    gpt('vm-auto', { weight: 200, reset_7d: new Date(now + 3600_000).toISOString() }),
+    gpt('vm-high-a', { schedule_level_manual: 10, weight: 2, utilization_5h: 0.3 }),
+    gpt('vm-high-b', { policy: { priority: 10, weight: 1 }, utilization_5h: 0.4 }),
+  ]
+  const options = { now, boundVmId: 'vm-low', roundRobinCursor: 0 }
+  const ordered = orderCodexSessionSlots(vms, options)
+  assert.deepEqual(ordered.ids, ['vm-low', 'vm-high-a', 'vm-high-b', 'vm-auto'])
+  assert.equal(ordered.sticky, true)
+  const fresh = orderCodexSessionSlots(vms, { ...options, boundVmId: null })
+  assert.deepEqual(fresh.ids, ['vm-high-a', 'vm-high-b', 'vm-auto', 'vm-low'])
+  assert.equal(pickCodexSlots(vms, { now }).ids[0], 'vm-high-a')
+  const sameLevel = orderCodexSessionSlots(vms, { ...options, boundVmId: 'vm-high-b' })
+  assert.equal(sameLevel.ids[0], 'vm-high-b')
+  assert.equal(sameLevel.sticky, true)
+  const fallback = orderCodexSessionSlots(vms, { ...options, excluded: new Set(['vm-low', 'vm-high-a', 'vm-high-b']) })
+  assert.deepEqual(fallback.ids, ['vm-auto'])
+  assert.equal(fallback.sticky, false)
+  assert.deepEqual(orderCodexSessionSlots(vms, { now, pin: 'vm-low' }).ids, ['vm-low'])
+})
+
 test('panel max_concurrency on the listVms summary is the candidate cap (#150)', async () => {
   const { codexAccountCandidate } = await import('../../src/lib/pool/codex-slot-pool.mjs')
   const signals = { inFlight: 0 }
@@ -314,6 +350,49 @@ test('GPT wait queue wakes FIFO on release and caps at 100 waiters', async () =>
   ac.abort()
   assert.deepEqual(await aborted, { woken: false, aborted: true })
   assert.equal(rt.openAIWaiterCount(), 0)
+})
+
+test('GPT wait queue wakes the oldest waiter for the freed account', async () => {
+  const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
+  rt.resetOpenAIAccountRuntime()
+  const deadline = Date.now() + 5000
+  const order = []
+  const onlyB = rt.waitForOpenAICapacity({ deadline, accounts: ['vm-b'] }).then((r) => order.push(['b', r.accountId]))
+  const onlyA = rt.waitForOpenAICapacity({ deadline, accounts: ['vm-a'] }).then((r) => order.push(['a', r.accountId]))
+  rt.tryAcquireOpenAISlot('vm-a').release()
+  await onlyA
+  assert.deepEqual(order, [['a', 'vm-a']])
+  assert.equal(rt.openAIWaiterCount(), 1)
+  // No waiter takes vm-c: the release wakes nobody.
+  rt.tryAcquireOpenAISlot('vm-c').release()
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(rt.openAIWaiterCount(), 1)
+  // An unscoped wake (routing change) still reaches the oldest waiter.
+  rt.wakeOpenAIWaiter()
+  await onlyB
+  assert.deepEqual(order, [
+    ['a', 'vm-a'],
+    ['b', null],
+  ])
+  rt.resetOpenAIAccountRuntime()
+})
+
+test('GPT wait queue re-parks a woken waiter at the head past the cap', async () => {
+  const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
+  rt.resetOpenAIAccountRuntime()
+  const deadline = Date.now() + 5000
+  const parked = Array.from({ length: rt.OPENAI_MAX_WAITERS }, (_, i) =>
+    rt.waitForOpenAICapacity({ deadline }).then((r) => ({ i, ...r })),
+  )
+  await assert.rejects(rt.waitForOpenAICapacity({ deadline }), { code: 'pool_wait_queue_full' })
+  const again = rt
+    .waitForOpenAICapacity({ deadline, accounts: ['vm-a'], front: true })
+    .then((r) => ({ i: 'again', ...r }))
+  assert.equal(rt.openAIWaiterCount(), rt.OPENAI_MAX_WAITERS + 1)
+  rt.tryAcquireOpenAISlot('vm-a').release()
+  assert.deepEqual(await again, { i: 'again', woken: true, accountId: 'vm-a' })
+  rt.resetOpenAIAccountRuntime()
+  await Promise.all(parked)
 })
 
 test('RPM-only capacity miss reports when the window reopens', async () => {

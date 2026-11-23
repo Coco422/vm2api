@@ -14,6 +14,11 @@ function seed(pool, line = 'socks5://alice:s3cret@1.2.3.4:1080') {
   pool.importLines(line)
   return pool.state.proxies[0]
 }
+// A connection-field update replaces the stored row rather than mutating it, so
+// a reference taken before the call keeps the old values. Read the row back.
+function row(pool, id) {
+  return pool.state.proxies.find((proxy) => proxy.id === id)
+}
 
 test('update: 只改 port，账密保留；raw 明文密码被清除', () => {
   const pool = makePool()
@@ -21,29 +26,32 @@ test('update: 只改 port，账密保留；raw 明文密码被清除', () => {
   assert.match(p.raw, /s3cret/, '前提：导入后 raw 含明文密码')
   const r = pool.update(p.id, { port: 1081 })
   assert.equal(r.ok, true)
-  assert.equal(p.port, 1081)
-  assert.equal(p.username, 'alice')
-  assert.equal(p.password, 's3cret')
-  assert.equal(p.raw, '1.2.3.4:1081')
-  assert.doesNotMatch(p.raw, /s3cret/, 'raw 不应再含明文密码')
+  const after = row(pool, p.id)
+  assert.equal(after.port, 1081)
+  assert.equal(after.username, 'alice')
+  assert.equal(after.password, 's3cret')
+  assert.equal(after.raw, '1.2.3.4:1081')
+  assert.doesNotMatch(after.raw, /s3cret/, 'raw 不应再含明文密码')
 })
 
 test('update: username 传空串清除账密（password 一并清）', () => {
   const pool = makePool()
   const p = seed(pool)
   assert.equal(pool.update(p.id, { username: '' }).ok, true)
-  assert.equal(p.username, null)
-  assert.equal(p.password, null)
+  const after = row(pool, p.id)
+  assert.equal(after.username, null)
+  assert.equal(after.password, null)
 })
 
 test('update: 不传的字段保持不动', () => {
   const pool = makePool()
   const p = seed(pool)
   pool.update(p.id, { password: 'newpw' })
-  assert.equal(p.host, '1.2.3.4')
-  assert.equal(p.port, 1080)
-  assert.equal(p.username, 'alice')
-  assert.equal(p.password, 'newpw')
+  const after = row(pool, p.id)
+  assert.equal(after.host, '1.2.3.4')
+  assert.equal(after.port, 1080)
+  assert.equal(after.username, 'alice')
+  assert.equal(after.password, 'newpw')
 })
 
 test('update: 只给密码不给用户名被拒，不静默存成「仍无账密」', () => {
@@ -61,8 +69,9 @@ test('update: 只换用户名时沿用原密码（不传的键就是不动）', 
   const pool = makePool()
   const p = seed(pool)
   assert.equal(pool.update(p.id, { username: 'bob' }).ok, true)
-  assert.equal(p.username, 'bob')
-  assert.equal(p.password, 's3cret', 'password 没传，按语义保持原值')
+  const after = row(pool, p.id)
+  assert.equal(after.username, 'bob')
+  assert.equal(after.password, 's3cret', 'password 没传，按语义保持原值')
 })
 
 test('update: 非法值与空 patch 被拒，且不改动原记录', () => {
@@ -155,8 +164,9 @@ test('update: 连接字段与名称同改时报告 connection_changed', () => {
   const p = seed(pool)
   const r = pool.update(p.id, { port: 1082, label: 'box' })
   assert.equal(r.connection_changed, true)
-  assert.equal(p.port, 1082)
-  assert.equal(p.label, 'box')
+  const after = row(pool, p.id)
+  assert.equal(after.port, 1082)
+  assert.equal(after.label, 'box')
 })
 
 test('labelOf 只给名称，不带账密；未知代理返回 null', () => {
@@ -166,4 +176,52 @@ test('labelOf 只给名称，不带账密；未知代理返回 null', () => {
   pool.update(p.id, { label: 'tw-box' })
   assert.equal(pool.labelOf(p.id), 'tw-box')
   assert.equal(pool.labelOf('px-missing'), null)
+})
+
+test('update: scheme 可在 socks5 / http 间切换，算连接变更，账密保留', () => {
+  const pool = makePool()
+  const p = seed(pool)
+  const r = pool.update(p.id, { scheme: 'http' })
+  assert.equal(r.ok, true)
+  assert.equal(r.connection_changed, true)
+  const after = row(pool, p.id)
+  assert.equal(after.scheme, 'http')
+  assert.equal(r.proxy.scheme, 'http')
+  assert.equal(after.username, 'alice')
+  assert.equal(after.password, 's3cret')
+  assert.equal(pool.update(p.id, { scheme: 'socks5h' }).ok, true)
+  assert.equal(row(pool, p.id).scheme, 'socks5', 'socks5h 归一为 socks5')
+})
+
+test('update: 非法 scheme 被拒，本地代理不能改协议', () => {
+  const pool = makePool()
+  const p = seed(pool)
+  assert.equal(pool.update(p.id, { scheme: 'https' }).error, 'invalid_scheme')
+  assert.equal(pool.update(p.id, { scheme: 'local' }).error, 'invalid_scheme')
+  assert.equal(p.scheme, 'socks5', '被拒后原值不变')
+  pool.ensureLocal()
+  const lp = pool.state.proxies.find((x) => x.scheme === 'local')
+  assert.ok(lp, '前提：已有本地代理')
+  assert.equal(pool.update(lp.id, { scheme: 'http' }).error, 'scheme_unsupported')
+})
+
+test('importLines: defaultScheme 只作用于未写协议的行', () => {
+  const pool = makePool()
+  const r = pool.importLines('1.1.1.1:8080\nu:p@2.2.2.2:3128\nsocks5://3.3.3.3:1080', { defaultScheme: 'http' })
+  assert.equal(r.added, 3)
+  const by = Object.fromEntries(pool.state.proxies.map((x) => [x.host, x.scheme]))
+  assert.deepEqual(by, { '1.1.1.1': 'http', '2.2.2.2': 'http', '3.3.3.3': 'socks5' })
+  // 同端点不同协议不算重复
+  assert.equal(pool.importLines('1.1.1.1:8080').added, 1)
+})
+
+test('update: 从库加载后改 scheme，重开仍是新协议（protocol 列不被旧值覆盖）', () => {
+  const pool = makePool()
+  seed(pool)
+  pool.load()
+  const p = pool.state.proxies[0]
+  assert.equal(p.protocol, 'socks5', '前提：库里加载的行带 protocol 列')
+  assert.equal(pool.update(p.id, { scheme: 'http' }).ok, true)
+  pool.load()
+  assert.equal(pool.state.proxies[0].scheme, 'http')
 })

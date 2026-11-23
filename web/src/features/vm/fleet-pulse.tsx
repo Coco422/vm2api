@@ -63,6 +63,7 @@ function computePulse(vms: Vm[], accounts?: UsageAccountRow[]): Pulse {
 
   for (const vm of vms) {
     counts[zoneOf(vm)] += 1
+    if (vm.gemini) continue
     if (vm.has_token) {
       const remain = Math.max(0, 100 - usedPctOf(vm, '7d'))
       remains.push(remain)
@@ -225,7 +226,7 @@ export function FleetPulse({
       </Cell>
 
       <Cell
-        title='7d 余量分布'
+        title='7 天窗口余量'
         className='xl:col-span-2'
         meta={
           <span className='text-[13px] leading-none font-[590] tracking-[-0.01em] tabular-nums'>
@@ -282,11 +283,11 @@ export function FleetPulse({
       </Cell>
 
       <Cell
-        title='今日消耗'
+        title='今日消耗 · 北京时间'
         className='xl:col-span-2'
         meta={
           <span className='text-[11px] text-muted-foreground tabular-nums'>
-            7d {fmtUsd(pulse.weekCost, 2)}
+            7 天窗口 {fmtUsd(pulse.weekCost, 2)}
           </span>
         }
       >
@@ -310,7 +311,7 @@ export function FleetPulse({
       </Cell>
 
       <Cell
-        title='7D 成败'
+        title='7 天窗口成败'
         className='sm:col-span-2 xl:col-span-2'
         meta={
           <span className='text-[11px] text-muted-foreground tabular-nums'>

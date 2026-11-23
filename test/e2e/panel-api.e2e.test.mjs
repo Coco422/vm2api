@@ -2,7 +2,9 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
-import { REPO_ROOT, startGateway, api } from '../harness.mjs'
+import net from 'node:net'
+import os from 'node:os'
+import { REPO_ROOT, startGateway, api, seedVm } from '../harness.mjs'
 
 test('panel login → cookie → /api/panel/me', async () => {
   const gw = await startGateway()
@@ -268,6 +270,65 @@ test('DNS 64/65 suppression is visible in proxy config and can be toggled', asyn
   }
 })
 
+test('the SVCB/HTTPS override is per proxy, and the pool switch writes through to every row', async () => {
+  const gw = await startGateway()
+  try {
+    const added = await api(gw, 'POST', '/api/panel/proxies/import', {
+      body: { text: '10.9.8.1:1080\n10.9.8.2:1080' },
+    })
+    assert.equal(added.status, 200, added.text)
+    const [first, second] = (added.json.data || added.json).items
+    assert.equal(first.dns_disable_svcb_https, false)
+
+    const listed = async () => {
+      const get = await api(gw, 'GET', '/api/panel/proxies')
+      const rows = (get.json.data || get.json).proxies
+      return new Map(rows.map((p) => [p.id, p.dns_disable_svcb_https]))
+    }
+
+    // The pool switch is a bulk action over the rows, not an inherited value.
+    const all = await api(gw, 'PUT', '/api/panel/proxies/config', {
+      body: { dns_disable_svcb_https: true },
+    })
+    assert.equal(all.status, 200, all.text)
+    const afterBulk = await listed()
+    assert.equal(afterBulk.get(first.id), true)
+    assert.equal(afterBulk.get(second.id), true)
+
+    // One outlet can differ from the pool, and the pool key keeps its value.
+    const one = await api(gw, 'PUT', `/api/panel/proxies/${first.id}`, {
+      body: { dns_disable_svcb_https: false },
+    })
+    assert.equal(one.status, 200, one.text)
+    assert.equal((one.json.data || one.json).proxy.dns_disable_svcb_https, false)
+    const afterOne = await listed()
+    assert.equal(afterOne.get(first.id), false)
+    assert.equal(afterOne.get(second.id), true)
+    const cfg = await api(gw, 'GET', '/api/panel/proxies/config')
+    assert.equal((cfg.json.data || cfg.json).dns_disable_svcb_https, true)
+
+    // A rename must not disturb the override.
+    const renamed = await api(gw, 'PUT', `/api/panel/proxies/${first.id}`, { body: { label: 'tokyo-1' } })
+    assert.equal(renamed.status, 200, renamed.text)
+    assert.equal((renamed.json.data || renamed.json).proxy.dns_disable_svcb_https, false)
+
+    const bad = await api(gw, 'PUT', `/api/panel/proxies/${first.id}`, {
+      body: { dns_disable_svcb_https: 'yes' },
+    })
+    assert.equal(bad.status, 400, bad.text)
+    assert.equal(bad.json.error.code, 'invalid_dns_disable_svcb_https')
+
+    // The local row has no helper of its own to carry the override.
+    const local = await api(gw, 'PUT', '/api/panel/proxies/px-local', {
+      body: { dns_disable_svcb_https: true },
+    })
+    assert.equal(local.status, 400, local.text)
+    assert.equal(local.json.error.code, 'dns_disable_svcb_https_unsupported')
+  } finally {
+    await gw.stop()
+  }
+})
+
 test('generate-auth-url requires bound SOCKS5', async () => {
   const gw = await startGateway()
   try {
@@ -300,6 +361,51 @@ test('generate-auth-url then exchange-code writes fake oauth', async () => {
     assert.equal(out.vm?.has_token || out.has_refresh != null, true)
   } finally {
     await gw.stop()
+  }
+})
+
+test('OAuth exchange reuses VM egress without a host-side proxy hop', async () => {
+  let connections = 0
+  const proxy = net.createServer((socket) => {
+    connections += 1
+    socket.on('error', () => {})
+    socket.destroy()
+  })
+  await new Promise((resolve) => proxy.listen(0, '127.0.0.1', resolve))
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-oauth-proxy-'))
+  const vmPath = path.join(project, 'vms', 'vm-sim-01.json')
+  try {
+    seedVm({ project, oauth: false })
+    const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+    vm.proxy = {
+      ...vm.proxy,
+      url: `socks5h://127.0.0.1:${proxy.address().port}`,
+      host: '127.0.0.1',
+      port: proxy.address().port,
+    }
+    fs.writeFileSync(vmPath, JSON.stringify(vm, null, 2))
+    const gw = await startGateway({ project, oauth: false })
+    try {
+      // Gateway startup is not part of the exchange request under test.
+      connections = 0
+      const generated = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/oauth/generate-auth-url', { body: {} })
+      assert.equal(generated.status, 200, generated.text)
+      const link = generated.json.data || generated.json
+      const exchanged = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/oauth/exchange-code', {
+        body: { session_id: link.session_id, code: 'pasted-auth-code' },
+      })
+      assert.equal(exchanged.status, 200, exchanged.text)
+      const imported = await api(gw, 'POST', '/api/panel/vms/import', {
+        body: { vm_id: 'vm-sim-01', sessionKey: 'sk-ant-sid-proxy-reuse' },
+      })
+      assert.equal(imported.status, 200, imported.text)
+      assert.equal(connections, 0)
+    } finally {
+      await gw.stop()
+    }
+  } finally {
+    await new Promise((resolve) => proxy.close(resolve))
+    fs.rmSync(project, { recursive: true, force: true })
   }
 })
 
@@ -342,14 +448,57 @@ test('pasted setup token survives identity enrichment and persists inference cre
   }
 })
 
-test('claude_code flavor refuses login before the slot container and cli-node exist', async () => {
-  const gw = await startGateway({ oauth: false })
+test('panel import syncs credentials while Claude Code OAuth requires a native terminal', async () => {
+  const gw = await startGateway({ oauth: false, readyMs: 30000 })
   try {
     const gen = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/oauth/generate-auth-url', {
+      body: { flavor: 'cai' },
+    })
+    assert.equal(gen.status, 200, gen.text)
+    const generated = gen.json.data || gen.json
+    const exchanged = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/oauth/exchange-code', {
+      body: { session_id: generated.session_id, code: 'pasted-auth-code' },
+    })
+    assert.equal(exchanged.status, 200, exchanged.text)
+    const claudeDir = path.join(gw.project, 'vms', 'vm-sim-01', 'cli-home', '.claude')
+    const official = path.join(claudeDir, '.credentials.json')
+    const worker = path.join(claudeDir, 'credentials.json')
+    assert.equal(fs.readlinkSync(official), 'credentials.json')
+    assert.equal(fs.readFileSync(official, 'utf8'), fs.readFileSync(worker, 'utf8'))
+    fs.unlinkSync(official)
+    const synced = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/credentials/sync', { body: {} })
+    assert.equal(synced.status, 200, synced.text)
+    assert.equal(synced.json.data.synced, true)
+    assert.equal(fs.readlinkSync(official), 'credentials.json')
+    fs.unlinkSync(official)
+    fs.mkdirSync(official)
+    const failed = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/credentials/sync', { body: {} })
+    assert.equal(failed.status, 502, failed.text)
+    assert.equal(failed.json.error.code, 'client_credential_sync_failed')
+    assert.equal(failed.text.includes(claudeDir), false)
+    const retryLink = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/oauth/generate-auth-url', {
+      body: { flavor: 'cai' },
+    })
+    assert.equal(retryLink.status, 200, retryLink.text)
+    const syncFailure = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/oauth/exchange-code', {
+      body: { session_id: retryLink.json.data.session_id, code: 'pasted-auth-code' },
+    })
+    assert.equal(syncFailure.status, 502, syncFailure.text)
+    assert.equal(syncFailure.json.error.code, 'client_credential_sync_failed')
+    const saved = JSON.parse(fs.readFileSync(path.join(gw.project, 'vms', 'vm-sim-01.json'), 'utf8'))
+    assert.equal(saved.claude.has_access, true)
+    fs.rmdirSync(official)
+    const repaired = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/credentials/sync', { body: {} })
+    assert.equal(repaired.status, 200, repaired.text)
+    assert.equal(fs.readlinkSync(official), 'credentials.json')
+    const native = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/oauth/generate-auth-url', {
       body: { flavor: 'claude_code' },
     })
-    assert.equal(gen.status, 400, gen.text)
-    assert.equal(gen.json.error.code, 'container_not_ready')
+    assert.equal(native.status, 409, native.text)
+    assert.equal(native.json.error.code, 'native_login_required')
+    const ticket = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/shell-ticket', { body: { login: true } })
+    assert.equal(ticket.status, 200, ticket.text)
+    assert.match(ticket.json.data.cli_bin, /crag-v2\/claude-code-[^/]+\/claude$/)
   } finally {
     await gw.stop()
   }

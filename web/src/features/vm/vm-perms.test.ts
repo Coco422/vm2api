@@ -15,23 +15,30 @@ describe('vmPermsFor follows panel-acl roles', () => {
       power: true,
       test: true,
       testModels: true,
+      usageQuery: true,
       credential: true,
       resetCredits: true,
+      quotaThresholds: true,
+      tenantSchedule: false,
+      proxy: true,
       remove: true,
     })
   })
 
-  it('tenant can only read owned usage and use reset credits', () => {
+  it('tenant can test owned VM, refresh official usage and use reset credits', () => {
     const p = vmPermsFor('user')
     expect(p.known).toBe(true)
     expect(p.admin).toBe(false)
     expect(p.dashboard).toBe(false)
     expect(p.power).toBe(false)
-    expect(p.test).toBe(false)
+    expect(p.test).toBe(true)
     // The backend only serves GET /api/panel/test-models to admins.
-    expect(p.testModels).toBe(false)
+    expect(p.testModels).toBe(true)
+    expect(p.usageQuery).toBe(true)
     expect(p.credential).toBe(false)
     expect(p.resetCredits).toBe(true)
+    expect(p.quotaThresholds).toBe(true)
+    expect(p.tenantSchedule).toBe(true)
     expect(p.remove).toBe(false)
   })
 
@@ -43,7 +50,10 @@ describe('vmPermsFor follows panel-acl roles', () => {
       dashboard: true,
       power: false,
       test: false,
+      usageQuery: false,
       credential: false,
+      quotaThresholds: false,
+      proxy: true,
       remove: false,
     })
   })
@@ -65,9 +75,10 @@ describe('vmDetailTabs', () => {
       'proxy',
       'test',
       'ops',
+      'desktop',
       'seed',
     ])
-    expect(vmDetailTabs(vmPermsFor('user'))).toEqual(['overview'])
+    expect(vmDetailTabs(vmPermsFor('user'))).toEqual(['overview', 'test'])
     expect(vmDetailTabs(vmPermsFor('super'))).toEqual([
       'overview',
       'account',
@@ -79,7 +90,8 @@ describe('vmDetailTabs', () => {
     const tabs = vmDetailTabs(vmPermsFor('user'))
     expect(visibleTab('ops', tabs)).toBe('overview')
     expect(visibleTab('seed', tabs)).toBe('overview')
-    expect(visibleTab('test', tabs)).toBe('overview')
+    expect(visibleTab('desktop', tabs)).toBe('overview')
+    expect(visibleTab('test', tabs)).toBe('test')
     expect(visibleTab('proxy', tabs)).toBe('overview')
   })
 })

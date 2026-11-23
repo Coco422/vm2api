@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import http from 'node:http'
 import {
   collectLivePanelCredentials,
   invalidateLiveCredentialCache,
@@ -12,6 +13,107 @@ import {
 function tmpDir(prefix = 'kin-live-cred-') {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix))
 }
+
+async function healthFixture(t) {
+  invalidateLiveCredentialCache()
+  const project = tmpDir()
+  const id = 'vm-live'
+  const home = path.join(project, 'vms', id, 'cli-home', '.claude')
+  fs.mkdirSync(home, { recursive: true })
+  fs.writeFileSync(
+    path.join(home, 'credentials.json'),
+    JSON.stringify({
+      claudeAiOauth: {
+        accessToken: 'fixture-access',
+        refreshToken: 'fixture-refresh',
+        expiresAt: Date.now() - 3600_000,
+      },
+    }),
+  )
+  const socket = path.join(project, 'health.sock')
+  let finish
+  let seen
+  const started = new Promise((resolve) => {
+    seen = resolve
+  })
+  const gate = new Promise((resolve) => {
+    finish = resolve
+  })
+  let requests = 0
+  const server = http.createServer(async (_req, res) => {
+    requests += 1
+    seen()
+    await gate
+    res.setHeader('Content-Type', 'application/json')
+    res.end(
+      JSON.stringify({
+        ok: true,
+        credential: {
+          has_access: true,
+          has_refresh: true,
+          expires_at: Date.now() + 3600_000,
+        },
+      }),
+    )
+  })
+  await new Promise((resolve) => server.listen(socket, resolve))
+  t.after(async () => {
+    finish()
+    invalidateLiveCredentialCache()
+    server.closeAllConnections()
+    await new Promise((resolve) => server.close(resolve))
+    fs.rmSync(project, { recursive: true, force: true })
+  })
+  const vm = { id, status: 'running', runtime: { kernel_socket: socket } }
+  fs.writeFileSync(path.join(project, 'vms', id + '.json'), JSON.stringify(vm))
+  return { project, vm, finish, started, count: () => requests }
+}
+
+test('list background read returns file data immediately and shares one pending health scan', async (t) => {
+  const f = await healthFixture(t)
+  const first = await collectLivePanelCredentials(f.project, [f.vm], { background: true })
+  assert.equal(first.get(f.vm.id).credential_state, 'expired_refreshable')
+  await f.started
+  await collectLivePanelCredentials(f.project, [f.vm], { background: true })
+  assert.equal(f.count(), 1)
+  const blocking = collectLivePanelCredentials(f.project, [f.vm])
+  f.finish()
+  const fresh = await blocking
+  assert.equal(fresh.get(f.vm.id).credential_state, 'fresh')
+  assert.equal(f.count(), 1)
+  assert.equal(JSON.stringify([...fresh]).includes('fixture-access'), false)
+})
+
+test('credential cache cannot reuse another project or filtered VM collection; stopped VMs are not probed', async (t) => {
+  const f = await healthFixture(t)
+  f.finish()
+  await collectLivePanelCredentials(f.project, [f.vm])
+  assert.equal((await collectLivePanelCredentials(f.project, [])).size, 0)
+  const other = tmpDir()
+  t.after(() => fs.rmSync(other, { recursive: true, force: true }))
+  const missing = await collectLivePanelCredentials(other, [{ id: f.vm.id, status: 'stopped' }])
+  assert.equal(missing.size, 0)
+  const n = f.count()
+  await collectLivePanelCredentials(f.project, [{ ...f.vm, status: 'stopped' }])
+  assert.equal(f.count(), n)
+  await collectLivePanelCredentials(f.project, [f.vm], { cacheMs: 0 })
+  assert.equal(f.count(), n + 1)
+})
+
+test('invalidated background collection cannot publish stale data or mirror credentials', async (t) => {
+  const f = await healthFixture(t)
+  const file = path.join(f.project, 'vms', f.vm.id + '.json')
+  const before = fs.readFileSync(file, 'utf8')
+  await collectLivePanelCredentials(f.project, [f.vm], { background: true })
+  await f.started
+  const pending = collectLivePanelCredentials(f.project, [f.vm])
+  invalidateLiveCredentialCache()
+  f.finish()
+  await pending
+  assert.equal(fs.readFileSync(file, 'utf8'), before)
+  await collectLivePanelCredentials(f.project, [f.vm])
+  assert.equal(f.count(), 2)
+})
 
 test('live credential prefers newer file TTL over stale worker snapshot', () => {
   const now = Date.now()

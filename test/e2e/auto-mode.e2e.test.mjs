@@ -220,6 +220,7 @@ async function harness(t, layout = 'zero', cliPath = cli) {
       claude_bin: cliPath,
       slots_per_worker: 2,
       system_layout: layout,
+      thinking_display: 'summarized',
       timezone: 'America/New_York',
       test_endpoints: true,
       anthropic_base_url: `http://127.0.0.1:${upstream.address().port}`,
@@ -403,7 +404,7 @@ for (const layout of ['zero', 'identity'])
         assert.equal(response.stop_sequence, stage === 'xml_s1' ? input.stop_sequences[0] : null)
         const wire = h.captured.at(-1)
         assert.deepEqual(wire.thinking, { type: 'disabled' })
-        assert.equal(wire.temperature, 0)
+        assert.equal(wire.temperature, input.temperature)
         assert.equal(wire.max_tokens, input.max_tokens)
         assert.deepEqual(wire.stop_sequences, input.stop_sequences)
         assert.equal(wire.output_config, undefined)
@@ -494,7 +495,7 @@ function withCase(body, marker) {
   return input
 }
 
-test('classifier terminal/error/cancel/concurrency boundaries through actual ELF', { timeout: 30000 }, async (t) => {
+test('classifier terminal/error/concurrency boundaries through actual ELF', { timeout: 30000 }, async (t) => {
   const h = await harness(t)
   const context = { purpose: 'auto_mode_classifier', format: 'xml', stage: 'xml_s1' }
   for (const marker of ['CASE_BLOCK', 'CASE_EMPTY', 'CASE_MAX']) {
@@ -565,22 +566,6 @@ test('classifier terminal/error/cancel/concurrency boundaries through actual ELF
   assert.deepEqual(b.thinking, { type: 'adaptive' })
   assert.equal(b.max_tokens, 2112)
   assert.equal(b.system.at(-1).cache_control.ttl, '1h')
-  const running = h.direct({
-    body: withCase(classifierFixture(), 'CASE_CANCEL'),
-    request_context: context,
-    stream: true,
-    request_id: 'cancel-classifier',
-  })
-  for (let i = 0; i < 100 && !h.captured.some((b) => JSON.stringify(b.messages).includes('CASE_CANCEL')); i++)
-    await new Promise((resolve) => setTimeout(resolve, 20))
-  assert.equal(JSON.parse((await h.cancel('cancel-classifier')).text).cancelled, true)
-  await running
-  for (let i = 0; i < 100 && (await h.getHealth()).ready_slots !== 2; i++) {
-    await new Promise((resolve) => setTimeout(resolve, 20))
-  }
-  assert.equal((await h.getHealth()).ready_slots, 2)
-  const reused = await h.send(classifierFixture())
-  assert.equal(reused.status, 200, reused.text)
   const mixed = await Promise.all([
     h.send(withCase(classifierFixture(), 'CASE_CONCURRENT_CLASSIFIER')),
     h.send({
@@ -607,14 +592,39 @@ test('classifier terminal/error/cancel/concurrency boundaries through actual ELF
   assert.equal(wire.max_tokens, 128)
   assert.deepEqual(wire.thinking, { type: 'adaptive', display: 'summarized' })
   assert.equal(wire.request_context, undefined)
-  assert.equal(wire.system.at(-1).text, 'Ordinary caller prompt')
-  assert.equal(wire.messages.at(-1).role, 'user')
+  assert.ok(!wire.system.some((block) => block.text === 'Ordinary caller prompt'))
+  const firstUser = wire.messages.find((message) => message.role === 'user')
+  assert.match(JSON.stringify(firstUser.content), /Ordinary caller prompt/)
+  assert.match(JSON.stringify(firstUser.content), /hello/)
   h.setHealth({ ...h.health, classifier_request_context: false })
   const count = h.captured.length
   const unsupported = await h.send(classifierFixture())
   assert.equal(unsupported.status, 400, unsupported.text)
   assert.equal(JSON.parse(unsupported.text).error.code, 'classifier_runtime_unsupported')
   assert.equal(h.captured.length, count)
+})
+
+test('classifier cancellation releases its slot when upstream never responds', { timeout: 30000 }, async (t) => {
+  const h = await harness(t)
+  const running = h.direct({
+    body: withCase(classifierFixture(), 'CASE_CANCEL'),
+    request_context: { purpose: 'auto_mode_classifier', format: 'xml', stage: 'xml_s1' },
+    stream: true,
+    request_id: 'cancel-classifier',
+  })
+  for (let i = 0; i < 100 && !h.captured.some((b) => JSON.stringify(b.messages).includes('CASE_CANCEL')); i++)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(JSON.parse((await h.cancel('cancel-classifier')).text).cancelled, true)
+  await running
+  const deadline = Date.now() + 15000
+  let health = await h.getHealth()
+  while (Date.now() < deadline && health.ready_slots !== 2) {
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    health = await h.getHealth()
+  }
+  assert.equal(health.ready_slots, 2, JSON.stringify(health))
+  const reused = await h.send(classifierFixture())
+  assert.equal(reused.status, 200, reused.text)
 })
 
 test('actual kernel+CLI ELF keeps per-message effort and top-level high', { timeout: 30000 }, async (t) => {
@@ -687,7 +697,14 @@ test('actual kernel+CLI ELF keeps per-message effort and top-level high', { time
     const wire = h.captured.at(-1)
     const headers = h.capturedHeaders.at(-1)
     assert.equal(wire.output_config.effort, 'high', item.name)
-    assert.deepEqual(roles(wire), roles({ messages: item.turns }), item.name)
+    // #854 anchors generated Environment after the first user. Preserve the
+    // caller's effort-control system turns while excluding that generated one.
+    const callerWire = {
+      messages: wire.messages.filter(
+        (message) => !(message.role === 'system' && String(message.content).startsWith('# Environment')),
+      ),
+    }
+    assert.deepEqual(roles(callerWire), roles({ messages: item.turns }), item.name)
     assert.deepEqual(efforts(wire), item.wantEfforts, `${item.name} ${JSON.stringify(roles(wire))}`)
     assert.ok(
       hasBeta(wire, headers),

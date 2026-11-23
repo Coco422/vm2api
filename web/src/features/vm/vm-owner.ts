@@ -8,6 +8,13 @@ export function canReclaimVm(vm: Vm): boolean {
   return vm.origin !== 'user_created'
 }
 
+/** 列表第三行：有租户才显示，没有租户不占位。 */
+export function rentedMark(
+  ownerId: string | null | undefined
+): '出租中' | null {
+  return String(ownerId || '').trim() ? '出租中' : null
+}
+
 export function vmOriginLabel(origin: string | null | undefined): string {
   switch (origin) {
     case 'user_created':
@@ -41,12 +48,16 @@ export function assignableUsers(users: PanelUser[] | undefined): PanelUser[] {
 
 export type PatchVmOwnerResponse = { vm?: Vm }
 
-export function patchVmOwner(vmId: string, user_id: string | null) {
+export function patchVmOwner(
+  vmId: string,
+  user_id: string | null,
+  deliveryBatch?: string
+) {
   return api<PatchVmOwnerResponse>(
     `/api/panel/vms/${encodeURIComponent(vmId)}/owner`,
     {
       method: 'PATCH',
-      body: JSON.stringify({ user_id }),
+      body: JSON.stringify({ user_id, delivery_batch: deliveryBatch }),
     }
   )
 }

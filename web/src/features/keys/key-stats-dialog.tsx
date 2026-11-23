@@ -84,7 +84,9 @@ function StatsBody({ item, vms }: { item: ApiKeyItem; vms: Vm[] }) {
           ? 'Anthropic'
           : item.group_type === 'openai'
             ? 'OpenAI'
-            : '全局'}
+            : item.group_type === 'gemini'
+              ? 'Gemini'
+              : '全局'}
         {' · '}近 {usage?.days ?? 30} 天 · 官方价
       </div>
       {q.isLoading ? (
@@ -95,6 +97,10 @@ function StatsBody({ item, vms }: { item: ApiKeyItem; vms: Vm[] }) {
             ))}
           </div>
           <Skeleton className='h-64 rounded-xl' />
+        </div>
+      ) : q.isError && !view ? (
+        <div className='grid h-40 place-items-center rounded-xl border text-sm text-destructive'>
+          密钥统计加载失败
         </div>
       ) : !view ? (
         <div className='grid h-40 place-items-center rounded-xl border text-sm text-muted-foreground'>
@@ -116,9 +122,11 @@ function StatsBody({ item, vms }: { item: ApiKeyItem; vms: Vm[] }) {
               label={`${view.summary.days} 天请求`}
               value={fmtNum(view.summary.requests)}
               hint={
-                view.summary.errors > 0
-                  ? `含 ${fmtNum(view.summary.errors)} 次失败`
-                  : '全部成功'
+                view.summary.requests === 0
+                  ? '此期间无请求'
+                  : view.summary.errors > 0
+                    ? `含 ${fmtNum(view.summary.errors)} 次失败`
+                    : '全部成功'
               }
             />
             <MetricCard

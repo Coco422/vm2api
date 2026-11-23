@@ -143,6 +143,7 @@ export async function startSandbox({ root, sandbox, record, port = 8791, install
     config: { safety_ratio: 0.85, weekly_safety_ratio: 0.8 },
     setMaxConcurrency() {},
     setMaxRpm() {},
+    setVmQuotaOverride() {},
     snapshot: () => ({
       accounts: [...utilization].map(([id, used]) => ({
         vm_id: id,

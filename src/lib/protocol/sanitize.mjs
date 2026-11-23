@@ -1,12 +1,14 @@
+import { mayRepairAutoModeReminder, repairAutoModeReminders } from './auto-mode-reminder.mjs'
 import { defaultMaxTokensForModel } from './model-policy.mjs'
 
 /**
  * Sanitize Anthropic Messages body for official API.
  *
- * Credential-forwarding (sub2api-style): drop client-private / OpenAI leftover
+ * Credential forwarding: drop client-private and leftover OpenAI
  * keys, pass through unknown official fields such as output_config.
  */
 const DROP_TOP = new Set([
+  'caller_cwd',
   'settings',
   'claude_settings',
   'env',
@@ -115,6 +117,21 @@ export function applyStructuredOutput(out, source = {}) {
 
 /** OpenAI / client leftovers Anthropic TextBlock rejects as Extra inputs. */
 const DROP_CONTENT_KEYS = new Set(['annotations'])
+const SMALL_TEXT_TURN_CHARS = 4096
+
+export function isSmallTextTurn(body) {
+  if (body?.messages?.length !== 1 || body.tools?.length) return false
+  const message = body.messages[0]
+  if (message?.role !== 'user') return false
+  const content = message.content
+  const text =
+    typeof content === 'string'
+      ? content
+      : Array.isArray(content) && content.length === 1 && content[0]?.type === 'text'
+        ? content[0].text
+        : null
+  return typeof text === 'string' && text.length <= SMALL_TEXT_TURN_CHARS
+}
 
 /** Drop content-block fields the public Messages schema rejects (annotations, …). */
 export function stripIllegalContentFields(content) {
@@ -160,8 +177,22 @@ export function promoteContentToBlocks(content) {
 export function promoteSystemToBlocks(system) {
   if (system == null || system === '') return system
   if (typeof system === 'string') return [{ type: 'text', text: system }]
-  if (!Array.isArray(system)) return system
+  if (!Array.isArray(system)) return [canonicalSystemBlock(system, 'system')]
   return system.map((block) => (typeof block === 'string' ? { type: 'text', text: block } : block))
+}
+
+function canonicalSystemBlock(block, param) {
+  if (typeof block === 'string') return { type: 'text', text: block }
+  if ((block?.type === 'text' || block?.type === undefined) && typeof block?.text === 'string') {
+    return block.type === 'text' ? block : { ...block, type: 'text' }
+  }
+  const code = 'invalid_system_block'
+  const message = `${param}: must be a text block with a string text field`
+  throw Object.assign(new Error(message), {
+    status: 400,
+    code,
+    body: { type: 'error', error: { type: 'invalid_request_error', code, param, message } },
+  })
 }
 
 /**
@@ -191,45 +222,87 @@ export function canonicalizeClaudeMessagesShape(body, { preserveContentShape = f
   return out
 }
 
-export function sanitizeAnthropicBody(body, { strictPassthrough = false, preserveContentShape = false } = {}) {
-  if (!body || typeof body !== 'object') return body
-  if (strictPassthrough) {
-    const out = { ...body }
-    normalizeStop(out)
-    return out
+export function reusableContentBlock(block) {
+  if (!block || typeof block !== 'object' || typeof block.type !== 'string' || !block.type) return false
+  for (const key of DROP_CONTENT_KEYS) {
+    if (Object.hasOwn(block, key)) return false
   }
+  return (
+    block.type !== 'text' ||
+    (typeof block.text === 'string' && !!block.text.trim() && !mayRepairAutoModeReminder(block.text))
+  )
+}
+
+function reusableContent(content) {
+  for (const block of content) {
+    if (!reusableContentBlock(block)) return false
+    if (block.type === 'tool_result' && Array.isArray(block.content) && !reusableContent(block.content)) return false
+  }
+  return true
+}
+
+export function canReuseCanonicalHistory(messages) {
+  if (!Array.isArray(messages) || !messages.length) return false
+  let previousRole = 'assistant'
+  for (const message of messages) {
+    const role = message?.role
+    if ((role !== 'user' && role !== 'assistant') || role === previousRole) return false
+    if (!Array.isArray(message.content) || !message.content.length || !reusableContent(message.content)) return false
+    previousRole = role
+  }
+  return true
+}
+
+export function sanitizeAnthropicBody(
+  body,
+  { preserveContentShape = false, onSystemBlock, reuseCanonicalHistory = false } = {},
+) {
+  if (!body || typeof body !== 'object') return body
 
   const out = copyOfficialAnthropicFields(body)
   applyStructuredOutput(out, body)
 
-  if (!preserveContentShape && Array.isArray(out.system)) {
-    const blocks = out.system
-      .map((b) => {
-        if (typeof b === 'string') return { type: 'text', text: b }
-        if (b && typeof b.text === 'string') {
-          const block = { type: 'text', text: b.text }
-          if (b.cache_control) block.cache_control = b.cache_control
-          return block
-        }
-        return b && typeof b === 'object' ? b : null
-      })
-      .filter(Boolean)
-    out.system = blocks
+  if (!preserveContentShape && out.system != null && typeof out.system !== 'string') {
+    const list = Array.isArray(out.system)
+    out.system = (list ? out.system : [out.system]).map((value, index) => {
+      const source = canonicalSystemBlock(value, list ? `system[${index}]` : 'system')
+      const block = { type: 'text', text: source.text }
+      if (source.cache_control) block.cache_control = source.cache_control
+      onSystemBlock?.(block, index)
+      return block
+    })
   }
 
-  normalizeAnthropicMessages(out)
-  stripIllegalBodyContentFields(out)
+  const reuseHistory =
+    !preserveContentShape &&
+    (typeof reuseCanonicalHistory === 'function'
+      ? reuseCanonicalHistory(out.messages)
+      : reuseCanonicalHistory && canReuseCanonicalHistory(out.messages))
+  if (reuseHistory) {
+    if (Array.isArray(out.system)) out.system = stripIllegalContentFields(out.system)
+  } else {
+    if (reuseCanonicalHistory && Array.isArray(out.messages)) {
+      out.messages = out.messages.map((message) => (message && typeof message === 'object' ? { ...message } : message))
+    }
+    normalizeAnthropicMessages(out)
+    stripIllegalBodyContentFields(out)
+  }
 
   if (Array.isArray(out.tools) && out.tools.length === 0) delete out.tools
   // Do not overwrite caller max_tokens (thinking budget). Only fill if missing.
   if (!out.max_tokens) out.max_tokens = defaultMaxTokensForModel(out.model)
-  if (out.tool_choice && !out.tools) delete out.tool_choice
   normalizeStop(out)
-  return canonicalizeClaudeMessagesShape(out, { preserveContentShape })
+  const normalized = reuseHistory ? out : canonicalizeClaudeMessagesShape(out, { preserveContentShape })
+  if (reuseHistory && out.system != null) out.system = promoteSystemToBlocks(out.system)
+  // A nonempty source string becomes the first block; lifted history only appends.
+  if (!preserveContentShape && onSystemBlock && typeof body.system === 'string') {
+    onSystemBlock(normalized.system?.[0], 0)
+  }
+  return normalized
 }
 
 /**
- * Sub2API-style Messages repair before the Anthropic hop:
+ * Messages repair before the Anthropic hop:
  *   - leading system / developer turns (before the first user) lift into top-level system
  *   - mid-conversation role:system after a user turn is kept when the model/beta allow it
  *   - unknown roles (admin, tool, function, …) become user
@@ -249,6 +322,7 @@ export function sanitizeAnthropicBody(body, { strictPassthrough = false, preserv
  */
 export function normalizeAnthropicMessages(body, { keepMidConversationSystem = true } = {}) {
   if (!body || !Array.isArray(body.messages)) return body
+  repairAutoModeReminders(body)
 
   const keepMessageEffort = modelSupportsPerMessageEffort(body.model)
   const systemParts = []
@@ -297,6 +371,7 @@ export function normalizeAnthropicMessages(body, { keepMidConversationSystem = t
   }
 
   body.messages = merged
+  repairAutoModeReminders(body)
   if (systemParts.length) body.system = appendSystemParts(body.system, systemParts)
   if (!keepMessageEffort && (trailingEmptyEffort || liftedContentEffort)) {
     applyLiftedEffort(body, trailingEmptyEffort || liftedContentEffort)
@@ -383,7 +458,7 @@ function modelSupportsPerMessageEffort(modelId = '') {
     .trim()
     .toLowerCase()
     .replace(/\[1m\]$/i, '')
-  return /^claude-(?:(?:fable|mythos)-5[-.]1|opus-5(?:[-.]5)?|(?:sonnet|haiku)-5[-.]5)(?:-|$)/.test(id)
+  return /^claude-(?:(?:fable|mythos)-5[-.](?:1|2)|opus-5(?:[-.]5)?|(?:sonnet|haiku)-5[-.]5)(?:-|$)/.test(id)
 }
 
 function applyLiftedEffort(body, effort) {

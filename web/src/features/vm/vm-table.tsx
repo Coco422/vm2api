@@ -88,13 +88,15 @@ export function sortVms(
     }
   }
   return vms.slice().sort((a, b) => {
-    // 无效凭证恒后置，不受排序键与方向影响。按「今日花费」倒序时一台已吊销
+    // 无效凭证恒后置，不受排序键与方向影响。按「今日花费 · 北京时间」倒序时一台已吊销
     // 的高消耗槽本来会窜到第一行 —— 它已经不能用了，占着头部只会误导。
     // 组内按失效时间排（最近坏的在前），同样不看排序键。
     const da = vmCredDead(a)
     const db = vmCredDead(b)
     if (da !== db) return da ? 1 : -1
     if (da && db) return deadCmp(a, b)
+    if (key === 'remain' && !!a.gemini !== !!b.gemini) return a.gemini ? 1 : -1
+    if (key === 'remain' && a.gemini && b.gemini) return deadCmp(a, b)
     const av = val(a)
     const bv = val(b)
     if (typeof av === 'string' || typeof bv === 'string') {
@@ -109,10 +111,11 @@ export function sortVms(
  * 等级与凭证类型仍参与全文搜索（可以直接搜 "Max" / "OAuth"）。
  * `kind` 切 Claude / GPT 凭证面，默认全部。
  */
-export type VmKindFilter = 'all' | 'claude' | 'gpt'
+export type VmKindFilter = 'all' | 'claude' | 'gpt' | 'gemini'
 
 export function matchesKind(vm: Vm, kind: VmKindFilter): boolean {
   if (kind === 'all') return true
+  if (vm.gemini) return kind === 'gemini'
   return isCodexVm(vm) ? kind === 'gpt' : kind === 'claude'
 }
 
@@ -120,38 +123,45 @@ export function KindFilterChips({
   vms,
   kind,
   onChange,
+  showGemini = false,
 }: {
   vms: Vm[]
   kind: VmKindFilter
   onChange: (kind: VmKindFilter) => void
+  showGemini?: boolean
 }) {
   let claude = 0
   let openai = 0
+  let gemini = 0
   for (const vm of vms) {
-    if (isCodexVm(vm)) openai += 1
+    if (vm.gemini) gemini += 1
+    else if (isCodexVm(vm)) openai += 1
     else claude += 1
   }
   const chips = [
     ['claude', 'claude', claude, '筛选 Claude'],
     ['gpt', 'codex', openai, '筛选 OpenAI'],
+    ['gemini', 'gemini', gemini, '筛选 Gemini'],
   ] as const
   return (
     <>
-      {chips.map(([key, chipKind, n, label]) => (
-        <Button
-          key={key}
-          size='sm'
-          variant={kind === key ? 'default' : 'outline'}
-          aria-pressed={kind === key}
-          aria-label={label}
-          title={label}
-          className='cursor-pointer gap-1.5 transition-colors duration-200'
-          onClick={() => onChange(kind === key ? 'all' : key)}
-        >
-          <PlatformChip kind={chipKind} />
-          <span className='tabular-nums'>{n}</span>
-        </Button>
-      ))}
+      {chips
+        .filter(([key]) => key !== 'gemini' || showGemini)
+        .map(([key, chipKind, n, label]) => (
+          <Button
+            key={key}
+            size='sm'
+            variant={kind === key ? 'default' : 'outline'}
+            aria-pressed={kind === key}
+            aria-label={label}
+            title={label}
+            className='cursor-pointer gap-1.5 transition-colors duration-200'
+            onClick={() => onChange(kind === key ? 'all' : key)}
+          >
+            <PlatformChip kind={chipKind} />
+            <span className='tabular-nums'>{n}</span>
+          </Button>
+        ))}
     </>
   )
 }
@@ -176,7 +186,7 @@ export function filterVms(
       vm.kernel,
       vm.proxy_id,
       claudeTier(vm).label,
-      platformLabel(vm),
+      vm.gemini ? 'Gemini Google craganti' : platformLabel(vm),
       credTypeLabel(credTypeOf(vm)),
     ]
       .map((x) => String(x || '').toLowerCase())

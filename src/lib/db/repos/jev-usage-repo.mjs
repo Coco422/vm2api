@@ -29,6 +29,20 @@ const COUNTS = [
 ]
 const empty = () => Object.fromEntries(COUNTS.map((name) => [name, 0]))
 
+/**
+ * A configured key's panel status, decided by its latest event; with no event at
+ * all the configuration itself answers. Single source so the panel and the usage
+ * page cannot drift into two different verdicts for the same key.
+ */
+function latestKeyStatus(last, key) {
+  if (last?.http_status === 402) return 'insufficient_balance'
+  if (last?.outcome === 'success') return 'normal'
+  if (last?.http_status === 401 || last?.http_status === 403) return 'auth_error'
+  if (last?.http_status === 429) return 'rate_limited'
+  if (last) return 'request_error'
+  return key.retired ? 'paused' : 'unrequested'
+}
+
 export class JevUsageRepo {
   constructor(db = getDb(), { now = Date.now } = {}) {
     this.db = db
@@ -70,6 +84,58 @@ export class JevUsageRepo {
         )
         .run(shanghaiUsageDay(new Date(now - 90 * 86400000).toISOString()))
     }
+  }
+  /** Latest event per key. Shared so a status never depends on which caller asked. */
+  _latestKeyEvent() {
+    return this.db.prepare(`SELECT created_at,http_status,outcome FROM jev_usage_events
+      WHERE key_fingerprint=? ORDER BY created_at DESC,id DESC LIMIT 1`)
+  }
+
+  /**
+   * Status of each configured key, from its latest event alone.
+   *
+   * `configuredKeys` answers the same question but first aggregates the entire
+   * `jev_usage_events` table; a caller that only renders a key's status paid for
+   * sums it never read (#1043).
+   */
+  configuredKeyStatuses(keys) {
+    const latest = this._latestKeyEvent()
+    return keys.map((key) => {
+      const last = latest.get(key.key_fingerprint)
+      return {
+        key_fingerprint: key.key_fingerprint,
+        status: latestKeyStatus(last, key),
+        last_request_at: last?.created_at ?? null,
+        last_http_status: last?.http_status ?? null,
+      }
+    })
+  }
+
+  configuredKeys(keys) {
+    const rows = this.db
+      .prepare(`SELECT key_fingerprint,
+      COUNT(*) AS requests,
+      SUM(CASE WHEN outcome='success' THEN 1 ELSE 0 END) AS successful,
+      SUM(COALESCE(estimated_cost_nano_usd,0)) AS estimated_cost_nano_usd,
+      SUM(CASE WHEN estimated_cost_nano_usd IS NULL THEN 1 ELSE 0 END) AS unknown_cost_requests
+      FROM jev_usage_events GROUP BY key_fingerprint`)
+      .all()
+    const totals = new Map(rows.map((row) => [row.key_fingerprint, row]))
+    const latest = this._latestKeyEvent()
+    return keys.map((key) => {
+      const last = latest.get(key.key_fingerprint)
+      return {
+        ...key,
+        requests: 0,
+        successful: 0,
+        estimated_cost_nano_usd: 0,
+        unknown_cost_requests: 0,
+        ...totals.get(key.key_fingerprint),
+        status: latestKeyStatus(last, key),
+        last_request_at: last?.created_at ?? null,
+        last_http_status: last?.http_status ?? null,
+      }
+    })
   }
   overview() {
     const today = shanghaiUsageDay(new Date(this.now()).toISOString())
@@ -115,6 +181,10 @@ export class JevUsageRepo {
     const more = rows.length > limit
     if (more) rows.pop()
     const last = rows.at(-1)
-    return { rows, has_more: more, next_cursor: more && last ? { created_at: last.created_at, id: last.id } : null }
+    return {
+      rows,
+      has_more: more,
+      next_cursor: more && last ? { created_at: last.created_at, id: last.id } : null,
+    }
   }
 }

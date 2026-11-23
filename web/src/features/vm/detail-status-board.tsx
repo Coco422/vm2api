@@ -35,9 +35,11 @@ import {
 } from '@/lib/wrap-health'
 import { SlotIdentity } from '@/components/platform-chip'
 import { StatusMark } from '@/components/status-mark'
+import { ActiveUsageAction } from '@/features/vm/active-usage-action'
+import { TenantProxyBadge } from '@/features/company/tenant-proxy-badge'
 import { ClaudeResetActions } from '@/features/vm/claude-reset-actions'
 import { CodexKernelHealthFields } from '@/features/vm/codex-kernel-health-card'
-import { dataplaneLabel } from '@/features/vm/dataplane-contract'
+import { kernelRouteLabel } from '@/features/vm/dataplane-contract'
 import { CircuitField } from '@/features/vm/detail-circuit-field'
 import {
   Field,
@@ -52,8 +54,9 @@ import { OpenaiQuotaPanel } from '@/features/vm/openai-quota-panel'
 import { proxyHealthOf } from '@/features/vm/proxy-health'
 import { RuntimeChip } from '@/features/vm/runtime-chip'
 import { VmMemoryBlock } from '@/features/vm/vm-memory-block'
+import { useVmPerms } from '@/features/vm/vm-perms'
 import { VmSchedulingBlock } from '@/features/vm/vm-scheduling'
-import { telemetryView } from './telemetry-policy'
+import { telemetryEnabled } from './telemetry-policy'
 import { telemetryStatusLabel } from './telemetry-status'
 
 type Props = {
@@ -64,7 +67,6 @@ type Props = {
   dash: { data: Dashboard | undefined }
   u5: number
   u7: number
-  tierKey: string
   now: number
   cost: VmCostSummary
   split: WeeklySplitSummary | null
@@ -108,14 +110,18 @@ type Verdict = {
 function slotVerdict(
   vm: Vm,
   kernel: VmKernelSnapshot | null | undefined,
-  proxy: VmProxySnap
+  proxy: VmProxySnap,
+  revealProxy = true
 ): Verdict {
   const acc = accountStatus(vm)
   const proxyH = proxyHealthOf(vm, proxy)
   const hop = kernel?.rust_health || kernel?.go_health
   const notes: string[] = []
   const proxyFailClosed =
-    !!vm.has_token && proxyH.score === 0 && proxyH.tone.cls === 'bad'
+    revealProxy &&
+    !!vm.has_token &&
+    proxyH.score === 0 &&
+    proxyH.tone.cls === 'bad'
 
   if (acc.cls === 'none') {
     return {
@@ -168,7 +174,7 @@ function slotVerdict(
 
 function workerLabel(value: unknown) {
   const raw = String(value || '').trim()
-  if (raw === 'go' || raw === 'rust') return 'Rust · cli-hop'
+  if (raw === 'go' || raw === 'rust') return 'Rust'
   return raw || '—'
 }
 
@@ -186,6 +192,7 @@ function money(value: unknown): number {
 }
 
 export function VmStatusBoard(props: Props) {
+  const revealProxy = useVmPerms().dashboard
   const {
     vm,
     kernel,
@@ -194,7 +201,6 @@ export function VmStatusBoard(props: Props) {
     dash,
     u5,
     u7,
-    tierKey,
     now,
     cost,
     split,
@@ -203,9 +209,9 @@ export function VmStatusBoard(props: Props) {
     today,
     billing,
   } = props
-  const verdict = slotVerdict(vm, kernel, proxy)
+  const verdict = slotVerdict(vm, kernel, proxy, revealProxy)
   const proxyH = proxyHealthOf(vm, proxy)
-  const fable = fableCardInfo(vm, tierKey, fableCap(dash.data))
+  const fable = fableCardInfo(vm, fableCap(dash.data))
   const reset5 = acc.reset_5h ?? vm.reset_5h
   const reset7 = acc.reset_7d ?? vm.reset_7d
   const cost5 = money(acc.window_5h_cost ?? vm.window_5h_cost ?? cost.w)
@@ -225,9 +231,16 @@ export function VmStatusBoard(props: Props) {
       : live5
   const spend7 = formatWindowSpend(cost7, vm.estimate_7d)
   const spendFable = formatWindowSpend(fableCost, vm.estimate_fable)
-  const telemetry = telemetryView(vm.seed_policy, kernel?.telemetry)
+  const telemetry = kernel?.telemetry
   const topology = kernel?.process_topology
-  const rust = wrapHealthLabel(kernel?.rust_health)
+  const route = kernelRouteLabel(
+    vm.resolved_dataplane,
+    vm.resolved_crag_kernel_version
+  )
+  const rust = wrapHealthLabel(
+    kernel?.rust_health,
+    vm.resolved_dataplane === 'crag' ? route : 'cli-hop'
+  )
 
   return (
     <section className='rounded-lg border bg-card'>
@@ -248,7 +261,11 @@ export function VmStatusBoard(props: Props) {
             {isCodexVm(vm) ? <OpenaiPlanBadge vm={vm} size='sm' /> : null}
             <StatusMark tone={accountStatus(vm)} variant='pill' />
             <StatusMark tone={poolStatus(vm)} variant='pill' />
-            <StatusMark tone={proxyH.tone} variant='pill' />
+            {revealProxy ? (
+              <StatusMark tone={proxyH.tone} variant='pill' />
+            ) : (
+              <TenantProxyBadge />
+            )}
             <StatusMark
               tone={{
                 key: vmRunning(vm) ? 'ok' : 'off',
@@ -385,7 +402,19 @@ export function VmStatusBoard(props: Props) {
                     />
                   </div>
                 ) : null}
-                <ClaudeResetActions vm={vm} now={now} />
+                <ActiveUsageAction vm={vm} />
+                <ClaudeResetActions
+                  vm={vm}
+                  now={now}
+                  usage={{
+                    fiveHour: u5,
+                    sevenDay: u7,
+                    fable: fable.usedPct,
+                    sevenDayGate: vm.quota_policy
+                      ? vm.quota_policy.limit_7d * 100
+                      : null,
+                  }}
+                />
               </>
             )}
           </div>
@@ -395,7 +424,9 @@ export function VmStatusBoard(props: Props) {
           <h3 className='text-sm font-medium'>运行</h3>
           <div className='mt-3 grid grid-cols-2 gap-3'>
             <div>
-              <div className='text-xs text-muted-foreground'>今日</div>
+              <div className='text-xs text-muted-foreground'>
+                今日 · 北京时间
+              </div>
               <div className='mt-0.5 text-lg font-semibold tabular-nums'>
                 {fmtUsd(
                   Number(acc.today_cost ?? vm.today_cost ?? cost.today),
@@ -418,9 +449,13 @@ export function VmStatusBoard(props: Props) {
           </div>
           <div className='mt-3 divide-y'>
             <Field label='代理' compact>
-              <span className='font-mono text-xs'>
-                {proxyNamedLabel(proxy)}
-              </span>
+              {revealProxy ? (
+                <span className='font-mono text-xs'>
+                  {proxyNamedLabel(proxy)}
+                </span>
+              ) : (
+                <TenantProxyBadge />
+              )}
             </Field>
             <div className='space-y-2 py-2'>
               <VmSchedulingBlock vm={vm} conc={conc} rpm={rpm} />
@@ -440,18 +475,27 @@ export function VmStatusBoard(props: Props) {
               <CodexKernelHealthFields health={kernel?.codex_health} />
             ) : (
               <>
-                <Field label='cli-hop' compact>
+                <Field
+                  label={vm.resolved_dataplane === 'crag' ? route : 'cli-hop'}
+                  compact
+                >
                   {rust}
                 </Field>
                 <Field label='内核' compact>
-                  {isCodexVm(vm) ? '—' : dataplaneLabel(vm.resolved_dataplane)}
+                  {kernelRouteLabel(
+                    vm.resolved_dataplane,
+                    vm.resolved_crag_kernel_version
+                  )}
                 </Field>
                 <Field label='拓扑' compact>
                   {topologyLabel(topology)}
                   {topology?.go_telemetry ? ' · Go telemetry' : ''}
                 </Field>
                 <Field label='遥测' compact>
-                  {telemetryStatusLabel(telemetry)}
+                  {telemetryStatusLabel(
+                    telemetry,
+                    telemetryEnabled(vm.seed_policy)
+                  )}
                 </Field>
               </>
             )}

@@ -32,6 +32,7 @@
 import { createHash } from 'node:crypto'
 import { resolveWorkstationProfile } from './workstation-profile.mjs'
 import fs from 'node:fs'
+import { readJsonParsedCached } from '../vm/vm-file.mjs'
 import { uuidFromSeed } from './identity-rewrite.mjs'
 import { OFFICIAL_CLI_VERSION } from './vm-identity.mjs'
 import { CCH_PLACEHOLDER } from './cch.mjs'
@@ -76,6 +77,7 @@ import {
   OFFICIAL_303_PRESET,
 } from './persona-template.mjs'
 import {
+  OFFICIAL_303_AGENT_IDENTITY,
   OFFICIAL_303_HARNESS,
   OFFICIAL_303_ENV_INSTRUCTIONS,
   buildOfficial303Environment,
@@ -118,7 +120,7 @@ Do not mention /status, /model, claude --version, a proxy, or a gateway.`
 export const OFFICIAL_CC_ENTRYPOINT_RE =
   /cc_entrypoint\s*=\s*(cli|sdk-cli|vscode|cowork|desktop|claude-vscode|claude-desktop(?:-3p)?)\b/i
 export const OFFICIAL_CC_IDENTITY_VARIANT_RE = /You are Claude Code\b|Claude Agent SDK/i
-/** sub2api official / child-hop system prefixes (Explore, Compact, search hop, …). */
+/** Official Claude Code system prompt prefixes, including child hops (Explore, Compact, search, …). */
 export const OFFICIAL_CC_CHILD_PROMPT_PREFIXES = Object.freeze([
   "You are Claude Code, Anthropic's official CLI for Claude",
   "You are a Claude agent, built on Anthropic's Claude Agent SDK",
@@ -334,12 +336,13 @@ function boundedBillingIndex(value, min) {
   return n
 }
 
-/** 2.1.293 appends both indexes, or neither. */
-export function billingTurnSuffix(promptIndex, turnIndex) {
-  const prompt = boundedBillingIndex(promptIndex, 0)
+/** First-turn indexes stay frozen. `cli` is the TUI capture; `sdk-cli` is `--print`. */
+export function billingTurnSuffix(promptIndex, turnIndex, entrypoint = 'sdk-cli') {
+  const prompt = entrypoint === 'cli' ? 1 : boundedBillingIndex(promptIndex, 0)
   const turn = boundedBillingIndex(turnIndex, 1)
   if (prompt == null || turn == null) return ''
-  return ` cc_turn_origin=sdk; cc_prompt_index=${prompt}; cc_turn_index=${turn};`
+  const origin = entrypoint === 'cli' ? 'human' : 'sdk'
+  return ` cc_turn_origin=${origin}; cc_prompt_index=${prompt}; cc_turn_index=${turn};`
 }
 
 function toolResultOnlyMessage(message) {
@@ -349,14 +352,14 @@ function toolResultOnlyMessage(message) {
 }
 
 /** First-turn indexes only. A moving cc_turn_index rewrites system[0] and invalidates every breakpoint after tools. */
-export function billingIndexesFromMessages(messages) {
+export function billingIndexesFromMessages(messages, entrypoint = 'sdk-cli') {
   if (!Array.isArray(messages)) return null
   let prompts = 0
   for (const message of messages) {
     if (message?.role === 'user' && !toolResultOnlyMessage(message)) prompts += 1
   }
   if (prompts < 1) return null
-  return { promptIndex: 0, turnIndex: 1 }
+  return { promptIndex: entrypoint === 'cli' ? 1 : 0, turnIndex: 1 }
 }
 
 const BILLING_PROMPT_ID_RE = /cc_prompt_id=[^;\s]*/g
@@ -429,8 +432,8 @@ export function buildBillingAttributionText(
   const ver = parseCliVersion(cliVersion)
   const fp = computeClaudeCodeFingerprint(firstUserText ?? '', ver)
   const promptId = billingPromptId(sessionId, firstUserText, ver)
-  const tail = billingTurnSuffix(indexes?.promptIndex, indexes?.turnIndex)
   const entry = entrypoint === 'cli' ? 'cli' : 'sdk-cli'
+  const tail = billingTurnSuffix(indexes?.promptIndex, indexes?.turnIndex, entry)
   return `x-anthropic-billing-header: cc_version=${ver}.${fp}; cc_entrypoint=${entry}; cch=${CCH_PLACEHOLDER}; cc_prompt_id=${promptId};${tail}`
 }
 
@@ -439,10 +442,17 @@ export function ccEntrypointFromRouting(routing) {
   return routing?.compatibility?.cc_entrypoint === 'sdk-cli' ? 'sdk-cli' : 'cli'
 }
 
-/** Add the billing block exactly once before the cli-node hop. */
+/** Add the project billing block when none is present. Do not replace one the template already wrote. */
 export function ensureBillingAttribution(
   body,
-  { firstUserText = '', cliVersion = DEFAULT_CLI_VERSION, sessionId = '', indexes = null, entrypoint = 'cli' } = {},
+  {
+    firstUserText = '',
+    cliVersion = DEFAULT_CLI_VERSION,
+    sessionId = '',
+    indexes = null,
+    entrypoint = 'cli',
+    passthrough = false,
+  } = {},
 ) {
   if (!body || typeof body !== 'object') return body
   const hasBilling = (system) => {
@@ -450,7 +460,7 @@ export function ensureBillingAttribution(
     if (!Array.isArray(system)) return false
     return system.some((block) => /x-anthropic-billing-header:/i.test(String(block?.text || block || '')))
   }
-  if (hasBilling(body.system)) return body
+  if (passthrough || hasBilling(body.system)) return body
   const block = {
     type: 'text',
     text: buildBillingAttributionText(firstUserText, cliVersion, sessionId, indexes, entrypoint),
@@ -871,15 +881,15 @@ export function personaTemplateVars({
     firstUserText,
     cliVersion,
     sessionId,
-    billingIndexesFromMessages(messages),
+    billingIndexesFromMessages(messages, entrypoint),
     entrypoint,
   )
   const envTimezoneOnly = () => buildOfficialEnvironmentSection(env, { sourceTexts, contextManagement: false })
   return {
     billing,
     billing_semi: billing.endsWith(';') ? billing : `${billing};`,
-    identity: CRS_OFFICIAL_CLI_SYSTEM,
-    identity_cli: CRS_OFFICIAL_CLI_SYSTEM,
+    identity: entrypoint === 'sdk-cli' ? OFFICIAL_303_AGENT_IDENTITY : CRS_OFFICIAL_CLI_SYSTEM,
+    identity_cli: entrypoint === 'sdk-cli' ? OFFICIAL_303_AGENT_IDENTITY : CRS_OFFICIAL_CLI_SYSTEM,
     identity_compact: CRS_COMPACT_IDENTITY,
     reporting: CRS_REPORTING_OUTCOMES,
     dynamic_boundary: '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__',
@@ -1193,7 +1203,8 @@ export function personaExpansionToolsFromRouting(routing = {}) {
 export function personaExpansionFromRoutingFile(filePath) {
   if (!filePath) return { mode: DEFAULT_PERSONA_EXPANSION, extraNames: [] }
   try {
-    const routing = JSON.parse(fs.readFileSync(filePath, 'utf8'))
+    const routing = readJsonParsedCached(filePath)
+    if (!routing) return { mode: DEFAULT_PERSONA_EXPANSION, extraNames: [] }
     return {
       mode: personaExpansionFromRouting(routing),
       extraNames: personaExpansionToolsFromRouting(routing),
@@ -1213,7 +1224,8 @@ export const PERSONA_STANDING_MAX = 800
 export function standingConstraintFromRoutingFile(filePath) {
   if (filePath) {
     try {
-      const raw = JSON.parse(fs.readFileSync(filePath, 'utf8'))?.compatibility?.persona_standing
+      const routing = readJsonParsedCached(filePath)
+      const raw = routing?.compatibility?.persona_standing
       const text = String(raw ?? '').trim()
       if (text) return text.slice(0, PERSONA_STANDING_MAX)
     } catch {
@@ -1423,7 +1435,11 @@ export function personaOptionsFromRoutingFile(filePath) {
     return { mode: DEFAULT_PERSONA_MODE, park: DEFAULT_PERSONA_PARK, agent: DEFAULT_PERSONA_AGENT }
   }
   try {
-    return personaOptionsFromRouting(JSON.parse(fs.readFileSync(filePath, 'utf8')))
+    const routing = readJsonParsedCached(filePath)
+    if (!routing) {
+      return { mode: DEFAULT_PERSONA_MODE, park: DEFAULT_PERSONA_PARK, agent: DEFAULT_PERSONA_AGENT }
+    }
+    return personaOptionsFromRouting(routing)
   } catch {
     return { mode: DEFAULT_PERSONA_MODE, park: DEFAULT_PERSONA_PARK, agent: DEFAULT_PERSONA_AGENT }
   }
@@ -1491,7 +1507,9 @@ export function personaTemplateSettingsFromRouting(routing = {}) {
 export function personaTemplateSettingsFromRoutingFile(filePath) {
   if (!filePath) return personaTemplateSettingsFallback()
   try {
-    return personaTemplateSettingsFromRouting(JSON.parse(fs.readFileSync(filePath, 'utf8')))
+    const routing = readJsonParsedCached(filePath)
+    if (!routing) return personaTemplateSettingsFallback()
+    return personaTemplateSettingsFromRouting(routing)
   } catch {
     return personaTemplateSettingsFallback()
   }
@@ -1611,6 +1629,8 @@ export function looksLikeOhMyPiSystem(system, headers = {}) {
   if (/<system-conventions>/i.test(text) && /<workstation>/i.test(text)) return true
   if (/^ROLE\s*\n\s*=+/m.test(text) && /^PROJECT\s*\n\s*=+/m.test(text)) return true
   if (/\b(?:oh my pi|pi coding harness|omp coding harness)\b/i.test(text)) return true
+  // OMP 18.12–18.16 send the Claude Code envelope plus their own role line (captured).
+  if (/^You are omp['’]s trusted coding assistant\.?\s*$/im.test(text)) return true
   return false
 }
 
@@ -1644,7 +1664,7 @@ export function inboundHasOpenAIToolShape(body = {}) {
 }
 
 /**
- * Official Claude Code family (sub2api-style UA prefix).
+ * Official Claude Code family detection uses the CLI User-Agent prefix and body checks.
  * UA + user_id is not enough: third-party Messages clients spoof both.
  * Body must also look like official CC system, and must not be OpenAI tools.
  * oh-my-pi / local-agent stealth is unofficial even with a matching UA.
@@ -1673,7 +1693,7 @@ function systemHasOfficialBillingBlock(system) {
 /**
  * An upstream API gateway forwarding real Claude Code rewrites the UA to
  * Go-http-client. The billing block is the signal third-party clients do not
- * send, and some relays (NewAPI) keep that block while dropping metadata.user_id.
+ * send, and some relays keep that block while dropping metadata.user_id.
  * A relay that also drops the block still counts when the client beta
  * (`claude-code-20250219`), the official system text, and a valid user_id
  * all survive. The identity line alone is not enough: third-party tools copy it.
@@ -1686,7 +1706,7 @@ function headerBetaTokens(headers = {}) {
     .filter(Boolean)
 }
 
-function systemLooksLikeRelayedClaudeCode(system) {
+export function systemLooksLikeRelayedClaudeCode(system) {
   if (hasOfficialClaudeLine(system)) return true
   if (isOfficialClaudeSecurityMonitorPrompt(system)) return true
   return eachSystemText(system).some((text) => looksLikeAgentPrompt(text))
@@ -1696,7 +1716,7 @@ export function isProxiedOfficialClaudeCode(body = {}, headers = {}) {
   if (!body || typeof body !== 'object') return false
   if (looksLikeOhMyPiSystem(body?.system)) return false
   if (inboundHasOpenAIToolShape(body)) return false
-  // Billing block first: NewAPI keeps it and may drop user_id. local-agent
+  // Billing block first: some relays keep it and may drop user_id. local-agent
   // already returned above.
   if (systemHasOfficialBillingBlock(body?.system)) return true
   if (!isValidOfficialUserId(body?.metadata?.user_id)) return false
@@ -1716,7 +1736,9 @@ export function detectProxiedOfficialCcFromRouting(routing = {}) {
 export function detectProxiedOfficialCcFromRoutingFile(filePath) {
   if (!filePath) return true
   try {
-    return detectProxiedOfficialCcFromRouting(JSON.parse(fs.readFileSync(filePath, 'utf8')))
+    const routing = readJsonParsedCached(filePath)
+    if (!routing) return true
+    return detectProxiedOfficialCcFromRouting(routing)
   } catch {
     return true
   }
@@ -1725,6 +1747,11 @@ export function detectProxiedOfficialCcFromRoutingFile(filePath) {
 /** Off unless the protocol tab turns it on. Official family then keeps its inbound system. */
 export function officialCcPassthroughFromRouting(routing = {}) {
   return routing?.compatibility?.official_cc_passthrough === true
+}
+
+/** Recognition is not passthrough. The body is kept only when that switch is on. */
+export function officialFamilyBodyPassthrough(officialTraffic, routing = {}) {
+  return officialTraffic === true && officialCcPassthroughFromRouting(routing)
 }
 
 function stripSystemCacheControl(body) {
@@ -1757,13 +1784,30 @@ function firstUserIndex(messages) {
   return messages.findIndex((message) => message?.role === 'user')
 }
 
+function insertSystemAfterUser(messages, user, content) {
+  if (user < 0) return messages
+  const assistant = messages.findIndex((message, index) => index > user && message?.role === 'assistant')
+  const at = assistant < 0 ? messages.length : assistant
+  const previous = messages[at - 1]
+  const existing = previous?.content
+  if (previous?.role === 'system' && (Array.isArray(existing) ? existing.length : String(existing || '').trim())) {
+    const joined =
+      typeof existing === 'string' && typeof content === 'string'
+        ? `${existing}\n\n${content}`
+        : [
+            ...(Array.isArray(existing) ? existing : [{ type: 'text', text: existing }]),
+            ...(Array.isArray(content) ? content : [{ type: 'text', text: content }]),
+          ]
+    return [...messages.slice(0, at - 1), { ...previous, content: joined }, ...messages.slice(at)]
+  }
+  return [...messages.slice(0, at), { role: 'system', content }, ...messages.slice(at)]
+}
+
 /** 2.1.263 leftover: after the first user, not inside system[]. */
 export function insertMidConversationSystem(messages, text) {
   const t = String(text || '').trim()
   if (!t || !Array.isArray(messages)) return messages
-  const idx = firstUserIndex(messages)
-  if (idx < 0) return messages
-  return [...messages.slice(0, idx + 1), { role: 'system', content: t }, ...messages.slice(idx + 1)]
+  return insertSystemAfterUser(messages, firstUserIndex(messages), t)
 }
 
 /** Caller text stays in system segment 5. Do not lift it into role=system. */
@@ -2151,9 +2195,12 @@ function applyTemplatePersona(
       // expansions as blocks so the assembled cache merger can budget them.
       system = [...system, ...(Array.isArray(content) ? content : [{ type: 'text', text: content }])]
     } else if (content.length) {
-      const at = outMessages.findLastIndex((message) => message?.role === 'user')
-      if (at >= 0)
-        outMessages = [...outMessages.slice(0, at + 1), { role: 'system', content }, ...outMessages.slice(at + 1)]
+      // Official presets anchor to the first user turn: callers resend history
+      // without this injected block, so a tail position shifts every turn and
+      // breaks the cache prefix from that point on. Zero templates keep the
+      // caller-visible tail placement.
+      const user = zero ? outMessages.findLastIndex((message) => message?.role === 'user') : firstUserIndex(outMessages)
+      outMessages = insertSystemAfterUser(outMessages, user, content)
     }
   }
   if (midSystem) {
@@ -2189,18 +2236,30 @@ export function applyCrsUnofficialPersona(
   } = {},
 ) {
   if (!body || typeof body !== 'object') return body
-  if (!forceConfigured && (officialClient || isOfficialClaudeCodeTraffic(headers || {}, body))) return body
-  const fromFile = routingFile ? personaOptionsFromRoutingFile(routingFile) : null
+  // Looking like Claude Code is not passthrough. The handler sets officialClient
+  // only when routing.compatibility.official_cc_passthrough is on.
+  if (!forceConfigured && officialClient) return body
+  let fromFile = null
+  let fileSettings = personaTemplateSettingsFallback()
+  let routing = null
+  if (routingFile) {
+    try {
+      routing = readJsonParsedCached(routingFile)
+      if (routing) {
+        fromFile = personaOptionsFromRouting(routing)
+        fileSettings = personaTemplateSettingsFromRouting(routing)
+      } else {
+        fromFile = { mode: DEFAULT_PERSONA_MODE, park: DEFAULT_PERSONA_PARK, agent: DEFAULT_PERSONA_AGENT }
+      }
+    } catch {
+      routing = null
+      fromFile = { mode: DEFAULT_PERSONA_MODE, park: DEFAULT_PERSONA_PARK, agent: DEFAULT_PERSONA_AGENT }
+      fileSettings = personaTemplateSettingsFallback()
+    }
+  }
   const resolved = normalizePersonaMode(mode ?? fromFile?.mode)
   // Read the caller's agent prompt before stripLeakySystem drops it as known official text.
   const rawCallerAgent = extractCallerAgentPrompt(body.system)
-  const fileSettings = personaTemplateSettingsFromRoutingFile(routingFile)
-  let routing = null
-  try {
-    routing = routingFile ? JSON.parse(fs.readFileSync(routingFile, 'utf8')) : null
-  } catch {
-    routing = null
-  }
   const resolvedEntrypoint =
     entrypoint === 'cli' || entrypoint === 'sdk-cli' ? entrypoint : ccEntrypointFromRouting(routing)
   const hopPreset = mode != null ? personaPresetFromHopMode(mode) : null

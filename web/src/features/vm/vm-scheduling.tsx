@@ -3,7 +3,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query'
 import type { Vm, VmQuotaOverride, VmQuotaView } from '@/types/panel-vm'
 import { SlidersHorizontal } from 'lucide-react'
 import { toast } from 'sonner'
-import { patchVm, type VmPatch } from '@/lib/api'
+import { api, patchVm, type VmPatch } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import { isCodexVm } from '@/lib/vm-kind'
 import { seatTitle } from '@/lib/vm-status'
@@ -89,9 +89,15 @@ const ALL_DAYS = [0, 1, 2, 3, 4, 5, 6]
 const HHMM = /^([01]\d|2[0-3]):[0-5]\d$/
 const DAY_LABELS = ['日', '一', '二', '三', '四', '五', '六']
 
+const QUOTA_THRESHOLDS = [
+  { key: 'limit_5h', block: 'block_on_5h', exact: 'tenant_exact_5h', window: '5h', label: '5h 闸线', desc: '5h 用量到这里写成受限并切号' },
+  { key: 'limit_7d', block: 'block_on_7d', exact: 'tenant_exact_7d', window: '7d', label: '7d 闸线', desc: '7d 用量到这里写成受限并切号' },
+] as const
+type QuotaThreshold = (typeof QUOTA_THRESHOLDS)[number]['key']
+type QuotaBlock = (typeof QUOTA_THRESHOLDS)[number]['block']
+
 const QUOTA_FIELDS: { key: QuotaKey; label: string; desc: string }[] = [
-  { key: 'limit_5h', label: '5h 闸线', desc: '5h 用量到这里写成受限并切号' },
-  { key: 'limit_7d', label: '7d 闸线', desc: '7d 用量到这里写成受限并切号' },
+  ...QUOTA_THRESHOLDS,
   { key: 'block_on_5h', label: '5h 闸生效', desc: '关掉后不按 5h 拦截' },
   { key: 'block_on_7d', label: '7d 闸生效', desc: '关掉后不按 7d 拦截' },
   {
@@ -102,6 +108,7 @@ const QUOTA_FIELDS: { key: QuotaKey; label: string; desc: string }[] = [
 ]
 
 const LEVELS = Array.from({ length: 10 }, (_, i) => i + 1)
+const RATIO_OPTIONS = RATIO_STEPS.map((p): [number, string] => [p, `${p}%`])
 
 function isRatio(key: QuotaKey) {
   return key === 'limit_5h' || key === 'limit_7d'
@@ -246,9 +253,7 @@ function patchOf(vm: Vm, draft: Draft): VmPatch {
 }
 
 function overrideCount(vm: Vm): number {
-  const quota = Object.values(vm.quota_override || {}).filter(
-    (v) => v != null
-  ).length
+  const quota = QUOTA_FIELDS.filter(({ key }) => vm.quota_override?.[key] != null).length
   return (
     quota +
     Number(vm.session_slots_override === true) +
@@ -294,7 +299,7 @@ function Tile({
 }
 
 /**
- * VM 内的「调度」块：席位、并发、RPM、调度等级与配额闸的生效值；
+ * VM 内的「调度」块：席位、并发、RPM、调度优先级与配额闸的生效值；
  * 本槽覆盖的项高亮，悬停看全局值，一个弹窗改全部。
  */
 export function VmSchedulingBlock({
@@ -319,7 +324,7 @@ export function VmSchedulingBlock({
   const policy = vm.quota_policy
   const quotaOverride = vm.quota_override || {}
   const level = Number(vm.schedule_level)
-  const canEdit = useVmPerms().admin
+  const perms = useVmPerms()
 
   return (
     <div className='space-y-2 rounded-md border border-primary/30 bg-primary/5 px-2.5 py-2'>
@@ -335,7 +340,11 @@ export function VmSchedulingBlock({
             {custom ? `本槽覆盖 ${custom} 项` : '全部跟随全局'}
           </div>
         </div>
-        {canEdit ? <VmSchedulingEditor vm={vm} /> : null}
+        {perms.admin ? (
+          <VmSchedulingEditor vm={vm} />
+        ) : perms.quotaThresholds && !codex && vm.quota_inherited ? (
+          <VmQuotaThresholdEditor vm={vm} inherited={vm.quota_inherited} />
+        ) : null}
       </div>
 
       {codex ? null : (
@@ -413,18 +422,16 @@ export function VmSchedulingBlock({
             }
           />
         ) : null}
-        {!codex ? (
-          <Tile
-            label='调度等级'
-            value={
-              Number.isInteger(level)
-                ? `${level} 级 · ${vm.schedule_level_mode === 'manual' ? '手动' : '自动'}`
-                : '—'
-            }
-            own={vm.schedule_level_mode === 'manual'}
-            title='等级高的 VM 先开席位；自动模式按 7D 重置倒计时算'
-          />
-        ) : null}
+        <Tile
+          label='调度优先级'
+          value={
+            Number.isInteger(level) && level >= 1 && level <= 10
+              ? `${level} · ${vm.schedule_level_mode === 'manual' ? '手动' : '自动'}`
+              : '—'
+          }
+          own={vm.schedule_level_mode === 'manual'}
+          title='数值越大越优先；自动模式按 7D 重置倒计时计算'
+        />
         <Tile
           label='工作时段'
           value={
@@ -513,6 +520,156 @@ function KnobRow({
       </div>
       {own ? children : null}
     </div>
+  )
+}
+
+type ThresholdDraft = Pick<Draft['quota'], QuotaThreshold>
+type TenantQuotaPatch = Partial<Record<QuotaThreshold, number | null> & Record<QuotaBlock, true>>
+
+function thresholdChanged(before: ThresholdDraft[QuotaThreshold], current: ThresholdDraft[QuotaThreshold]) {
+  return before.own !== current.own || (current.own && before.value !== current.value)
+}
+
+function VmQuotaThresholdEditor({
+  vm,
+  inherited,
+}: {
+  vm: Vm
+  inherited: VmQuotaView
+}) {
+  const qc = useQueryClient()
+  const [draft, setDraft] = useState<{
+    before: ThresholdDraft
+    current: ThresholdDraft
+    enable: Partial<Record<QuotaBlock, boolean>>
+  } | null>(null)
+  const save = useMutation({
+    mutationFn: (body: TenantQuotaPatch) =>
+      api(`/api/panel/vms/${encodeURIComponent(vm.id)}/quota-thresholds`, {
+        method: 'PATCH',
+        body: JSON.stringify(body),
+      }),
+    onSuccess: async () => {
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: vmQueryOptions(vm.id).queryKey }),
+        qc.invalidateQueries({ queryKey: vmsListQueryOptions().queryKey }),
+      ])
+      setDraft(null)
+      toast.success('调用闸线已更新')
+    },
+    onError: (error: Error) => toast.error(error.message || '更新失败'),
+  })
+  const pending = save.isPending
+
+  const submit = () => {
+    if (!draft) return
+    const body: TenantQuotaPatch = {}
+    for (const { key, block } of QUOTA_THRESHOLDS) {
+      const before = draft.before[key]
+      const current = draft.current[key]
+      if (thresholdChanged(before, current)) {
+        body[key] = current.own ? Number(current.value) / 100 : null
+      }
+      if (draft.enable[block]) body[block] = true
+    }
+    if (Object.keys(body).length) save.mutate(body)
+    else setDraft(null)
+  }
+
+  return (
+    <>
+      <Button
+        size='sm'
+        className='h-7 shrink-0 gap-1 px-2.5 text-xs shadow-sm'
+        onClick={() => {
+          const quota = draftOf(vm).quota
+          setDraft({ before: quota, current: quota, enable: {} })
+        }}
+      >
+        <SlidersHorizontal className='size-3.5' aria-hidden />
+        调用闸线
+      </Button>
+      <Dialog
+        open={draft !== null}
+        onOpenChange={(open) => !open && !pending && setDraft(null)}
+      >
+        {draft ? (
+          <DialogContent className='max-h-[88vh] overflow-y-auto sm:max-w-2xl'>
+            <DialogHeader>
+              <DialogTitle>调用闸线 · {vm.name || vm.id}</DialogTitle>
+              <DialogDescription>
+                保存本槽闸线时会同时开启对应闸线。已启用的闸线达到设定值后暂停接收新请求。「跟随」使用默认百分比。
+              </DialogDescription>
+            </DialogHeader>
+            <div className='grid gap-2 sm:grid-cols-2'>
+              {QUOTA_THRESHOLDS.map(({ key, block, exact, window, label }) => {
+                const current = draft.current[key]
+                const customChanged = current.own && thresholdChanged(draft.before[key], current)
+                const exactEnabled = vm.quota_override?.[exact] === true
+                const update = (next: Partial<typeof current>) =>
+                  setDraft({
+                    ...draft,
+                    current: {
+                      ...draft.current,
+                      [key]: { ...current, ...next },
+                    },
+                  })
+                return (
+                  <div key={key} className='space-y-2'>
+                    <KnobRow
+                      label={label}
+                      inheritedText={fmtQuota(key, inherited[key])}
+                      own={current.own}
+                      onOwnChange={(own) => update({ own })}
+                      disabled={pending}
+                    >
+                      <ChipGroup
+                        label={label}
+                        value={Number(current.value)}
+                        options={withCurrent(RATIO_OPTIONS, Number(current.value))}
+                        onChange={(value) => update({ value })}
+                        disabled={pending}
+                      />
+                    </KnobRow>
+                    {exactEnabled || customChanged ? (
+                      <p className='px-1 text-xs text-muted-foreground'>
+                        {exactEnabled ? `${window} 闸线已启用` : `保存后启用 ${window} 闸线`}
+                      </p>
+                    ) : (
+                      <Button
+                        type='button'
+                        size='sm'
+                        variant={draft.enable[block] ? 'secondary' : 'outline'}
+                        aria-pressed={draft.enable[block] === true}
+                        disabled={pending}
+                        onClick={() => setDraft({
+                          ...draft,
+                          enable: { ...draft.enable, [block]: !draft.enable[block] },
+                        })}
+                      >
+                        {draft.enable[block] ? `保存后启用 ${window} 闸线` : `启用 ${window} 闸线`}
+                      </Button>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+            <DialogFooter>
+              <Button
+                variant='outline'
+                disabled={pending}
+                onClick={() => setDraft(null)}
+              >
+                取消
+              </Button>
+              <Button disabled={pending} onClick={submit}>
+                {pending ? '保存中…' : '保存'}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        ) : null}
+      </Dialog>
+    </>
   )
 }
 
@@ -732,36 +889,33 @@ export function VmSchedulingEditor({ vm }: { vm: Vm }) {
                   disabled={pending}
                 />
               </KnobRow>
-              {!codex ? (
-                <div className='space-y-2 rounded-lg border p-3'>
-                  <div className='space-y-0.5'>
-                    <Label>调度等级</Label>
-                    <p className='text-[11px] leading-4 text-muted-foreground'>
-                      等级高的 VM 先开新席位，同等级才看开席策略。自动 = 按 7D
-                      重置倒计时算（1–7）；手动 1–10。
-                    </p>
-                  </div>
-                  <ChipGroup
-                    label='调度等级'
-                    value={draft.level}
-                    options={[
-                      [
-                        'auto',
-                        vm.schedule_level_mode === 'auto' &&
-                        Number.isInteger(Number(vm.schedule_level))
-                          ? `自动（当前 ${vm.schedule_level}）`
-                          : '自动',
-                      ] as ['auto' | number, string],
-                      ...LEVELS.map((n): ['auto' | number, string] => [
-                        n,
-                        String(n),
-                      ]),
-                    ]}
-                    onChange={(level) => setDraft({ ...draft, level })}
-                    disabled={pending}
-                  />
+              <div className='space-y-2 rounded-lg border p-3'>
+                <div className='space-y-0.5'>
+                  <Label>调度优先级</Label>
+                  <p className='text-[11px] leading-4 text-muted-foreground'>
+                    数值越大越优先。自动按 7D 重置倒计时计算（1–7）；手动 1–10。
+                  </p>
                 </div>
-              ) : null}
+                <ChipGroup
+                  label='调度优先级'
+                  value={draft.level}
+                  options={[
+                    [
+                      'auto',
+                      vm.schedule_level_mode === 'auto' &&
+                      Number.isInteger(Number(vm.schedule_level))
+                        ? `自动（当前 ${vm.schedule_level}）`
+                        : '自动',
+                    ] as ['auto' | number, string],
+                    ...LEVELS.map((level): ['auto' | number, string] => [
+                      level,
+                      String(level),
+                    ]),
+                  ]}
+                  onChange={(level) => setDraft({ ...draft, level })}
+                  disabled={pending}
+                />
+              </div>
               <KnobRow
                 label='工作时段'
                 desc='只在此时段内接单，窗口外此号不参与调度（模拟真人作息）。开始晚于结束 = 跨夜班次；时区跟随槽位。'
@@ -887,10 +1041,7 @@ export function VmSchedulingEditor({ vm }: { vm: Vm }) {
                             label={label}
                             value={Number(k.value)}
                             options={withCurrent(
-                              RATIO_STEPS.map((p): [number, string] => [
-                                p,
-                                `${p}%`,
-                              ]),
+                              RATIO_OPTIONS,
                               Number(k.value)
                             )}
                             onChange={(value) => setQuota(key, { value })}

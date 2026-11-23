@@ -53,6 +53,57 @@ test('summarizeBody counts messages and tools', () => {
   assert.equal(s.system_len, 10)
 })
 
+test('summarizeBody measures a namespaced tool catalog beyond its top level (#1310)', () => {
+  const filler = 'Synthetic catalog documentation. '.repeat(4)
+  const members = (count, from) =>
+    Array.from({ length: count }, (_, i) => ({
+      type: 'function',
+      name: `fn_${from + i}`,
+      description: filler,
+    }))
+  const body = {
+    model: 'gpt-6.2-astra',
+    input: [{ role: 'user', content: 'go' }],
+    tools: [
+      { type: 'function', name: 'exec_command', description: 'top level' },
+      { type: 'namespace', name: 'ns_a', tools: members(30, 0) },
+      { type: 'namespace', name: 'ns_b', tools: members(20, 30) },
+      { type: 'web_search' },
+    ],
+  }
+  const s = summarizeBody(body)
+  // The top-level count alone cannot tell 4 entries from 1400 callable functions.
+  assert.equal(s.tools_count, 4)
+  assert.equal(s.tool_functions_count, 51)
+  assert.equal(s.tools_bytes, Buffer.byteLength(JSON.stringify(body.tools)))
+  assert.equal(s.tools_deferred_count, 0)
+  assert.equal(s.tools_search_declared, false)
+})
+
+test('summarizeBody records a caller that already defers loading (#1310)', () => {
+  const s = summarizeBody({
+    model: 'gpt-6.2-astra',
+    tools: [
+      { type: 'namespace', name: 'ns', tools: [{ type: 'function', name: 'a', defer_loading: true }] },
+      { type: 'function', name: 'b', defer_loading: true },
+      { type: 'function', name: 'c' },
+      { type: 'tool_search' },
+    ],
+  })
+  assert.equal(s.tool_functions_count, 3)
+  assert.equal(s.tools_deferred_count, 2)
+  assert.equal(s.tools_search_declared, true)
+})
+
+test('summarizeBody leaves tool metrics at zero without a catalog (#1310)', () => {
+  const s = summarizeBody({ model: 'claude-haiku-4-5-20251001', messages: [{ role: 'user', content: 'hi' }] })
+  assert.equal(s.tools_count, 0)
+  assert.equal(s.tool_functions_count, 0)
+  assert.equal(s.tools_bytes, 0)
+  assert.equal(s.tools_deferred_count, 0)
+  assert.equal(s.tools_search_declared, false)
+})
+
 test('normal mode writes jsonl without body', () => {
   const store = tmpStore('normal')
   const ctx = store.start(
@@ -780,6 +831,35 @@ test('gate stats count every inbound request and keep the stored verdict', () =>
   assert.deepEqual(blockBy, { 'distill:Memory-stage-one extractor': 1, 'refusal:device': 1 })
 })
 
+test('risk audit counts only routed hops and looks up upstream 400s by original request', () => {
+  const store = tmpStore()
+  const verdict = gateVerdict({ kind: 'pass', by: 'jev', route: { kind: 'pool', target: 'pool_12345678', score: 0.6 } })
+  const original = logOne(store, {
+    status: 200,
+    upstream_status: 200,
+    audit_upstream_400: true,
+    audit_upstream_400_message: 'Provider rejected request shape',
+    attempt_count: 1,
+    intercept: verdict,
+    inbound_device_id: 'request-device',
+    session_id: 'request-session',
+  })
+  logOne(store, { status: 503, attempt_count: 0, intercept: verdict })
+  logOne(store, { status: 400, error_code: 'invalid_request' })
+  logOne(store, { status: 400, upstream_status: 400, attempt_count: 1, error_code: 'invalid_kernel_request' })
+  assert.deepEqual(store.protocolEntryStats({ since: '1970-01-01T00:00:00.000Z' }).routes, [
+    { kind: 'pool', target: 'pool_12345678', count: 1 },
+  ])
+  const view = new UsageLogsView(store.db)
+  const requests = view.listBatch({ upstream_400: true }).logs
+  assert.equal(requests.length, 1)
+  assert.equal(requests[0].upstreamStatus, 400)
+  assert.equal(requests[0].upstream400Message, 'Provider rejected request shape')
+  assert.equal(requests[0].inboundDeviceId, 'request-device')
+  assert.equal(requests[0].clientSessionId, 'request-session')
+  assert.equal(view.listBatch({ request_id: original.request_id }).logs[0].id, requests[0].id)
+})
+
 test('queryNormal filters + pagination + total', () => {
   const store = tmpStore('normal')
   logOne(store, { api_key_id: 'key_a', model: 'm1', input_tokens: 10, output_tokens: 5 })
@@ -862,7 +942,7 @@ test('windowStats treats 429 quota/rate-limit as SLA success', () => {
   assert.equal(w.error_collection.by_class[0].id, 'rate_limit')
 })
 
-test('windowStats treats ingress auth failures as SLA success like sub2api', () => {
+test('windowStats treats ingress auth failures as SLA success', () => {
   const store = tmpStore('normal')
   logOne(store, { status: 200, first_token_ms: 80, duration_ms: 100, model: 'claude-sonnet-5' })
   logOne(store, {
@@ -887,7 +967,7 @@ test('windowStats treats ingress auth failures as SLA success like sub2api', () 
   assert.equal(w.error_collection.by_class[0].owner, 'client')
 })
 
-test('windowStats ignores client abort like sub2api ignore_context_canceled', () => {
+test('windowStats excludes client aborts from error counts', () => {
   const store = tmpStore('normal')
   logOne(store, { status: 200, first_token_ms: 80, duration_ms: 100, model: 'claude-sonnet-5' })
   logOne(store, { status: 200, error_code: 'client_cancelled', error_message: 'ECONNRESET', model: 'claude-sonnet-5' })

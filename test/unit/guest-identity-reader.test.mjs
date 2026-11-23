@@ -17,6 +17,8 @@ const guestOutput = [
   'guest-machine',
   'UTC',
   'en_US.UTF-8',
+  '{}',
+  '24.04',
   '',
 ].join('\0')
 
@@ -162,6 +164,7 @@ const guestOutputWithHardware = [
   'UTC',
   'en_US.UTF-8',
   hardwareJson,
+  '24.04',
   '',
 ].join('\0')
 
@@ -201,6 +204,7 @@ test('invalid optional hardware JSON does not fail identity collection', async (
     'UTC',
     'en_US.UTF-8',
     '{',
+    '24.04',
     '',
   ].join('\0')
   const result = await readGuestIdentity({ vmId: 'vm-01' }, '', { run: async () => ({ stdout }) })
@@ -209,8 +213,9 @@ test('invalid optional hardware JSON does not fail identity collection', async (
   assert.equal(result.body.identity.hardware, undefined)
 })
 
-test('READ_IDENTITY hardware probes survive missing optional commands', async () => {
-  const script = `hostname() { return 127; }\nnproc() { return 127; }\n${READ_IDENTITY}`
+test('READ_IDENTITY hardware probes survive missing optional commands', async (t) => {
+  const prefix = slotComputerFixture(t, { cpuMax: 'max 100000', memoryMax: 'max' })
+  const script = `${prefix}hostname() { return 127; }\nnproc() { return 127; }\n${READ_IDENTITY}`
   const result = await readGuestIdentity({ vmId: 'vm-04', vm: { runtime: { type: 'docker' } } }, '', {
     run: (_command, args, opts) => {
       assert.equal(args.at(-1), READ_IDENTITY)

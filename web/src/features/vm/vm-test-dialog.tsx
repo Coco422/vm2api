@@ -11,10 +11,12 @@ import {
 import { SlotIdentity } from '@/components/platform-chip'
 import { VmTestPanel } from '@/features/vm/detail-test-tab'
 import { useVmTestChat } from '@/features/vm/use-vm-test-chat'
+import { useVmPerms } from '@/features/vm/vm-perms'
 import { VmTestSchedule } from '@/features/vm/vm-test-schedule'
 
 function TestBody({ vm }: { vm: Vm }) {
   const chat = useVmTestChat(vm)
+  const perms = useVmPerms()
   return (
     <VmTestPanel
       {...chat}
@@ -22,7 +24,12 @@ function TestBody({ vm }: { vm: Vm }) {
       credType={credTypeOf(vm)}
       isCodex={isCodexVm(vm)}
       dataplane={vm.resolved_dataplane}
-      schedule={<VmTestSchedule key={vm.id} vm={vm} {...chat} />}
+      cragKernelVersion={vm.resolved_crag_kernel_version}
+            schedule={
+        perms.admin ? (
+          <VmTestSchedule key={vm.id} vm={vm} {...chat} />
+        ) : undefined
+      }
     />
   )
 }

@@ -2,7 +2,7 @@ import { extractApiKey, extractPanelToken, verifyPanelSession, timingSafeEqualSt
 import { makeError, ErrorType, ErrorCode } from './errors.mjs'
 
 /** Panel sessions are accepted only on panel routes; inference must pass managed-key gates. */
-export function createRequestAuth({ cfg, apiKeyStore, panelUsers, allowRate, json }) {
+export function createRequestAuth({ cfg, apiKeyStore, panelUsers, allowRate, json, validateManagedKey, resolveBuyer }) {
   function rejectAuth(req, res, error) {
     req.authError = {
       code: error?.body?.error?.code || ErrorCode.INVALID_API_KEY,
@@ -13,10 +13,16 @@ export function createRequestAuth({ cfg, apiKeyStore, panelUsers, allowRate, jso
     return false
   }
 
-  function authenticate(req, res, allowPanelSession) {
+  function rejectBuyer(res, optionalBuyer) {
+    if (!optionalBuyer) json(res, 403, { ok: false, error: { code: 'shop_login_required', message: 'Admin login required' } })
+    return false
+  }
+
+  function authenticate(req, res, allowPanelSession, { keyGate = true, buyer = false, optionalBuyer = false } = {}) {
     req.presentedApiKey = extractApiKey(req)
     const token = allowPanelSession ? extractPanelToken(req) || req.presentedApiKey : req.presentedApiKey
     if (!token) {
+      if (buyer) return rejectBuyer(res, optionalBuyer)
       return rejectAuth(
         req,
         res,
@@ -33,6 +39,12 @@ export function createRequestAuth({ cfg, apiKeyStore, panelUsers, allowRate, jso
     // Panel session
     const session = allowPanelSession ? verifyPanelSession(token) : null
     if (session) {
+      const rec = panelUsers.getByUsername(session.user)
+      if (buyer) {
+        const owner = (rec?.role || session.role) === 'admin' ? resolveBuyer?.(session, rec) : null
+        if (!owner) return rejectBuyer(res, optionalBuyer)
+        req.panelBuyerOwner = owner
+      }
       if (!allowRate('panel:' + session.user)) {
         return rejectAuth(
           req,
@@ -47,14 +59,14 @@ export function createRequestAuth({ cfg, apiKeyStore, panelUsers, allowRate, jso
       }
       req.panelUser = session.user
       req.panelRole = session.role || panelUsers.getByUsername(session.user)?.role || 'user'
-      const rec = panelUsers.getByUsername(session.user)
       req.panelUserId = rec?.id || null
       req.panelVmCreateQuota = rec?.vm_create_quota ?? 0
       return true
     }
+    if (buyer) return rejectBuyer(res, optionalBuyer)
     // Master env API key — unlimited admin
     if (timingSafeEqualStr(token, cfg.api_key)) {
-      if (!allowRate(token)) {
+      if (keyGate && !allowRate(token)) {
         return rejectAuth(
           req,
           res,
@@ -86,7 +98,9 @@ export function createRequestAuth({ cfg, apiKeyStore, panelUsers, allowRate, jso
         }),
       )
     }
-    const gate = apiKeyStore.canAccept(managed.record)
+    const keyError = validateManagedKey?.(req, managed.record)
+    if (keyError) return rejectAuth(req, res, keyError)
+    const gate = keyGate ? apiKeyStore.canAccept(managed.record) : { ok: true }
     if (!gate.ok) {
       const type =
         gate.status === 429
@@ -106,7 +120,7 @@ export function createRequestAuth({ cfg, apiKeyStore, panelUsers, allowRate, jso
         }),
       )
     }
-    if (!allowRate(token)) {
+    if (keyGate && !allowRate(token)) {
       return rejectAuth(
         req,
         res,
@@ -124,7 +138,7 @@ export function createRequestAuth({ cfg, apiKeyStore, panelUsers, allowRate, jso
   }
 
   return {
-    requireAuth: (req, res) => authenticate(req, res, true),
-    requireProtocolAuth: (req, res) => authenticate(req, res, false),
+    requireAuth: (req, res, options) => authenticate(req, res, true, options),
+    requireProtocolAuth: (req, res, options) => authenticate(req, res, false, options),
   }
 }

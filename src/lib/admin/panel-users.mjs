@@ -6,7 +6,9 @@
  */
 
 import crypto from 'node:crypto'
-import { resolveStoreDb } from '../db/database.mjs'
+import { twoFactorKey } from '../core/panel-2fa.mjs'
+import { SettingsRepo } from '../db/repos/settings-repo.mjs'
+import { resolveStoreDb, withTransaction } from '../db/database.mjs'
 import { UsersRepo } from '../db/repos/users-repo.mjs'
 import { clampVmCreateQuota } from './resource-owner.mjs'
 import { reclaimAssignedVms } from '../vm/vm-registry.mjs'
@@ -18,6 +20,9 @@ const SCRYPT_R = 8
 const SCRYPT_P = 1
 const KEYLEN = 32
 const USERNAME_RE = /^[a-zA-Z][a-zA-Z0-9._-]{1,31}$/
+// users.concurrency caps the summed inflight requests of all of a user's keys (api-keys canAccept); 0 = no cap.
+const USER_CONCURRENCY_MIN = 0
+const USER_CONCURRENCY_MAX = 1000
 
 function nowIso() {
   return new Date().toISOString()
@@ -68,7 +73,7 @@ export function verifyPassword(password, stored) {
   }
 }
 
-function assertUsername(username) {
+export function assertUsername(username) {
   const name = normalizeUsername(username)
   if (!USERNAME_RE.test(name)) {
     const err = new Error('用户名为 2–32 位，需字母开头，仅字母数字 . _ -')
@@ -78,7 +83,7 @@ function assertUsername(username) {
   return name
 }
 
-function assertPassword(password) {
+export function assertPassword(password) {
   const pass = String(password ?? '')
   if (pass.length < 8) {
     const err = new Error('密码至少 8 位')
@@ -91,6 +96,15 @@ function assertPassword(password) {
     throw err
   }
   return pass
+}
+
+function assertConcurrency(value) {
+  if (!Number.isInteger(value) || value < USER_CONCURRENCY_MIN || value > USER_CONCURRENCY_MAX) {
+    const err = new Error(`并发须为 ${USER_CONCURRENCY_MIN}–${USER_CONCURRENCY_MAX} 的整数（0 表示不限）`)
+    err.code = 'invalid_concurrency'
+    throw err
+  }
+  return value
 }
 
 function assertRole(role) {
@@ -111,6 +125,7 @@ export function publicUserView(rec) {
     role: rec.role,
     enabled: rec.enabled !== false,
     vm_create_quota: clampVmCreateQuota(rec.vm_create_quota, 0),
+    concurrency: Number(rec.concurrency) || 0,
     created_at: rec.created_at,
     updated_at: rec.updated_at,
     last_login_at: rec.last_login_at || null,
@@ -175,13 +190,14 @@ export class PanelUserStore {
     return publicUserView(next)
   }
 
-  create({ username, password, role = 'user', enabled = true, vm_create_quota = 0 } = {}) {
+  create({ username, password, role = 'user', enabled = true, vm_create_quota = 0, concurrency } = {}) {
     const name = assertUsername(username)
     if (this.repo.getByUsername(name)) {
       const err = new Error('用户名已存在')
       err.code = 'username_exists'
       throw err
     }
+    const limit = concurrency == null ? null : assertConcurrency(concurrency)
     const rec = {
       id: crypto.randomUUID(),
       username: name,
@@ -189,6 +205,7 @@ export class PanelUserStore {
       role: assertRole(role),
       enabled: enabled !== false,
       vm_create_quota: clampVmCreateQuota(vm_create_quota, 0),
+      concurrency: limit,
       created_at: nowIso(),
       updated_at: nowIso(),
       last_login_at: null,
@@ -234,6 +251,10 @@ export class PanelUserStore {
       next.vm_create_quota = clampVmCreateQuota(patch.vm_create_quota, rec.vm_create_quota || 0)
     }
 
+    if (patch.concurrency != null) {
+      next.concurrency = assertConcurrency(patch.concurrency)
+    }
+
     next.updated_at = nowIso()
     return this.repo.update(next)
   }
@@ -253,6 +274,10 @@ export class PanelUserStore {
     }
     // Validate deletion first; a failed slot write must leave the user available for retry.
     if (this.projectRoot) reclaimAssignedVms(this.projectRoot, new Set([rec.id]))
-    return this.repo.remove(id)
+    return withTransaction(this.db, () => {
+      const removed = this.repo.remove(id)
+      if (removed) new SettingsRepo(this.db).remove(twoFactorKey(rec.username))
+      return removed
+    })
   }
 }

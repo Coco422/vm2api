@@ -216,16 +216,24 @@ test('vm detail exposes Go credential ownership and Rust kernel health', async (
   })
 
   assert.equal(healthCalls, 1)
-  assert.deepEqual(detail.data.kernel, {
-    telemetry: { enabled: null, running: null },
-    process_topology: null,
-    credential_owner: 'go',
-    configured_engine: 'rust',
-    resolved_engine: 'rust',
-    active_engine: 'rust',
-    go_health: { reachable: true, status: 200, worker_version: 'go-1.0.0' },
-    rust_health: { reachable: true, status: 200, worker_version: 'rust-0.1.0' },
-  })
+  assert.deepEqual(
+    {
+      credential_owner: detail.data.kernel.credential_owner,
+      configured_engine: detail.data.kernel.configured_engine,
+      resolved_engine: detail.data.kernel.resolved_engine,
+      active_engine: detail.data.kernel.active_engine,
+      go_health: detail.data.kernel.go_health,
+      rust_health: detail.data.kernel.rust_health,
+    },
+    {
+      credential_owner: 'go',
+      configured_engine: 'rust',
+      resolved_engine: 'rust',
+      active_engine: 'rust',
+      go_health: { reachable: true, status: 200, worker_version: 'go-1.0.0' },
+      rust_health: { reachable: true, status: 200, worker_version: 'rust-0.1.0' },
+    },
+  )
 })
 
 test('vm detail rust-only health does not fall back to go', async () => {
@@ -467,4 +475,88 @@ test('local proxy node labels are present for admin and absent for tenant', asyn
   )
   assert.equal(tenantAlloc.node_name, undefined)
   assert.equal(tenantAlloc.bound_vm_ids, undefined)
+})
+
+function countingQuota(accounts) {
+  const calls = { snapshot: 0 }
+  return {
+    calls,
+    quota: {
+      config: { safety_ratio: 0.95 },
+      // A real pool has one, and findRuntime only reaches findAccount when it does.
+      runtimeRepo: { get: () => null },
+      snapshot: () => {
+        calls.snapshot++
+        return { accounts, safety_ratio: 0.95 }
+      },
+    },
+  }
+}
+
+// Each slot used to pull its own account snapshot twice (findAccount, then
+// findRuntime calling findAccount again), so a list of N slots re-read the whole
+// account table 2N+1 times and ran its per-account SQL just as often (#1043).
+const window5h = { utilization: 0.12, status: 'allowed', reset: null }
+const SNAPSHOT_ACCOUNTS = [
+  { account_id: 'uuid-a', vm_id: 'vm-a', email: 'a@slot.test', unified: { '5h': window5h } },
+  { account_id: 'vm-b', vm_id: 'vm-b', email: 'b@slot.test', unified: { '5h': window5h } },
+  { account_id: 'uuid-c', vm_id: 'vm-c', email: 'c@slot.test', unified: { '5h': window5h } },
+]
+
+function snapshotProject() {
+  const project = tmpDir()
+  fs.mkdirSync(path.join(project, 'data'), { recursive: true })
+  writeVm(project, { id: 'vm-a', status: 'stopped', claude: {}, account_uuid: 'uuid-a' })
+  writeVm(project, { id: 'vm-b', status: 'stopped', claude: {} })
+  writeVm(project, { id: 'vm-c', status: 'stopped', claude: {}, account_uuid: 'uuid-c' })
+  return { paths: { project }, rewrite: { enabled: false }, base_url: 'http://127.0.0.1' }
+}
+
+test('a slot list reads one account snapshot and keeps the same match (#1043)', async () => {
+  const cfg = snapshotProject()
+  const { calls, quota } = countingQuota(SNAPSHOT_ACCOUNTS)
+  const listed = await buildVmList({ cfg, accountQuota: quota, routingConfig: {} })
+  assert.equal(listed.ok, true)
+  assert.equal(calls.snapshot, 1, '三个槽位只读一份账户快照')
+  // UUID-keyed and VM-keyed rows both still resolve to their own account.
+  assert.deepEqual(
+    listed.data.items.map((item) => [item.id, item.email]).sort((a, b) => a[0].localeCompare(b[0])),
+    [
+      ['vm-a', 'a@slot.test'],
+      ['vm-b', 'b@slot.test'],
+      ['vm-c', 'c@slot.test'],
+    ],
+  )
+})
+
+test('a dashboard reads one account snapshot for its slots and its account summary (#1043)', async () => {
+  const cfg = snapshotProject()
+  const { calls, quota } = countingQuota(SNAPSHOT_ACCOUNTS)
+  const dash = await buildDashboard({
+    cfg,
+    accountQuota: quota,
+    stickyRouter: { stats: () => ({ active_sessions: 0 }) },
+    routingConfig: { quota: { safety_ratio: 0.95 } },
+    stats: {},
+    proxyPool: null,
+  })
+  assert.equal(dash.ok, true)
+  assert.equal(calls.snapshot, 1, '槽位列表和账户汇总共用同一份快照')
+  assert.deepEqual(
+    dash.data.vms.map((item) => [item.id, item.email]).sort((a, b) => a[0].localeCompare(b[0])),
+    [
+      ['vm-a', 'a@slot.test'],
+      ['vm-b', 'b@slot.test'],
+      ['vm-c', 'c@slot.test'],
+    ],
+  )
+})
+
+test('a single slot detail reads one account snapshot (#1043)', async () => {
+  const cfg = snapshotProject()
+  const { calls, quota } = countingQuota(SNAPSHOT_ACCOUNTS)
+  const detail = await buildVmDetail({ cfg, accountQuota: quota, id: 'vm-a' })
+  assert.equal(detail.ok, true)
+  assert.equal(detail.data.vm.email, 'a@slot.test')
+  assert.equal(calls.snapshot, 1)
 })

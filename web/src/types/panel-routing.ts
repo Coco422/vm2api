@@ -86,6 +86,35 @@ export type RefusalDeviceBlock = {
   source_request_id: string | null
   fingerprint: string | null
   reason: string | null
+  subject_kind: 'device' | 'session'
+  identity_value: string
+  session_id: string | null
+  violations: number
+  expires_at: string | null
+}
+
+export type RiskAuditPolicy = {
+  ban_steps: number[]
+  blocked_tools: { name: string; message: string }[]
+  block_system_prompt_rewrite: boolean
+  upstream_policy_phrases: string[]
+  downgrade_pool: string
+  downgrade_endpoint: string
+  downgrade_model: string
+  route_margin: number
+  model_margin: number
+}
+
+export type RefusalSessionBlock = {
+  session_id: string
+  first_seen_at: string
+  last_seen_at: string
+  hit_count: number
+  source_request_id: string | null
+  account_id: string | null
+  model: string | null
+  preview: string | null
+  reason: string | null
 }
 
 export type RefusalGuardConfig = {
@@ -94,10 +123,15 @@ export type RefusalGuardConfig = {
   /** 80、85、90 或 95。 */
   similarity: number
   device_block_enabled: boolean
+  risk_audit: RiskAuditPolicy
+  /** 独立于 enabled：上游拒答过的会话永久停止转发。 */
+  session_block_enabled: boolean
   count: number
   items: RefusalGuardItem[]
   device_count: number
   devices: RefusalDeviceBlock[]
+  session_count: number
+  sessions: RefusalSessionBlock[]
 }
 
 export type PolicyQuestion = {
@@ -144,6 +178,20 @@ export type JevScopeInventory = {
   accounts: JevScopeAccount[]
 }
 
+export type JevEndpointKey = {
+  number: number
+  masked_key: string
+  key_fingerprint: string
+  retired: boolean
+  status?: string
+  last_http_status?: number | null
+}
+
+export type JevEndpoint = {
+  base_url: string
+  keys: JevEndpointKey[]
+}
+
 /** `GET/PUT /api/panel/jev-intercept`。决策模型与硬正则。密钥只回 api_key_set。 */
 export type JevInterceptConfig = {
   enabled: boolean
@@ -181,6 +229,7 @@ export type JevInterceptConfig = {
   timeout_ms: number
   api_key_set: boolean
   api_key_count: number
+  endpoints?: JevEndpoint[]
   safety_instruction: string
   question_ids: string[]
   question_bank?: PolicyQuestion[]
@@ -228,6 +277,15 @@ export type NotifyWecomConfig = {
   mention_all: boolean
 }
 
+export type NotifyFeishuConfig = {
+  enabled: boolean
+  webhook: string
+  webhook_set?: boolean
+  secret: string
+  secret_set?: boolean
+  clear_secret?: boolean
+}
+
 /** `GET /routing -> notify` 与 `GET /notify -> config` 的脱敏通知配置。 */
 export type NotifyConfig = {
   enabled: boolean
@@ -240,6 +298,7 @@ export type NotifyConfig = {
   events: NotifyEvents
   telegram: NotifyTelegramConfig
   wecom: NotifyWecomConfig
+  feishu: NotifyFeishuConfig
   email?: Record<string, unknown>
 }
 
@@ -253,6 +312,7 @@ export type NotifyStatus = {
     email?: boolean
     telegram?: boolean
     wecom?: boolean
+    feishu?: boolean
     any?: boolean
   }
 }

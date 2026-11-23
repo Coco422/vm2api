@@ -30,6 +30,8 @@ const SCAN_CAP = 2000
 const SUMMARY_SCAN_CAP = 5000
 /** Recent rows mined for distinct filter values / empty-prefix session suggestions. */
 const RECENT_SCAN = 5000
+/** One conversation = the caller's session id; rows without one fall back to the outbound id. */
+const CONVERSATION_KEY_SQL = "COALESCE(NULLIF(session_id, ''), outbound_session_id)"
 const OPTION_LIMIT = 200
 const EXPORT_LIMIT_DEFAULT = 2000
 const EXPORT_LIMIT_MAX = 5000
@@ -225,6 +227,8 @@ export function toUsageLogRow(row, names, chain = []) {
     context1mApplied: row.long_context == null ? null : row.long_context === 1,
     reasoningEffort: row.reasoning_effort ?? null,
     inboundDeviceId: row.inbound_device_id ?? null,
+    upstreamStatus: nullableNum(row.upstream_status),
+    upstream400Message: row.upstream_400_message ?? null,
     jevState: row.jev_state || null,
     errorClass: row.error_class ?? null,
     errorLabel: row.error_label ?? null,
@@ -329,6 +333,8 @@ function buildFilter(filters, defaultMuted) {
   }
   eq('path', filters.endpoint)
   eq('protocol', filters.protocol)
+  if (filters.upstream_400) where.push('upstream_status = 400')
+  eq('request_id', filters.request_id)
   if (filters.account_id) {
     where.push('(account_id = ? OR final_account_id = ?)')
     params.push(filters.account_id, filters.account_id)
@@ -708,7 +714,12 @@ export class UsageLogsView {
       .map((r) => r.sid)
   }
 
-  /** Outbound sessions with a completed request in the last `minutes`. */
+  /**
+   * Conversations with a completed request in the last `minutes`, grouped by the
+   * caller's session_id (falling back to the outbound id). Grouping by outbound id
+   * splits one conversation into many: side requests (title / topic / suggestion
+   * forks) mint their own session id while sharing the main prompt cache.
+   */
   activeSessions({ minutes = 5, limit = 50, owner_user_id = null, now = Date.now() } = {}) {
     const mins = clampInt(minutes, 1, 1440, 5)
     const n = clampInt(limit, 1, 200, 50)
@@ -720,23 +731,35 @@ export class UsageLogsView {
       params.push(...own.params)
     }
     const cond = `WHERE ${where.join(' AND ')}`
-    const total = this.db
-      .prepare(`SELECT COUNT(DISTINCT outbound_session_id) AS n FROM usage_logs ${cond}`)
-      .get(...params).n
+    // "One-off" = a conversation key seen once with no tools: side requests (title /
+    // topic forks) that mint their own session id. Counted apart, never merged.
+    const counts = this.db
+      .prepare(`
+      SELECT COUNT(*) AS total,
+             COALESCE(SUM(CASE WHEN c.requests = 1 AND c.tools = 0 THEN 1 ELSE 0 END), 0) AS one_off
+      FROM (
+        SELECT COUNT(*) AS requests, SUM(IFNULL(has_tools, 0)) AS tools
+        FROM usage_logs ${cond}
+        GROUP BY ${CONVERSATION_KEY_SQL}
+      ) c
+    `)
+      .get(...params)
+    const total = counts.total
     // Aggregate first, then pull the newest row per session by id; SQLite's
     // bare-column-with-MAX shortcut is undefined once MIN() is also present.
     const rows = this.db
       .prepare(`
       WITH s AS (
-        SELECT outbound_session_id AS sid,
+        SELECT ${CONVERSATION_KEY_SQL} AS sid,
                MAX(created_at) AS last_at,
                MIN(created_at) AS first_at,
                COUNT(*) AS requests,
                SUM(IFNULL(input_tokens, 0) + IFNULL(output_tokens, 0) + IFNULL(cache_read_tokens, 0) + IFNULL(cache_creation_tokens, 0)) AS tokens,
-               COALESCE(SUM(total_cost), 0) AS cost
+               COALESCE(SUM(total_cost), 0) AS cost,
+               CASE WHEN COUNT(*) = 1 AND SUM(IFNULL(has_tools, 0)) = 0 THEN 1 ELSE 0 END AS one_off
         FROM usage_logs ${cond}
-        GROUP BY outbound_session_id
-        ORDER BY last_at DESC
+        GROUP BY ${CONVERSATION_KEY_SQL}
+        ORDER BY one_off ASC, last_at DESC
         LIMIT ?
       )
       SELECT s.*, l.session_id AS client_session_id, l.user_id, l.api_key_id, l.vm_id, l.model, l.status, l.duration_ms,
@@ -744,10 +767,10 @@ export class UsageLogsView {
       FROM s
       JOIN usage_logs l ON l.id = (
         SELECT id FROM usage_logs
-        WHERE outbound_session_id = s.sid AND created_at = s.last_at${own.sql ? ` AND ${own.sql}` : ''}
+        WHERE ${CONVERSATION_KEY_SQL} = s.sid AND created_at = s.last_at${own.sql ? ` AND ${own.sql}` : ''}
         ORDER BY id DESC LIMIT 1
       )
-      ORDER BY s.last_at DESC
+      ORDER BY s.one_off ASC, s.last_at DESC
     `)
       .all(...params, n, ...own.params)
     const names = lookupNames(this.db, {
@@ -759,8 +782,10 @@ export class UsageLogsView {
     return {
       minutes: mins,
       total: num(total),
+      oneOffTotal: num(counts.one_off),
       sessions: rows.map((r) => ({
         sessionId: r.sid,
+        oneOff: r.one_off === 1,
         clientSessionId: r.client_session_id ?? null,
         userName: r.user_id ? (names.users.get(r.user_id) ?? null) : null,
         keyName: r.api_key_id ? (names.keys.get(r.api_key_id) ?? null) : null,
@@ -802,8 +827,16 @@ export class UsageLogsView {
                COALESCE(SUM(CASE WHEN ${ERROR_PRED} THEN 1 ELSE 0 END), 0) AS errors,
                COALESCE(SUM(total_cost), 0) AS cost,
                COALESCE(SUM(actual_cost), 0) AS actual_cost,
+               COALESCE(SUM(input_tokens), 0) AS input_tokens,
+               COALESCE(SUM(output_tokens), 0) AS output_tokens,
+               COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+               COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
+               COALESCE(SUM(cache_creation_5m_tokens), 0) AS cache_creation_5m_tokens,
+               COALESCE(SUM(cache_creation_1h_tokens), 0) AS cache_creation_1h_tokens,
+               COALESCE(SUM(${PROMPT_TOKENS_SQL}), 0) AS prompt_tokens,
                AVG(duration_ms) AS avg_duration_ms,
-               COUNT(DISTINCT outbound_session_id) AS sessions
+               AVG(first_token_ms) AS avg_ttft_ms,
+               COUNT(DISTINCT CASE WHEN outbound_session_id IS NOT NULL THEN ${CONVERSATION_KEY_SQL} END) AS sessions
         FROM usage_logs WHERE ${where.join(' AND ')}
       `)
         .get(...params)
@@ -814,6 +847,11 @@ export class UsageLogsView {
     const active = agg(now - 5 * 60_000, now + 1)
     const lastMinute = agg(now - 60_000, now + 1)
     const avg = (v) => (v == null ? null : Math.round(Number(v)))
+    const input = num(today.input_tokens)
+    const output = num(today.output_tokens)
+    const cacheRead = num(today.cache_read_tokens)
+    const cacheCreation = num(today.cache_creation_tokens)
+    const prompt = num(today.prompt_tokens)
     return {
       activeSessions: num(active.sessions),
       rpm: num(lastMinute.requests),
@@ -821,7 +859,16 @@ export class UsageLogsView {
       todayCost: num(today.cost),
       todayActualCost: num(today.actual_cost),
       todayErrors: num(today.errors),
+      todayTokens: input + output + cacheRead + cacheCreation,
+      todayInputTokens: input,
+      todayOutputTokens: output,
+      todayCacheReadTokens: cacheRead,
+      todayCacheCreationTokens: cacheCreation,
+      todayCacheCreation5mTokens: num(today.cache_creation_5m_tokens),
+      todayCacheCreation1hTokens: num(today.cache_creation_1h_tokens),
+      todayCacheHitRate: prompt > 0 ? Math.min(1, cacheRead / prompt) : 0,
       todayAvgDurationMs: avg(today.avg_duration_ms),
+      todayAvgTtftMs: avg(today.avg_ttft_ms),
       yesterdayRequests: num(yesterday.requests),
       yesterdayCost: num(yesterday.cost),
       yesterdayAvgDurationMs: avg(yesterday.avg_duration_ms),

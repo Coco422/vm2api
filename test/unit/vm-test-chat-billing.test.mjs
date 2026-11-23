@@ -115,6 +115,8 @@ test('runVmTestChat loopbacks /v1/messages with x-kin-vm pin and never calls a w
   assert.equal(calls[0].body.stream, true)
   assert.match(String(calls[0].body.messages[0].content || ''), /hello/)
   assert.equal(calls[0].body.system, undefined)
+  assert.deepEqual(calls[0].body.thinking, { type: 'disabled' })
+  assert.equal(calls[0].body.max_tokens, 64)
   assert.equal(result.official_cc_inference, 'cli-hop')
   assert.ok(result.log.some((l) => /\/v1\/messages/.test(l.message)))
   assert.ok(!result.log.some((l) => /Go slot worker|streamGoWorker|callGoWorker/i.test(l.message)))
@@ -179,6 +181,18 @@ test('buildVmTestInbound stays Claude Code shaped for /v1 loopback', () => {
   assert.equal(headers['anthropic-beta'], undefined)
   assert.equal(inbound.stream, true)
 })
+
+test('VM connectivity probes explicitly select disabled or model-required adaptive thinking', () => {
+  for (const [model, type] of [
+    ['claude-haiku-4-5', 'disabled'],
+    ['claude-sonnet-5-5', 'adaptive'],
+  ]) {
+    const { inbound } = buildVmTestInbound({ model, prompt: 'hello', maxTokens: 64 })
+    assert.deepEqual(inbound.thinking, { type })
+    assert.equal(inbound.max_tokens, 64)
+  }
+})
+
 test('health probe mode uses the full official Claude Code prompt', () => {
   const { inbound, headers } = buildVmTestInbound({
     model: 'claude-haiku-4-5',
@@ -233,8 +247,8 @@ test('runVmTestChat reports cli-hop when slot engine is rust', async (t) => {
   assert.equal(result.debug.inbound_class, 'cli_hop_passthrough')
   assert.equal(calls[0].headers['user-agent'], 'kin-console-test/1.0')
   assert.equal(calls[0].body.system, undefined)
-  assert.ok(result.log.some((l) => /cli-hop wrap/.test(l.message)))
-  assert.ok(result.log.some((l) => /cli-hop CLI 官方提示词/.test(l.message)))
+  assert.ok(result.log.some((l) => /cli-node \+ wrap kernel/.test(l.message)))
+  assert.ok(result.log.some((l) => /cli-hop · CLI 官方提示词/.test(l.message)))
 })
 
 test('runVmTestChat reports crag dataplane when routing says crag', async (t) => {
@@ -244,7 +258,9 @@ test('runVmTestChat reports crag dataplane when routing says crag', async (t) =>
   fs.mkdirSync(path.join(root, 'src/config'), { recursive: true })
   fs.writeFileSync(
     path.join(root, 'src/config/routing.json'),
-    JSON.stringify({ inference: { engine: 'rust', dataplane: 'crag', fallback_to_go: false, strict: true } }),
+    JSON.stringify({
+      inference: { engine: 'rust', dataplane: 'crag', crag_kernel_version: 'v2', fallback_to_go: false, strict: true },
+    }),
   )
   const { baseUrl } = await startLoopbackServer(t, () => ({
     status: 200,
@@ -268,9 +284,9 @@ test('runVmTestChat reports crag dataplane when routing says crag', async (t) =>
   })
   assert.equal(result.ok, true)
   assert.equal(result.dataplane, 'crag')
-  assert.ok(result.log.some((l) => /cli-hop crag/.test(l.message)))
+  assert.ok(result.log.some((l) => /CRAG v2 原生 worker/.test(l.message)))
   assert.equal(
-    result.log.some((l) => /cli-hop wrap/.test(l.message)),
+    result.log.some((l) => /cli-hop/.test(l.message)),
     false,
   )
 })

@@ -6,7 +6,8 @@ import {
   isCompleteAssistantMessage,
   isClientCancelledResult,
   isIncompleteAssistantMessage,
-  isUsagePolicyErrorMessage,
+  isThirdPartyClientMessage,
+  isUnanswerablePromptMessage,
   isWrapConnectionError,
   ErrorCode,
 } from '../core/errors.mjs'
@@ -19,6 +20,17 @@ const ENTITLEMENT_PATTERNS = [
   /usage credits? (?:are )?required/i,
   /fast (?:mode|request).*(?:credit|entitlement)/i,
 ]
+
+// A Fable 429 with one of these bodies is the account's plan, not this request:
+// Pro seats whose included Fable allowance is gone answer every Fable request
+// this way until credits are bought. Any other model keeps the request stop.
+const FABLE_CREDITS_PATTERNS = [/extra usage required/i, /usage credits? (?:are )?required/i]
+
+/** Whether an upstream message says the account must buy usage credits (not fast mode). */
+export function isFableCreditsRequiredMessage(message) {
+  const text = String(message || '')
+  return !/\bfast (?:mode|request)/i.test(text) && FABLE_CREDITS_PATTERNS.some((pattern) => pattern.test(text))
+}
 
 const SIGNATURE_PATTERNS = [
   /signature/i,
@@ -43,6 +55,16 @@ const SCHEMA_PATTERNS = [/additionalProperties/i, /output_config/i]
 const SEARCH_HISTORY_PATTERNS = [/encrypted_content/i, /`?search_result`?\s+block/i, /web_search_result/i]
 
 const ADAPTIVE_PATTERNS = [/adaptive thinking/i, /thinking\.type.*adaptive/i, /does not support adaptive/i]
+
+// The upstream refuses the sampling fields themselves, not their values: a
+// relay or vendor model that rejects `temperature` outright, or one that only
+// accepts temperature=1 under thinking. Pinning the mimicry value again would
+// be refused the same way, so the retry carries no sampling at all.
+const SAMPLING_PATTERNS = [
+  /`?(?:temperature|top_p|top_k)`?\s+(?:is|are)\s+(?:deprecated|not supported)/i,
+  /`?(?:temperature|top_p|top_k)`?\s+may only be set to/i,
+  /(?:does not support|unsupported)[^.]*\b(?:temperature|top_p|top_k)\b/i,
+]
 
 const ORGANIZATION_DISABLED_PATTERNS = [
   /organization has been disabled/i,
@@ -175,6 +197,22 @@ function resultErrorCode(result) {
   return String(result?.body?.error?.code || result?.body?.error?.type || '')
 }
 
+function cacheRefusal(reason) {
+  return {
+    scope: 'request',
+    action: 'stop',
+    reason,
+    cooldownUntil: null,
+    retrySameAccount: false,
+    rememberRefusal: true,
+    refusalTtlMs: 0,
+  }
+}
+
+function refusalCodes(result, code, workerCode) {
+  return [code, workerCode, result?.body?.error?.upstream_code, result?.code, result?.error_code]
+}
+
 /**
  * First wrap hop after idle often streams a local/stale 401
  * (`request_id:null` or `upstream_stream_incomplete`) because the CLI
@@ -219,6 +257,12 @@ function continueWithoutCooldown({ scope, reason, retrySameAccount = true } = {}
   }
 }
 
+/** crag-v2: `process_error` "Claude process exited (None): Claude native process exited with code …". */
+export function isNativeProcessExit(workerCode, text) {
+  if (workerCode === 'process_error') return true
+  return /native process exited|claude process exited/i.test(String(text || ''))
+}
+
 function claudeStopReasonOf(result) {
   return assistantStopReason(result)
 }
@@ -239,6 +283,13 @@ export function isSilentClaudeRefusal(result = {}) {
 
 export const DEFAULT_OAUTH_401_COOLDOWN_MS = 120_000
 export const MAX_OAUTH_401_COOLDOWN_MS = 600_000
+/**
+ * A slot whose own credential refresh failed stops taking traffic for a while.
+ * Bounded rather than permanent: the worker only forwards the token endpoint's
+ * status, so a slot that is merely temporarily unable to refresh gets another
+ * chance instead of being parked until an operator re-imports it by hand.
+ */
+export const CREDENTIAL_ENSURE_COOLDOWN_MS = 10 * 60_000
 /** Upstream 5xx: stop the account and the same prompt. Do not open another slot. */
 export const PROVIDER_PAUSE_MS = 60 * 60 * 1000
 
@@ -312,8 +363,47 @@ function classifyUpstreamResultRaw(
       retrySameAccount: false,
     }
   }
+  if (result.cragPolicyBlock === true && !result.committed) {
+    return {
+      scope: 'request',
+      action: 'stop',
+      reason: 'crag_policy_blocked',
+      cooldownUntil: null,
+      retrySameAccount: false,
+    }
+  }
+  const handoffCode = result?.body?.error?.code
+  if (handoffCode === ErrorCode.SLOT_OAUTH_UNAVAILABLE) {
+    return {
+      scope: 'worker',
+      action: result.committed ? 'stop' : 'continue',
+      reason: handoffCode,
+      cooldownUntil: null,
+      retrySameAccount: false,
+    }
+  }
+  if (
+    result.nativeHandoff === true &&
+    /^native_handoff_(missing|invalid|conflict|incomplete)$/.test(handoffCode || '')
+  ) {
+    // The provider may already have finished. Missing terminal proof is not
+    // permission to execute the same turn again or penalize another account.
+    return {
+      scope: 'request',
+      action: 'stop',
+      reason: handoffCode,
+      cooldownUntil: null,
+      retrySameAccount: false,
+    }
+  }
+  if (result.clusterDeliveryUnconfirmed === true) {
+    return { scope: 'request', action: 'stop', reason: ErrorCode.CLUSTER_DELIVERY_UNCONFIRMED }
+  }
+  if (handoffCode === ErrorCode.CLUSTER_SLOT_RECONNECTING) {
+    return { scope: 'request', action: 'stop', reason: handoffCode }
+  }
   if (isContentFilterRefusal(result) && !result.committed) {
-    return { scope: 'request', action: 'stop', reason: 'content_filter_refusal', cooldownUntil: null }
+    return cacheRefusal('content_filter_refusal')
   }
   const completeAssistant = isCompleteAssistantMessage(result)
   const malformedSuccess =
@@ -338,28 +428,55 @@ function classifyUpstreamResultRaw(
   const reset = resetFromHeaders(result.headers, now)
 
   const hay = `${code} ${message} ${workerCode}`
+  if (code === 'license_crag_host_over_quota' && result.upstreamExecutions === 0 && !result.committed) {
+    return continueWithoutCooldown({ scope: 'worker', reason: code, retrySameAccount: false })
+  }
+  if (/Claude native launch failed/i.test(message)) {
+    return {
+      scope: 'worker',
+      action: 'stop',
+      reason: /Permission denied|Operation not permitted|os error (?:1|13)\b/i.test(message)
+        ? 'native_launch_permission_denied'
+        : 'native_launch_failed',
+      cooldownUntil: null,
+      retrySameAccount: false,
+    }
+  }
+  if (
+    [code, workerCode].some((value) =>
+      /^license_(required|expired|not_yet_valid|invalid|binding_mismatch|unconfigured|crag_host_over_quota|crag_host_usage_unverified)$/.test(
+        value,
+      ),
+    )
+  ) {
+    return {
+      scope: 'request',
+      action: 'stop',
+      reason: code || workerCode,
+      cooldownUntil: null,
+      retrySameAccount: false,
+    }
+  }
+  // The caller is a third-party client and the seat has no extra usage.
+  // Every seat without extra usage answers the same and one with it bills
+  // money, so stop here; the seat itself is fine, so no cooldown, no cache.
+  if (isThirdPartyClientMessage(message) || isThirdPartyClientMessage(hay)) {
+    return {
+      scope: 'request',
+      action: 'stop',
+      reason: 'third_party_client',
+      cooldownUntil: null,
+      retrySameAccount: false,
+    }
+  }
   // Claude Code wraps an AUP refusal as "API Error" and the kernel often
   // surfaces it as HTTP 400. That is the prompt, not a repairable request
   // and not an account failure: stop, do not hop again, cache forever.
-  if (isUsagePolicyErrorMessage(message) || isUsagePolicyErrorMessage(hay)) {
-    return {
-      scope: 'request',
-      action: 'stop',
-      reason: 'usage_policy_refusal',
-      cooldownUntil: null,
-      retrySameAccount: false,
-      rememberRefusal: true,
-      refusalTtlMs: 0,
-    }
+  if (isUnanswerablePromptMessage(message) || isUnanswerablePromptMessage(hay)) {
+    return cacheRefusal('usage_policy_refusal')
   }
-  if (isContentPolicyErrorCode(code) || isContentPolicyErrorCode(workerCode)) {
-    return {
-      scope: 'request',
-      action: 'stop',
-      reason: 'content_policy_refusal',
-      cooldownUntil: null,
-      retrySameAccount: false,
-    }
+  if (refusalCodes(result, code, workerCode).some(isContentPolicyErrorCode)) {
+    return cacheRefusal('content_policy_refusal')
   }
   // The org refuses this seat. Not a token death and not a timed cooldown:
   // pause the slot until an operator resumes it, and give the request to
@@ -398,8 +515,19 @@ function classifyUpstreamResultRaw(
       cooldownUntil: null,
     }
   }
+  // Non-fatal ensure failures keep the token endpoint's 400. Fatal grants are
+  // escalated to 401 above and must keep the permanent oauth_revoked path.
+  if (result.credential_ensure_failed === true && status === 400) {
+    return {
+      scope: 'account',
+      action: 'continue-and-cooldown',
+      reason: 'credential_refresh_failed',
+      cooldownUntil: now + CREDENTIAL_ENSURE_COOLDOWN_MS,
+      retrySameAccount: false,
+    }
+  }
   // Plan limit arrives as 429, as a kernel 502 provider_error, or (pre-restore)
-  // as 200 + SSE error. The text decides, not the status (sub2api handle429).
+  // as 200 + SSE error. The text decides, not the status.
   if (isPlanLimitMessage(message)) {
     return {
       scope: 'account',
@@ -462,6 +590,9 @@ function classifyUpstreamResultRaw(
     })
   }
   if (status === 400) {
+    if (code === 'invalid_kernel_request') {
+      return { scope: 'request', action: 'stop', reason: 'invalid_request', cooldownUntil: null }
+    }
     const hay = `${code} ${message}`
     // Default off. Turning this on drops thinking history and retries, so the
     // client sees 200 and never learns the upstream rejected the signature.
@@ -507,6 +638,14 @@ function classifyUpstreamResultRaw(
         cooldownUntil: null,
       }
     }
+    if (!repaired && SAMPLING_PATTERNS.some((pattern) => pattern.test(hay))) {
+      return {
+        scope: 'request',
+        action: 'repair-and-retry',
+        reason: 'sampling_repairable',
+        cooldownUntil: null,
+      }
+    }
     if (!repaired && ADAPTIVE_PATTERNS.some((pattern) => pattern.test(hay))) {
       return {
         scope: 'request',
@@ -546,7 +685,37 @@ function classifyUpstreamResultRaw(
   }
   if (status === 429) {
     if (ENTITLEMENT_PATTERNS.some((pattern) => pattern.test(message))) {
+      if (isFableModel(model) && isFableCreditsRequiredMessage(message)) {
+        return {
+          scope: 'account',
+          action: 'continue',
+          reason: 'fable_credits_required',
+          cooldownUntil: null,
+          retrySameAccount: false,
+        }
+      }
       return { scope: 'request', action: 'stop', reason: 'entitlement_required', cooldownUntil: null }
+    }
+    const facts = result.providerResult
+    const upstreamHeaders = facts?.response_headers
+    // #1139: CRAG reports this rejection before generation. Require the
+    // provider's own HTTP observation; a bare 429 alone proves no request error.
+    if (
+      facts?.schema_version === 2 &&
+      facts.source === 'provider_http' &&
+      facts.http_status === 429 &&
+      facts.error?.type === 'rate_limit_error' &&
+      facts.error.message === 'Error' &&
+      result.body?.error?.type === 'rate_limit_error' &&
+      message === 'Error' &&
+      upstreamHeaders &&
+      typeof upstreamHeaders === 'object' &&
+      !Array.isArray(upstreamHeaders) &&
+      ![upstreamHeaders, result.headers].some((headers) =>
+        Object.keys(headers || {}).some((name) => /^(anthropic-ratelimit-|retry-after$)/i.test(name)),
+      )
+    ) {
+      return { scope: 'request', action: 'stop', reason: 'crag_opaque_429', cooldownUntil: null }
     }
     if (isUnifiedAccountLimit(result.headers)) {
       return {
@@ -556,8 +725,9 @@ function classifyUpstreamResultRaw(
         cooldownUntil: accountLimitUntil(reset, usage, now, message),
       }
     }
-    if (isFableWindowLimit(result.headers) || isFableModel(model)) {
-      const fableReset = fableResetFromHeaders(result.headers, now) || reset
+    if (isFableWindowLimit(result.headers) || isFableWindowLimit(upstreamHeaders)) {
+      const fableReset =
+        fableResetFromHeaders(result.headers, now) || fableResetFromHeaders(upstreamHeaders, now) || reset
       return {
         scope: 'model',
         action: 'continue-and-cooldown',
@@ -592,9 +762,9 @@ function classifyUpstreamResultRaw(
     }
     return {
       scope: 'account',
-      action: 'continue-and-cooldown',
+      action: reset > now ? 'continue-and-cooldown' : 'continue',
       reason: 'rate_limited_unknown',
-      cooldownUntil: reset || now + 60_000,
+      cooldownUntil: reset > now ? reset : null,
       retrySameAccount: false,
     }
   }
@@ -613,6 +783,15 @@ function classifyUpstreamResultRaw(
       return continueWithoutCooldown({
         scope: 'worker',
         reason: 'slot_busy',
+        retrySameAccount: false,
+      })
+    }
+    // The VM's native Claude process died before answering (cgroup OOM or pids
+    // limit, crash). The account is fine: try another unit, open no circuit.
+    if (isNativeProcessExit(workerCode, hay)) {
+      return continueWithoutCooldown({
+        scope: 'worker',
+        reason: 'worker_process_exit',
         retrySameAccount: false,
       })
     }
@@ -641,7 +820,10 @@ function classifyUpstreamResultRaw(
         retrySameAccount: true,
       })
     }
-    return overloadedUnit(now)
+    return {
+      ...overloadedUnit(now),
+      reason: /overload/i.test(message) ? 'provider_overloaded' : 'upstream_server_error',
+    }
   }
   return { scope: 'request', action: 'stop', reason: `http_${status}`, cooldownUntil: null }
 }
@@ -693,7 +875,7 @@ function rectifyMessageContent(content, role) {
   return next.length ? next : placeholderContent(role)
 }
 
-/** Convert every thinking block to text and disable top-level thinking (sub2api retry). */
+/** Convert every thinking block to text and disable top-level thinking before retrying. */
 export function repairAnthropicRequest(body = {}, policy = {}) {
   if (policy.action !== 'repair-and-retry') return body
   const reason = String(policy.reason || '')
@@ -708,6 +890,10 @@ export function repairAnthropicRequest(body = {}, policy = {}) {
     normalizeThinkingForModel(next)
     return next
   }
+  // Sampling is owned by the outbound assembly, which rebuilds from caller input
+  // after this repair runs; `dropSampling` there strips the fields. Removing them
+  // here would only be refilled, and falling through would drop thinking as well.
+  if (reason === 'sampling_repairable') return body
   const out = structuredClone(body)
   if (out.thinking) delete out.thinking
   if (Array.isArray(out.context_management?.edits)) {

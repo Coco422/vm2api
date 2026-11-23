@@ -13,6 +13,7 @@ import {
   isAllowedSkeletonDiff,
   outboundShape,
 } from '../../src/lib/protocol/outbound-shape.mjs'
+import { hasForeignSystemBlock, relocateThirdPartySystem } from '../../src/lib/protocol/third-party-system.mjs'
 import { sealClaudeCodeCch } from '../../src/lib/identity/cch.mjs'
 import { OFFICIAL_303_MAIN_PROMPT } from '../../src/lib/identity/official-profiles.mjs'
 
@@ -30,7 +31,7 @@ const SECRET_BODY = {
     { role: 'system', content: '# Environment\n - Primary working directory: /home/alice/project' },
   ],
   system: [
-    { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.303.abc; cc_entrypoint=sdk-cli; cch=00000;' },
+    { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.321.abc; cc_entrypoint=sdk-cli; cch=00000;' },
     {
       type: 'text',
       text: "You are Claude Code, Anthropic's official CLI for Claude.",
@@ -69,6 +70,15 @@ test('shape keeps structure only: no prompt text, ids or secrets', () => {
   assert.equal(shape.messages[0].blocks[0].kind, 'reminder')
   assert.equal(shape.messages[1].kind, 'env')
   assert.equal(shape.markers.total, 3)
+})
+
+test('the official 2.1.321 system envelope does not open the relocation gate', () => {
+  // The gate is what keeps official traffic out of relocation: handle-protocol
+  // only calls the mover when this is true, so a false here means the envelope
+  // is never relocated. The mover itself is greedy by default (third-party
+  // callers reach it through `!officialTraffic`) and narrow only when asked.
+  assert.equal(hasForeignSystemBlock(SECRET_BODY.system), false)
+  assert.equal(relocateThirdPartySystem(SECRET_BODY, { onlyForeign: true }).moved, false)
 })
 
 test('diff ignores lengths and reports structural changes by path', () => {
@@ -143,7 +153,7 @@ test('cli: --shape and --against-profile run on a body file without printing tex
   }
 })
 
-function wireOf(body, ua = 'claude-cli/2.1.303 (external, sdk-cli)') {
+function wireOf(body, ua = 'claude-cli/2.1.321 (external, sdk-cli)') {
   const raw = JSON.stringify(sealClaudeCodeCch(body))
   return { raw, body: JSON.parse(raw), headers: { 'user-agent': ua, 'content-length': String(Buffer.byteLength(raw)) } }
 }
@@ -171,7 +181,7 @@ test('wire rules: internal field, key order, version, UA, tail system, CCH, cont
   assert.deepEqual(extra, [{ id: 'wire.extra_key', key: 'temperature', index: 9, blocking: false }])
 
   const old = structuredClone(SECRET_BODY)
-  old.system[0].text = old.system[0].text.replace('2.1.303', '2.1.296')
+  old.system[0].text = old.system[0].text.replace('2.1.321', '2.1.296')
   assert.deepEqual(ids(checkOfficial303Wire(wireOf(old))), ['wire.billing_version'])
   const noBilling = structuredClone(SECRET_BODY)
   noBilling.system.shift()
@@ -236,7 +246,7 @@ test('caller placement: official caller system never reaches the outbound; profi
   const inbound = {
     model: 'claude-opus-5-5',
     system: [
-      { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.303.abc; cc_entrypoint=cli; cch=e1d8b;' },
+      { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.321.abc; cc_entrypoint=cli; cch=e1d8b;' },
       { type: 'text', text: SECRET_BODY.system[1].text },
       { type: 'text', text: SECRET_BODY.system[2].text },
       { type: 'text', text: `${SECRET_BODY.system[3].text} toward their goals and more words here` },

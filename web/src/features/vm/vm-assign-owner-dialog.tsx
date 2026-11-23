@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import type { Vm } from '@/types/panel-vm'
+import { isCodexVm } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -10,6 +11,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
 import {
   Select,
   SelectContent,
@@ -35,7 +37,7 @@ export function VmAssignOwnerDialog({
   open: boolean
   pending?: boolean
   onOpenChange: (open: boolean) => void
-  onConfirm: (userId: string) => void
+  onConfirm: (userId: string, deliveryBatch?: string) => void
 }) {
   const users = useQuery({
     ...usersQueryOptions(),
@@ -43,6 +45,10 @@ export function VmAssignOwnerDialog({
   })
   const options = assignableUsers(users.data?.items)
   const [userId, setUserId] = useState('')
+  const [deliveryBatch, setDeliveryBatch] = useState('')
+  const canRecordDelivery = Boolean(vm && !isCodexVm(vm) && !vm.gemini)
+
+  useEffect(() => setDeliveryBatch(''), [open, vm?.id])
 
   useEffect(() => {
     if (!open || !vm) return
@@ -105,6 +111,18 @@ export function VmAssignOwnerDialog({
             </p>
           ) : null}
         </div>
+        {canRecordDelivery ? (
+          <label className='space-y-2 text-sm'>
+            <span>交付批次（可选）</span>
+            <Input
+              value={deliveryBatch}
+              onChange={(event) => setDeliveryBatch(event.target.value)}
+              maxLength={40}
+              disabled={pending}
+              placeholder='例如：第四批'
+            />
+          </label>
+        ) : null}
         <DialogFooter>
           <Button
             variant='outline'
@@ -115,7 +133,15 @@ export function VmAssignOwnerDialog({
           </Button>
           <Button
             disabled={pending || !userId}
-            onClick={() => userId && onConfirm(userId)}
+            onClick={() =>
+              userId &&
+              onConfirm(
+                userId,
+                canRecordDelivery
+                  ? deliveryBatch.trim() || undefined
+                  : undefined
+              )
+            }
           >
             确认分配
           </Button>

@@ -50,6 +50,90 @@ test('official kinds lock base_url', () => {
   assert.equal(openai.protocol, 'openai')
 })
 
+test('endpoint risk review defaults off and preserves explicit toggles across reloads', () => {
+  const dataDir = tmpDir()
+  let store = new ApiEndpointStore({ dataDir })
+  try {
+    const rec = store.create({ kind: 'claude' })
+    assert.equal(rec.risk_review_enabled, false)
+    assert.equal(store.listRaw()[0].risk_review_enabled, false)
+    assert.equal(store.update(rec.id, { risk_review_enabled: true }).risk_review_enabled, true)
+    store.db.close()
+    store = new ApiEndpointStore({ dataDir })
+    assert.equal(store.list()[0].risk_review_enabled, true)
+    assert.equal(store.update(rec.id, { name: 'renamed' }).risk_review_enabled, true)
+    assert.equal(store.update(rec.id, { risk_review_enabled: false }).risk_review_enabled, false)
+    const enabled = store.create({ kind: 'claude', risk_review_enabled: true })
+    assert.equal(enabled.risk_review_enabled, true)
+    store.db.close()
+    store = new ApiEndpointStore({ dataDir })
+    assert.equal(store.getRaw(rec.id).risk_review_enabled, false)
+    assert.equal(store.getRaw(enabled.id).risk_review_enabled, true)
+  } finally {
+    store.db.close()
+    fs.rmSync(dataDir, { recursive: true, force: true })
+  }
+})
+
+test('endpoint body policy defaults to persona and survives reloads (#1321)', () => {
+  const dataDir = tmpDir()
+  let store = new ApiEndpointStore({ dataDir })
+  try {
+    const rec = store.create({ kind: 'claude' })
+    assert.equal(rec.body_policy, 'persona')
+    assert.equal(store.listRaw()[0].body_policy, 'persona')
+    assert.equal(store.update(rec.id, { body_policy: 'caller' }).body_policy, 'caller')
+    store.db.close()
+    store = new ApiEndpointStore({ dataDir })
+    assert.equal(store.list()[0].body_policy, 'caller')
+    // An unrelated patch must not reset the policy.
+    assert.equal(store.update(rec.id, { name: 'renamed' }).body_policy, 'caller')
+    assert.equal(store.update(rec.id, { body_policy: 'persona' }).body_policy, 'persona')
+    const opted = store.create({ kind: 'claude', body_policy: 'caller' })
+    assert.equal(opted.body_policy, 'caller')
+    store.db.close()
+    store = new ApiEndpointStore({ dataDir })
+    assert.equal(store.getRaw(rec.id).body_policy, 'persona')
+    assert.equal(store.getRaw(opted.id).body_policy, 'caller')
+  } finally {
+    store.db.close()
+    fs.rmSync(dataDir, { recursive: true, force: true })
+  }
+})
+
+test('endpoint body policy rejects unknown values without changing the stored setting (#1321)', () => {
+  const dataDir = tmpDir()
+  const store = new ApiEndpointStore({ dataDir })
+  try {
+    const rec = store.create({ kind: 'claude', body_policy: 'caller' })
+    assert.throws(() => store.update(rec.id, { body_policy: 'nope' }), { code: 'invalid_body_policy' })
+    assert.throws(() => store.update(rec.id, { body_policy: true }), { code: 'invalid_body_policy' })
+    assert.equal(store.getRaw(rec.id).body_policy, 'caller')
+    assert.throws(() => store.create({ kind: 'claude', body_policy: 'persona_full' }), {
+      code: 'invalid_body_policy',
+    })
+  } finally {
+    store.db.close()
+    fs.rmSync(dataDir, { recursive: true, force: true })
+  }
+})
+
+test('endpoint risk review rejects nonboolean values without changing the stored setting', () => {
+  const dataDir = tmpDir()
+  const store = new ApiEndpointStore({ dataDir })
+  try {
+    const rec = store.create({ kind: 'claude', risk_review_enabled: true })
+    for (const value of ['false', 0, null, {}]) {
+      assert.throws(() => store.create({ kind: 'claude', risk_review_enabled: value }), { code: 'invalid_risk_review' })
+      assert.throws(() => store.update(rec.id, { risk_review_enabled: value }), { code: 'invalid_risk_review' })
+      assert.equal(store.getRaw(rec.id).risk_review_enabled, true)
+    }
+  } finally {
+    store.db.close()
+    fs.rmSync(dataDir, { recursive: true, force: true })
+  }
+})
+
 test('sk-kin category defaults oauth and can switch to api', () => {
   const keys = new ApiKeyStore({ dataDir: tmpDir() })
   const rec = keys.create({ name: 'c' })

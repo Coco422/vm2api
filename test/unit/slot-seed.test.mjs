@@ -3,7 +3,13 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { writeSlotSeedFiles, inferProjectRootFromCliHome } from '../../src/lib/vm/slot-seed.mjs'
+import {
+  initializeSlotSeedFiles,
+  writeSlotSeedFiles,
+  inferProjectRootFromCliHome,
+} from '../../src/lib/vm/slot-seed.mjs'
+import { seedFreshCliHome } from '../../src/lib/vm/vm-recreate.mjs'
+import { runtimeFileOwner } from '../../src/lib/oauth/oauth-credentials.mjs'
 import { standardSeedPolicy } from '../../src/lib/protocol/seed-policy.mjs'
 import { KIN_SEED_SCHEMA } from '../../src/lib/identity/workstation-profile.mjs'
 import { applySeedAfterOfficialInit } from '../../src/lib/oauth/official-cc-bootstrap.mjs'
@@ -14,6 +20,86 @@ test('inferProjectRootFromCliHome walks vms/<id>/cli-home', () => {
   assert.equal(inferProjectRootFromCliHome(home), path.resolve(root))
   assert.equal(inferProjectRootFromCliHome('/tmp/not-a-slot'), null)
 })
+
+for (const dataplane of ['wrap', 'crag']) {
+  test(`fresh ${dataplane} VM has private, VM-owned first-launch settings`, (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-fresh-settings-'))
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+    const vm = {
+      id: 'vm-13',
+      node_id: 'node-a',
+      dataplane,
+      timezone: 'Asia/Shanghai',
+      seed_policy: { telemetry_disabled: false, extra_env: { CLAUDE_CODE_DISABLE_TELEMETRY: '0', CUSTOM: 'kept' } },
+    }
+    const { homeDir } = seedFreshCliHome(root, vm)
+    const file = path.join(homeDir, '.claude', 'settings.json')
+    const settings = JSON.parse(fs.readFileSync(file, 'utf8'))
+    assert.equal(settings.env.TZ, 'Asia/Shanghai')
+    assert.equal(settings.env.CUSTOM, 'kept')
+    assert.equal(settings.env.CLAUDE_CODE_DISABLE_TELEMETRY, undefined)
+    assert.equal(settings.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, dataplane === 'crag' ? undefined : '1')
+    assert.equal(settings.autoUpdates, false)
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600)
+    for (const dir of [homeDir, path.dirname(file)]) {
+      assert.equal(fs.statSync(dir).mode & 0o777, 0o700)
+      if (process.getuid?.() === 0) {
+        assert.equal(fs.statSync(dir).uid, runtimeFileOwner(vm).uid)
+        assert.equal(fs.statSync(dir).gid, runtimeFileOwner(vm).gid)
+      }
+    }
+  })
+}
+
+test('seed initialization merges authoritative node settings and waits for publication', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-node-settings-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const vm = { id: 'vm-13', node_id: 'node-a', timezone: 'UTC' }
+  writeSlotSeedFiles(root, vm, null, { existingSettings: { controller_only: true } })
+  let published = false
+  const seed = await initializeSlotSeedFiles(root, vm, {
+    async seedFiles() {
+      return {
+        files: { 'settings.json': JSON.stringify({ permissions: { allow: ['Read'] }, env: { CUSTOM: 'node' } }) },
+      }
+    },
+    async syncSeed(_vm, slotDir) {
+      const settings = JSON.parse(fs.readFileSync(path.join(slotDir, 'cli-home', '.claude', 'settings.json')))
+      assert.equal(settings.controller_only, undefined)
+      assert.equal(settings.env.CUSTOM, 'node')
+      assert.deepEqual(settings.permissions, { allow: ['Read'] })
+      published = true
+      return { published: true }
+    },
+  })
+  assert.equal(seed.wrote, true)
+  assert.equal(published, true)
+})
+
+for (const stage of ['read', 'parse', 'publish']) {
+  test(`seed initialization propagates ${stage} failures`, async (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-init-failure-'))
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+    let published = false
+    await assert.rejects(
+      initializeSlotSeedFiles(
+        root,
+        { id: 'vm-13' },
+        {
+          async seedFiles() {
+            if (stage === 'read') throw new Error('node_read_failed')
+            return { files: { 'settings.json': stage === 'parse' ? '{invalid' : null } }
+          },
+          async syncSeed() {
+            published = true
+            return { published: false }
+          },
+        },
+      ),
+    )
+    assert.equal(published, stage === 'publish')
+  })
+}
 
 test('writeSlotSeedFiles writes latest settings and workstation kin-seed', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-slot-seed-'))
@@ -35,7 +121,6 @@ test('writeSlotSeedFiles writes latest settings and workstation kin-seed', () =>
       env: {
         DISABLE_TELEMETRY: '1',
         ANTHROPIC_API_KEY: 'old',
-        FOO: 'from-old-script',
       },
     }),
   )
@@ -48,7 +133,6 @@ test('writeSlotSeedFiles writes latest settings and workstation kin-seed', () =>
   assert.equal(settings.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, '1')
   assert.equal(settings.env.ANTHROPIC_BASE_URL, undefined)
   assert.equal(settings.env.ANTHROPIC_API_KEY, undefined)
-  assert.equal(settings.env.FOO, undefined)
   assert.equal(settings.env.KEEP, '1')
   assert.equal(settings.env.TZ, 'America/Los_Angeles')
   assert.equal(settings.autoUpdates, false)
@@ -99,4 +183,79 @@ test('applySeedAfterOfficialInit uses the same writer', () => {
   assert.match(seed.linux_kernel, /amd64$/)
   assert.equal(seed.workstation_sku, '4c8g')
   fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('seed writes preserve VM-owned settings and never write runtime config or identities', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-seed-private-'))
+  try {
+    const vm = { id: 'vm-11', seed_policy: { theme: 'light' } }
+    const home = path.join(root, 'vms', vm.id, 'cli-home')
+    const dir = path.join(home, '.claude')
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(
+      path.join(dir, 'settings.json'),
+      JSON.stringify({ permissions: { allow: ['Read'] }, env: { CUSTOM: 'vm-owned', DISABLE_TELEMETRY: '0' } }),
+    )
+    fs.writeFileSync(path.join(dir, 'credentials.json'), 'credential-marker')
+    fs.writeFileSync(path.join(home, '.claude.json'), '{"userID":"stable-user"}')
+    const out = writeSlotSeedFiles(root, vm)
+    assert.deepEqual(out.settings.permissions, { allow: ['Read'] })
+    assert.equal(out.settings.theme, 'light')
+    assert.equal(out.settings.env.DISABLE_TELEMETRY, '1')
+    assert.equal(out.settings.env.CUSTOM, 'vm-owned')
+    assert.equal(out.kin_seed.seed_policy.telemetry_disabled, true)
+    assert.equal(fs.existsSync(path.join(root, 'vms', vm.id, 'run', 'kernel.json')), false)
+    assert.equal(fs.readFileSync(path.join(dir, 'credentials.json'), 'utf8'), 'credential-marker')
+    assert.equal(fs.readFileSync(path.join(home, '.claude.json'), 'utf8'), '{"userID":"stable-user"}')
+    for (const name of ['settings.json', 'claude.setting', 'kin-seed.json']) {
+      assert.equal(fs.statSync(path.join(dir, name)).mode & 0o777, 0o600)
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('explicit env replacement removes deleted custom keys without changing privacy authority', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-seed-env-replace-'))
+  try {
+    const vm = { id: 'vm-14', seed_policy: { telemetry_disabled: true, extra_env: { KEEP: 'new' } } }
+    const existingSettings = { env: { REMOVE: 'old', KEEP: 'old', DO_NOT_TRACK: '0' } }
+    const result = writeSlotSeedFiles(root, vm, null, { existingSettings, replaceEnv: true })
+    assert.equal(result.settings.env.REMOVE, undefined)
+    assert.equal(result.settings.env.KEEP, 'new')
+    assert.equal(result.settings.env.DO_NOT_TRACK, '1')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('seed writes refuse a linked Claude directory without touching its target', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-seed-link-'))
+  try {
+    const home = path.join(root, 'vms', 'vm-12', 'cli-home')
+    const outside = path.join(root, 'outside')
+    fs.mkdirSync(home, { recursive: true })
+    fs.mkdirSync(outside)
+    fs.writeFileSync(path.join(outside, 'settings.json'), '{"marker":"untouched"}')
+    fs.symlinkSync(outside, path.join(home, '.claude'))
+    assert.throws(() => writeSlotSeedFiles(root, { id: 'vm-12' }))
+    assert.equal(fs.readFileSync(path.join(outside, 'settings.json'), 'utf8'), '{"marker":"untouched"}')
+    assert.deepEqual(fs.readdirSync(outside), ['settings.json'])
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('malformed existing settings fail instead of silently overwriting VM settings', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-seed-invalid-'))
+  try {
+    const dir = path.join(root, 'vms', 'vm-13', 'cli-home', '.claude')
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(path.join(dir, 'settings.json'), '{broken')
+    assert.throws(() => writeSlotSeedFiles(root, { id: 'vm-13' }))
+    assert.equal(fs.readFileSync(path.join(dir, 'settings.json'), 'utf8'), '{broken')
+    assert.equal(fs.existsSync(path.join(dir, 'kin-seed.json')), false)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })

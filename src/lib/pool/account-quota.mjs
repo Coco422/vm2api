@@ -14,23 +14,28 @@ import { AccountsRepo } from '../db/repos/accounts-repo.mjs'
 import { computeWeeklySplit, weeklySplitConfig } from './weekly-split.mjs'
 import {
   applyEffectiveWindows,
+  effectiveRateWindow,
   extraHeadersFromLimitError,
   extraIsLiveOpen,
   headerHardBlocked,
   headerWindow,
   headerWindowOrEmpty,
+  isOfficialWindowLimited,
   leftoverClearHeaderWindows,
   listQuotaFromHeaders,
   officialWindow,
   parseResetMs,
   wipeElapsedHeaderWindows,
+  wipeElapsedWindow,
 } from './quota-window.mjs'
-import { rollWindowHistory } from './window-history.mjs'
+import { HISTORY_WINDOW_MS, rollWindowHistory } from './window-history.mjs'
 import { accountTierKey, isNearLimit, normalizeTiers, resolveTierPolicy } from './quota-tiers.mjs'
 import { resolvePolicyModelId } from '../protocol/model-policy.mjs'
+import { isFableCreditsRequiredMessage } from './upstream-error-policy.mjs'
 import { SessionLimitRegistry } from './session-limit.mjs'
 import { applyVmQuotaConfig, applyVmQuotaPolicy } from './vm-quota-override.mjs'
 import {
+  FABLE_PROBE_MODEL,
   isFablePlanDenied,
   isInventedFableWindow,
   isOfficialUsageRateLimited,
@@ -55,6 +60,32 @@ import {
   worstGateZone,
 } from './quota-gate.mjs'
 
+/** How long a 'usage credits required' Fable answer keeps Fable off the seat. */
+export const FABLE_CREDITS_DENY_MS = 6 * 60 * 60_000
+
+function fableModelKey(model) {
+  return resolvePolicyModelId(model) || String(model || '').trim()
+}
+
+function setFableCreditsRequired(unified, key, now, durationMs) {
+  const until = now + durationMs
+  unified.model_denied_until = { ...(unified.model_denied_until || {}), [key]: until }
+  unified.fable_credits_required = {
+    model: key,
+    at: new Date(now).toISOString(),
+    until: new Date(until).toISOString(),
+  }
+}
+
+function clearFableCreditsRequired(unified, key) {
+  if (unified.model_denied_until?.[key]) {
+    const denied = { ...unified.model_denied_until }
+    delete denied[key]
+    unified.model_denied_until = denied
+  }
+  if (unified.fable_credits_required?.model === key) delete unified.fable_credits_required
+}
+
 export { extraHeadersFromLimitError }
 export { estimateRequestRisk }
 
@@ -75,7 +106,7 @@ export class AccountQuota {
     // Settled-in-band hops whose Extra reading has not yet moved.
     this.staleSettled = new Map()
     this.observedUtil = new Map()
-    this.reservationBand = new Map() // accountId → boolean[] (in-band at acquire)
+    this.reservationBand = new Map() // accountId → Map<reservation, boolean> (in-band at acquire)
     this.sessions = config?.sessions instanceof SessionLimitRegistry ? config.sessions : new SessionLimitRegistry()
     // vm_id → normalized `vm.policy.quota`; vm.json is the source of truth, this is the hot-path copy.
     this.vmQuota = new Map()
@@ -120,12 +151,27 @@ export class AccountQuota {
     } catch {}
   }
 
-  /** Archive the window that just rolled over; live headers win over the official probe, as in `_writeSessionWindow`. */
+  /**
+   * Archive the window that just rolled over. A live header reading wins over the
+   * official probe; once its reset has passed it belongs to the closed window and
+   * the official reading of the newer window counts, unless it is a leftover 100%
+   * (no gateway traffic since that window started).
+   */
   _rollWindowHistory(acc) {
     if (!acc?.unified) return
+    const now = Date.now()
     const read = (key) => {
       const extra = headerWindow(acc.unified, key)
-      return extra.utilization != null && extra.reset ? extra : officialWindow(acc.unified, key)
+      if (extra.utilization != null && parseResetMs(extra.reset) > now) return extra
+      const official = officialWindow(acc.unified, key)
+      if (!isOfficialWindowLimited(official, { now })) return official
+      const effective = effectiveRateWindow(official, {
+        now,
+        lastUsedAt: this._lastUsedAt(acc.account_id),
+        source: 'vm-oauth-usage',
+        durationMs: HISTORY_WINDOW_MS[key],
+      })
+      return effective.stale ? null : official
     }
     acc.window_history = rollWindowHistory(acc.window_history, { '5h': read('5h'), '7d': read('7d') })
   }
@@ -186,6 +232,7 @@ export class AccountQuota {
     const writeExtra = countRequest || exhausted
     const u5 = num(h['anthropic-ratelimit-unified-5h-utilization'])
     const u7 = num(h['anthropic-ratelimit-unified-7d-utilization'])
+    const sampledAt = new Date().toISOString()
     let sampled = false
     if (exhausted) {
       dropElapsedReset(acc, '5h', h['anthropic-ratelimit-unified-5h-reset'])
@@ -199,6 +246,7 @@ export class AccountQuota {
         utilization: u5,
         reset: h['anthropic-ratelimit-unified-5h-reset'],
         status: h['anthropic-ratelimit-unified-5h-status'] || (u5 != null ? statusFromUtil(u5) : null),
+        sampled_at: sampledAt,
       })
       sampled = true
     }
@@ -210,6 +258,7 @@ export class AccountQuota {
         utilization: u7,
         reset: h['anthropic-ratelimit-unified-7d-reset'],
         status: h['anthropic-ratelimit-unified-7d-status'] || (u7 != null ? statusFromUtil(u7) : null),
+        sampled_at: sampledAt,
       })
       sampled = true
     }
@@ -238,7 +287,7 @@ export class AccountQuota {
       acc.unified.overage_status = h['anthropic-ratelimit-unified-overage-status']
     }
     acc.unified.updated_at = new Date().toISOString()
-    if (sampled) acc.unified.headers.sampled_at = new Date().toISOString()
+    if (sampled) acc.unified.headers.sampled_at = sampledAt
 
     const usage = normalizeUsage(disjointOpenaiUsage(usageBody || {}) || {})
     if (
@@ -255,7 +304,7 @@ export class AccountQuota {
     }
     if (countRequest) acc.requests += 1
 
-    if (exhausted) applyHeaderExhausted(acc, h)
+    if (exhausted) applyHeaderExhausted(acc, h, sampledAt)
 
     if (countRequest) {
       const view = headerWindowOrEmpty(acc.unified, '5h')
@@ -273,6 +322,7 @@ export class AccountQuota {
       })
     }
 
+    settleElapsedHeaderWindows(acc, sampledAt)
     this._rollWindowHistory(acc)
     const saved = this.repo.save(acc)
     this._writeSessionWindow(saved)
@@ -311,8 +361,14 @@ export class AccountQuota {
    * CRS oauth/usage snapshot from the VM UID probe.
    * Fable weekly limit is stored separately and does not unschedulable the account.
    */
-  ingestOAuthUsage(accountId, probe = {}) {
+  ingestOAuthUsage(accountId, probe = {}, { confirmedReset = null } = {}) {
     const acc = this.ensure({ account_id: accountId })
+    const profileTier =
+      probe.account_tier_source === 'profile' && ['pro', 'max'].includes(probe.account_tier) ? probe.account_tier : null
+    if (profileTier) {
+      acc.unified.account_tier = profileTier
+      acc.unified.account_tier_source = 'profile'
+    }
     const nowIso = probe.probed_at || new Date().toISOString()
     if (isOfficialUsageRateLimited(probe)) {
       const retryMs = Number(probe.retry_after_ms)
@@ -392,8 +448,7 @@ export class AccountQuota {
     if (completeOfficialUsage) {
       if (probe.usage_has_fable === true || hasFableUsage) acc.unified.account_tier = 'max'
       else if (probe.usage_has_fable === false) acc.unified.account_tier = 'pro'
-      if (acc.unified.account_tier === 'pro' || acc.unified.account_tier === 'max')
-        acc.unified.account_tier_source = 'usage'
+      if (probe.usage_has_fable != null || hasFableUsage) acc.unified.account_tier_source = 'usage'
     }
     if (probe.fable && !fableTransport) {
       const planDenied = completeOfficialUsage && !hasFableUsage && isFablePlanDenied(probe.fable)
@@ -430,6 +485,20 @@ export class AccountQuota {
         }
       }
     }
+    // 限额查询's Fable hop sees the same 'usage credits required' 429 that
+    // routing does; record it the same way, and lift it when the hop succeeds.
+    if (probe.fable && !fableTransport) {
+      const fableKey = fableModelKey(FABLE_PROBE_MODEL)
+      if (Number(probe.fable.status) === 429 && isFableCreditsRequiredMessage(probe.fable.error)) {
+        setFableCreditsRequired(acc.unified, fableKey, Date.parse(nowIso) || Date.now(), FABLE_CREDITS_DENY_MS)
+      } else if (probe.fable.ok) {
+        clearFableCreditsRequired(acc.unified, fableKey)
+      }
+    }
+    if (profileTier) {
+      acc.unified.account_tier = profileTier
+      acc.unified.account_tier_source = 'profile'
+    }
     acc.unified.source = 'vm-oauth-usage'
     acc.unified.updated_at = new Date().toISOString()
     acc.last_probe = {
@@ -442,10 +511,15 @@ export class AccountQuota {
     }
     acc.unified.last_probe = acc.last_probe
     if (usageOk) {
-      syncActiveToPassive(acc, nowIso)
+      syncActiveToPassive(acc, nowIso, completeOfficialUsage ? confirmedReset : null, {
+        '5h': w5,
+        '7d': w7,
+        '7d_oi': oi,
+      })
       healOfficialOverwriteExtra(acc, accountId, this.repo)
       clearHeaderExhaustIfOfficialOpen(acc)
     }
+    settleElapsedHeaderWindows(acc, nowIso)
     this._rollWindowHistory(acc)
     const saved = this.repo.save(acc)
     this._writeSessionWindow(saved)
@@ -471,6 +545,7 @@ export class AccountQuota {
   ingestCliRateLimit(accountId, rateLimitInfo, usageBody = null, { countRequest = null } = {}) {
     const acc = this.ensure({ account_id: accountId })
     const infos = Array.isArray(rateLimitInfo) ? rateLimitInfo : rateLimitInfo ? [rateLimitInfo] : []
+    const sampledAt = new Date().toISOString()
     for (const info of infos) {
       if (!info || typeof info !== 'object') continue
       const typ = String(info.rateLimitType || info.rate_limit_type || '')
@@ -483,6 +558,7 @@ export class AccountQuota {
           status: info.status || (utilization != null ? statusFromUtil(utilization) : null),
           reset: info.resetsAt != null || info.resets_at != null ? epochToIso(info.resetsAt ?? info.resets_at) : null,
           utilization,
+          sampled_at: sampledAt,
         })
         acc.unified.headers[window].rate_limit_type = typ || null
         if (['rejected', 'rate_limited'].includes(String(info.status || '').toLowerCase())) {
@@ -516,6 +592,7 @@ export class AccountQuota {
       tokens_out: usageBody?.output_tokens ?? null,
     })
 
+    settleElapsedHeaderWindows(acc, sampledAt)
     this._rollWindowHistory(acc)
     return this.repo.save(acc)
   }
@@ -576,8 +653,9 @@ export class AccountQuota {
     const warnRatio = Number(policy.warn_ratio ?? this.config.warn_ratio ?? 0.75)
     const quotaConfig = this.quotaConfigFor(acc)
     const inflight = this.inflight.get(accountId) || 0
-    const gate = quotaGateOf(quotaConfig)
-    const band = gate.band
+    const gate5 = quotaGateOf(quotaConfig, '5h')
+    const gate7 = quotaGateOf(quotaConfig, '7d')
+    const band = gate5.band
 
     const limit = this.limitFor(acc, policy)
     if (inflight >= limit) {
@@ -621,8 +699,8 @@ export class AccountQuota {
     const w7 = headerWindowOrEmpty(acc.unified, '7d')
     const u5 = asUtilRatio(w5.utilization)
     const u7 = asUtilRatio(w7.utilization)
-    const z5 = quotaConfig.block_on_5h ? gateZone(u5, ratio, gate) : GATE_OPEN
-    const z7 = quotaConfig.block_on_7d ? gateZone(u7, weeklyRatio, gate) : GATE_OPEN
+    const z5 = quotaConfig.block_on_5h ? gateZone(u5, ratio, gate5) : GATE_OPEN
+    const z7 = quotaConfig.block_on_7d ? gateZone(u7, weeklyRatio, gate7) : GATE_OPEN
 
     if (z5 === GATE_GATED) {
       acc.last_blocked = { at: new Date().toISOString(), window: '5h', utilization: u5, status: w5.status }
@@ -634,10 +712,10 @@ export class AccountQuota {
           utilization: u5,
           safety_ratio: ratio,
           limit_5h: ratio,
-          gate_overshoot: gate.overshoot,
+          gate_overshoot: gate5.overshoot,
           inflight,
           reset: w5.reset,
-          message: `5h usage ${(u5 * 100).toFixed(1)}% ≥ safety ${(ratio * 100).toFixed(0)}% + ${(gate.overshoot * 100).toFixed(0)}% overshoot; request blocked to protect quota`,
+          message: `5h usage ${(u5 * 100).toFixed(1)}% ≥ safety ${(ratio * 100).toFixed(0)}% + ${(gate5.overshoot * 100).toFixed(0)}% overshoot; request blocked to protect quota`,
         },
       }
     }
@@ -653,10 +731,10 @@ export class AccountQuota {
           safety_ratio: weeklyRatio,
           weekly_safety_ratio: weeklyRatio,
           limit_7d: weeklyRatio,
-          gate_overshoot: gate.overshoot,
+          gate_overshoot: gate7.overshoot,
           inflight,
           reset: w7.reset,
-          message: `7d usage ${(u7 * 100).toFixed(1)}% ≥ weekly ${(weeklyRatio * 100).toFixed(0)}% + ${(gate.overshoot * 100).toFixed(0)}% overshoot; request blocked to protect weekly quota`,
+          message: `7d usage ${(u7 * 100).toFixed(1)}% ≥ weekly ${(weeklyRatio * 100).toFixed(0)}% + ${(gate7.overshoot * 100).toFixed(0)}% overshoot; request blocked to protect weekly quota`,
         },
       }
     }
@@ -677,7 +755,7 @@ export class AccountQuota {
           limit_5h: ratio,
           limit_7d: weeklyRatio,
           band,
-          gate_overshoot: gate.overshoot,
+          gate_overshoot: (in5 ? gate5 : gate7).overshoot,
           inflight,
         },
       }
@@ -707,7 +785,7 @@ export class AccountQuota {
             utilization_7d: u7,
             limit_5h: ratio,
             limit_7d: weeklyRatio,
-            gate_overshoot: gate.overshoot,
+            gate_overshoot: (in5 ? gate5 : gate7).overshoot,
             stale_settled: stale,
             inflight,
             estimated_prompt_tokens: risk?.estimatedPromptTokens ?? null,
@@ -717,7 +795,7 @@ export class AccountQuota {
             reset_5h: w5.reset,
             reset_7d: w7.reset,
             message:
-              '临近额度闸线，本请求预估未命中缓存过大。Near the quota safety line, this large uncached request is not eligible on this account.',
+              '临近额度闸线，本请求预估未命中缓存过大。请缩短上下文、等待窗口重置，或改用其他模型。Near the quota safety line, this large uncached request is not eligible on this account; shorten the context, wait for the window to reset, or switch to another model.',
           },
         }
       }
@@ -741,15 +819,16 @@ export class AccountQuota {
       return { ok: false, reason: 'concurrency_limit', detail: { inflight, max: limit, source: 'quota-reservation' } }
     }
     const inBand = this.gateZoneOf(accountId, { tier: opts.tier, account: acc }) === GATE_DRAINING
-    const stack = this.reservationBand.get(accountId) || []
-    stack.push(inBand)
-    this.reservationBand.set(accountId, stack)
+    const token = Symbol('quota-reservation')
+    const reservations = this.reservationBand.get(accountId) || new Map()
+    reservations.set(token, inBand)
+    this.reservationBand.set(accountId, reservations)
     this.inflight.set(accountId, inflight + 1)
     this._rpmTouch(accountId)
-    return { ok: true }
+    return { ok: true, release: () => this.release(accountId, token), token }
   }
 
-  /** sub2api 7d_oi: Fable-only window. Does not unschedulable the account. */
+  /** The `7d_oi` window limits Fable only; it does not block account scheduling. */
   fableWindowLimited(accountId, now = Date.now(), account = undefined) {
     const oi = (account === undefined ? this.repo.get(accountId) : account)?.unified?.['7d_oi']
     if (!oi) return false
@@ -797,12 +876,16 @@ export class AccountQuota {
     return n
   }
 
-  release(accountId) {
+  release(accountId, token) {
+    const reservations = this.reservationBand.get(accountId)
+    if (token !== undefined) {
+      if (!reservations?.delete(token)) return this.inflight.get(accountId) || 0
+    } else if (reservations?.size) {
+      reservations.delete([...reservations.keys()].at(-1))
+    }
+    if (reservations && !reservations.size) this.reservationBand.delete(accountId)
     const n = Math.max(0, (this.inflight.get(accountId) || 1) - 1)
     this.inflight.set(accountId, n)
-    const stack = this.reservationBand.get(accountId)
-    if (stack?.length) stack.pop()
-    if (stack && !stack.length) this.reservationBand.delete(accountId)
     return n
   }
 
@@ -811,10 +894,11 @@ export class AccountQuota {
    * previous percent, so the next large request treats the reading as stale
    * until headers/official usage move.
    */
-  noteBandSettled(accountId) {
+  noteBandSettled(accountId, token) {
     if (!accountId) return 0
-    const stack = this.reservationBand.get(accountId)
-    const reservedInBand = Array.isArray(stack) ? stack.some(Boolean) : false
+    const reservations = this.reservationBand.get(accountId)
+    const reservedInBand =
+      token === undefined ? [...(reservations?.values() || [])].some(Boolean) : reservations?.get(token)
     if (!reservedInBand && !this._drainingNow(accountId)) return this.staleSettled.get(accountId) || 0
     const next = (this.staleSettled.get(accountId) || 0) + 1
     this.staleSettled.set(accountId, next)
@@ -829,15 +913,16 @@ export class AccountQuota {
     const acc = account === undefined ? this.ensure({ account_id: accountId }) : account
     const policy = this.policyFor(acc, { tier })
     const quotaConfig = this.quotaConfigFor(acc)
-    const gate = quotaGateOf(quotaConfig)
+    const gate5 = quotaGateOf(quotaConfig, '5h')
+    const gate7 = quotaGateOf(quotaConfig, '7d')
     const ratio = Number(policy.limit_5h ?? policy.safety_ratio ?? this.config.safety_ratio ?? 0.85)
     const weeklyRatio = Number(
       policy.limit_7d ?? policy.weekly_safety_ratio ?? this.config.weekly_safety_ratio ?? ratio,
     )
     const u5 = asUtilRatio(headerWindowOrEmpty(acc.unified, '5h').utilization)
     const u7 = asUtilRatio(headerWindowOrEmpty(acc.unified, '7d').utilization)
-    const z5 = quotaConfig.block_on_5h ? gateZone(u5, ratio, gate) : GATE_OPEN
-    const z7 = quotaConfig.block_on_7d ? gateZone(u7, weeklyRatio, gate) : GATE_OPEN
+    const z5 = quotaConfig.block_on_5h ? gateZone(u5, ratio, gate5) : GATE_OPEN
+    const z7 = quotaConfig.block_on_7d ? gateZone(u7, weeklyRatio, gate7) : GATE_OPEN
     return worstGateZone(z5, z7)
   }
 
@@ -1008,6 +1093,7 @@ export class AccountQuota {
       tiers: this.tiers,
       accounts: this.repo.list().map((a) => {
         const lastUsedAt = this._lastUsedAt(a.account_id)
+        const rpm = this._rpmCount(a.account_id)
         const official = applyEffectiveWindows(a.unified, { lastUsedAt, source: a.unified?.source })
         const listed = listQuotaFromHeaders(a.unified)
         return {
@@ -1016,9 +1102,9 @@ export class AccountQuota {
           email: a.email,
           inflight: this.inflight.get(a.account_id) || 0,
           max_concurrency: a.max_concurrency,
-          rpm: this._rpmCount(a.account_id).n,
+          rpm: rpm.n,
           max_rpm: a.max_rpm ?? 0,
-          rpm_reset_at: this._rpmCount(a.account_id).resetAt,
+          rpm_reset_at: rpm.resetAt,
           requests: a.requests,
           tokens_in: a.tokens_in,
           tokens_out: a.tokens_out,
@@ -1172,14 +1258,31 @@ export class AccountQuota {
     return this.repo.save(acc)
   }
 
+  /**
+   * Upstream said this account needs usage credits for Fable. Keep Fable off
+   * the seat for a while (other models still route) and leave a marker the
+   * panel shows instead of 未探测. The marker sits outside `unified.fable`
+   * because a Pro usage probe deletes that object. A later Fable success on
+   * the account clears both via clearModelUnsupported.
+   */
+  markFableCreditsRequired(accountId, model, durationMs = FABLE_CREDITS_DENY_MS) {
+    const key = fableModelKey(model)
+    if (!accountId || !key) return null
+    const acc = this.repo.get(accountId)
+    if (!acc) return null
+    const now = Date.now()
+    acc.unified = acc.unified || {}
+    setFableCreditsRequired(acc.unified, key, now, durationMs)
+    acc.unified.updated_at = new Date(now).toISOString()
+    return this.repo.save(acc)
+  }
+
   clearModelUnsupported(accountId, model) {
     const key = resolvePolicyModelId(model) || String(model || '').trim()
     if (!accountId || !key) return null
     const acc = this.repo.get(accountId)
     if (!acc?.unified?.model_denied_until?.[key]) return acc
-    const denied = { ...acc.unified.model_denied_until }
-    delete denied[key]
-    acc.unified.model_denied_until = denied
+    clearFableCreditsRequired(acc.unified, key)
     acc.unified.updated_at = new Date().toISOString()
     return this.repo.save(acc)
   }
@@ -1308,18 +1411,43 @@ function isUnifiedRejected(h = {}) {
   return s5 === 'rejected' || s5 === 'rate_limited' || s7 === 'rejected' || s7 === 'rate_limited'
 }
 
+/**
+ * Merge one reading into an Extra window. Each window keeps its own `sampled_at`:
+ * a response that names only 7d must not make the 5h number look freshly read.
+ * A stored window whose reset already passed has ended, so none of its values
+ * carry into the new reading.
+ */
 function writeHeaderWindow(acc, key, incoming = {}) {
   acc.unified.headers = acc.unified.headers || {}
-  const cur = acc.unified.headers[key] || {}
+  const stored = acc.unified.headers[key] || {}
+  const cur = parseResetMs(stored.reset) <= Date.now() ? {} : stored
   const next = {
     utilization: incoming.utilization != null ? incoming.utilization : (cur.utilization ?? null),
     reset: incoming.reset || incoming.resets_at || cur.reset || null,
     status: incoming.status || cur.status || null,
   }
-  if (incoming.rate_limit_type || cur.rate_limit_type) {
-    next.rate_limit_type = incoming.rate_limit_type || cur.rate_limit_type
+  if (incoming.rate_limit_type || stored.rate_limit_type) {
+    next.rate_limit_type = incoming.rate_limit_type || stored.rate_limit_type
   }
+  const sampledAt = incoming.sampled_at || cur.sampled_at
+  if (sampledAt) next.sampled_at = sampledAt
   acc.unified.headers[key] = next
+}
+
+/**
+ * A 5h/7d window this write did not read again, whose reset has passed, is
+ * stored as stale now (as `persistEffectiveWindows` would later), instead of
+ * keeping the last window's numbers beside fresher ones.
+ */
+function settleElapsedHeaderWindows(acc, sampledAt, now = Date.now()) {
+  const headers = acc?.unified?.headers
+  if (!headers) return
+  for (const key of ['5h', '7d']) {
+    const window = headers[key]
+    if (!window || window.stale || (sampledAt && window.sampled_at === sampledAt)) continue
+    const wiped = wipeElapsedWindow(window, now)
+    if (wiped) headers[key] = wiped
+  }
 }
 
 function officialUtilToExtra(value) {
@@ -1362,13 +1490,36 @@ function shouldCopyOfficialToExtra(official, extra, now = Date.now()) {
   return false
 }
 
-/** Official /usage writes Extra only when Extra is empty, elapsed, or leftover rejected. */
-function syncActiveToPassive(acc, sampledAt) {
+const RESET_WINDOW = { '5h': 'five_hour', '7d': 'seven_day', '7d_oi': 'seven_day_overage_included' }
+
+/** A confirmed reset can replace a pre-claim sample even if its window end did not move. */
+function syncActiveToPassive(acc, sampledAt, confirmedReset, readings) {
   acc.unified.headers = acc.unified.headers || {}
+  const headers = acc.unified.headers
   const now = Date.now()
+  const at = sampledAt || new Date(now).toISOString()
+  const resetAt = Date.parse(confirmedReset?.at)
+  const cleared = new Set(confirmedReset?.cleared)
+  let copied = false
+  for (const [key, window] of Object.entries(RESET_WINDOW)) {
+    if (!cleared.has(window)) continue
+    const stored = headers[key]
+    const previousAt = Date.parse(stored?.sampled_at || headers.sampled_at)
+    const fresh = applyOfficialWindow(readings[key] || {})
+    if (!Number.isFinite(resetAt) || Date.parse(at) < resetAt || (stored && !Number.isFinite(previousAt))) continue
+    if (previousAt >= resetAt) {
+      // A later manual query should use the ordinary merge rules once the reset has been synchronized.
+      if (!confirmedReset.protectNewerSamples && previousAt < Date.parse(at)) cleared.delete(window)
+      continue
+    }
+    if (fresh?.utilization == null) continue
+    headers[key] = { ...fresh, sampled_at: at }
+    copied = true
+  }
   for (const key of ['5h', '7d']) {
+    if (cleared.has(RESET_WINDOW[key])) continue
     const src = acc.unified.official?.[key] || acc.unified[key]
-    const extra = acc.unified.headers[key]
+    const extra = headers[key]
     const officialReset = src?.reset || src?.resets_at || null
     if (!shouldCopyOfficialToExtra(src, extra, now)) {
       if (officialReset && extra && !extra.reset) writeHeaderWindow(acc, key, { reset: officialReset })
@@ -1378,17 +1529,21 @@ function syncActiveToPassive(acc, sampledAt) {
       utilization: officialUtilToExtra(src.utilization),
       reset: officialReset || extra?.reset || null,
       status: src.status || null,
+      sampled_at: at,
     })
+    copied = true
   }
   const oi = acc.unified['7d_oi']
-  if (oi && (oi.utilization != null || oi.status || oi.reset)) {
-    acc.unified.headers['7d_oi'] = {
-      utilization: officialUtilToExtra(oi.utilization) ?? acc.unified.headers['7d_oi']?.utilization ?? null,
-      reset: oi.reset || acc.unified.headers['7d_oi']?.reset || null,
-      status: oi.status || acc.unified.headers['7d_oi']?.status || null,
+  if (!cleared.has(RESET_WINDOW['7d_oi']) && oi && (oi.utilization != null || oi.status || oi.reset)) {
+    headers['7d_oi'] = {
+      utilization: officialUtilToExtra(oi.utilization) ?? headers['7d_oi']?.utilization ?? null,
+      reset: oi.reset || headers['7d_oi']?.reset || null,
+      status: oi.status || headers['7d_oi']?.status || null,
+      sampled_at: at,
     }
+    copied = true
   }
-  acc.unified.headers.sampled_at = sampledAt || new Date().toISOString()
+  if (copied && !(Date.parse(headers.sampled_at) > Date.parse(at))) headers.sampled_at = at
 }
 
 function lastHeaderAllocation(repo, accountId) {
@@ -1424,7 +1579,8 @@ function healOfficialOverwriteExtra(acc, accountId, repo) {
   const official = officialWindow(acc.unified, '5h')
   if (!officialLooksLimited(extra) || !officialLooksLimited(official)) return false
   if (extraIsLiveOpen(extra)) return false
-  const sampled = acc.unified.headers.sampled_at
+  // Only undo a value this probe copied; rows written before per-window times use the shared one.
+  const sampled = extra.sampled_at || acc.unified.headers.sampled_at
   const probeAt = acc.last_probe?.at || acc.unified.last_probe?.at
   if (sampled && probeAt) {
     const sampledMs = Date.parse(sampled)
@@ -1438,21 +1594,28 @@ function healOfficialOverwriteExtra(acc, accountId, repo) {
     utilization: prev,
     status: last.status_5h || 'allowed',
     reset: extra.reset || last.reset_5h || official.reset || null,
+    sampled_at: last.at,
   })
   acc.unified.headers.exhausted_at = null
   return true
 }
 
-function applyHeaderExhausted(acc, h = {}) {
+function applyHeaderExhausted(acc, h = {}, sampledAt = new Date().toISOString()) {
   const s5 = String(h['anthropic-ratelimit-unified-5h-status'] || '').toLowerCase()
   const s7 = String(h['anthropic-ratelimit-unified-7d-status'] || '').toLowerCase()
+  // Callers only pass exhausted with evidence: a window status, plan-limit
+  // text, or the classifier's account_quota_exhausted. When no window is named,
+  // the representative claim picks it; only a claimless proof falls back to 5h.
+  const claim = String(h['anthropic-ratelimit-unified-representative-claim'] || '').toLowerCase()
+  const claim7 = /^seven_day$|^7d$/.test(claim)
   const hit5 = s5 === 'rejected' || s5 === 'rate_limited'
-  const hit7 = s7 === 'rejected' || s7 === 'rate_limited'
+  const hit7 = s7 === 'rejected' || s7 === 'rate_limited' || (!hit5 && claim7)
   if (hit7) {
     writeHeaderWindow(acc, '7d', {
       utilization: num(h['anthropic-ratelimit-unified-7d-utilization']),
       reset: h['anthropic-ratelimit-unified-7d-reset'],
       status: 'rejected',
+      sampled_at: sampledAt,
     })
   }
   if (hit5 || !hit7) {
@@ -1460,6 +1623,7 @@ function applyHeaderExhausted(acc, h = {}) {
       utilization: num(h['anthropic-ratelimit-unified-5h-utilization']),
       reset: h['anthropic-ratelimit-unified-5h-reset'],
       status: 'rejected',
+      sampled_at: sampledAt,
     })
   }
   acc.unified.headers.exhausted_at = new Date().toISOString()

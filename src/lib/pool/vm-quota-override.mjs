@@ -17,6 +17,17 @@ const FIELDS = {
 }
 
 export const VM_QUOTA_FIELDS = Object.keys(FIELDS)
+const WINDOWS = ['5h', '7d']
+
+/** Keep a tenant's exact gate through operator edits that leave that gate enabled. */
+export function keepTenantExactGates(current, next) {
+  if (!next) return next
+  for (const window of WINDOWS) {
+    const key = `tenant_exact_${window}`
+    if (next[`block_on_${window}`] === true && current?.[key] === true) next[key] = true
+  }
+  return next
+}
 
 function parseField(key, value) {
   const spec = FIELDS[key]
@@ -58,7 +69,7 @@ export function vmQuotaOverrideOf(vm) {
     const parsed = parseField(key, raw[key])
     if (parsed.ok) out[key] = parsed.value
   }
-  return Object.keys(out).length ? out : null
+  return Object.keys(out).length ? keepTenantExactGates(raw, out) : null
 }
 
 /** Tier policy (`resolveTierPolicy`) with the VM's thresholds applied. */
@@ -84,6 +95,7 @@ export function applyVmQuotaConfig(quota, override) {
   const next = { ...base }
   if (override.block_on_5h != null) next.block_on_5h = override.block_on_5h
   if (override.block_on_7d != null) next.block_on_7d = override.block_on_7d
+  keepTenantExactGates(override, next)
   if (override.weekly_split != null) {
     next.weekly_split = {
       ...(base.weekly_split && typeof base.weekly_split === 'object' ? base.weekly_split : {}),

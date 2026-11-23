@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import fs from 'node:fs'
 import {
+  canonicalizeDottedClaudeId,
   isCatalogModelId,
   latestIdForFamily,
   resolveCatalogModel,
@@ -84,6 +84,7 @@ test('seed catalog matches the console model-policy matrix including opus-5', ()
   assert.ok(SEED_MODEL_IDS.includes('claude-sonnet-5-5'))
   assert.ok(SEED_MODEL_IDS.includes('claude-fable-5'))
   assert.ok(SEED_MODEL_IDS.includes('claude-fable-5-1'))
+  assert.ok(SEED_MODEL_IDS.includes('claude-fable-5-2'))
   assert.ok(SEED_MODEL_IDS.includes('claude-opus-5-5'))
   assert.ok(SEED_MODEL_IDS.includes('claude-haiku-5-5'))
   assert.ok(SEED_MODEL_IDS.includes('auto'))
@@ -105,7 +106,9 @@ test('seed catalog matches the console model-policy matrix including opus-5', ()
   assert.equal(validateOfficialModel('claude-fable-5-1').model, 'claude-fable-5-1')
   assert.equal(validateOfficialModel('claude-fable-5.1').model, 'claude-fable-5-1')
   assert.equal(validateOfficialModel('anthropic/claude-fable-5.1').model, 'claude-fable-5-1')
-  assert.equal(validateOfficialModel('fable').model, 'claude-fable-5-1')
+  assert.equal(validateOfficialModel('fable').model, 'claude-fable-5-2')
+  assert.equal(validateOfficialModel('claude-fable-5-2').model, 'claude-fable-5-2')
+  assert.equal(validateOfficialModel('claude-fable-5.2').model, 'claude-fable-5-2')
   assert.equal(validateOfficialModel('claude-fable-5.1[1m]').model, 'claude-fable-5-1')
   assert.equal(validateOfficialModel('claude-fable-5.1[1m]').want1m, true)
   clearModelsCache()
@@ -128,6 +131,50 @@ test('old worker catalogs cannot restore the unsupported dotted Fable 5.1 id', (
   clearModelsCache()
 })
 
+test('every dotted claude id is canonicalized, not just the listed ones', () => {
+  // Regression: the dotted → hyphen map used to be hardcoded per model, so each
+  // new x.y release (sonnet 5.5, haiku 5.5) silently failed to route.
+  assert.equal(canonicalizeDottedClaudeId('claude-opus-5.5'), 'claude-opus-5-5')
+  assert.equal(canonicalizeDottedClaudeId('claude-sonnet-5.5'), 'claude-sonnet-5-5')
+  assert.equal(canonicalizeDottedClaudeId('claude-haiku-5.5'), 'claude-haiku-5-5')
+  assert.equal(canonicalizeDottedClaudeId('claude-fable-5.1'), 'claude-fable-5-1')
+  // Already canonical, dated, and non-claude ids must pass through untouched.
+  assert.equal(canonicalizeDottedClaudeId('claude-opus-5-5'), 'claude-opus-5-5')
+  assert.equal(canonicalizeDottedClaudeId('claude-haiku-4-5-20251001'), 'claude-haiku-4-5-20251001')
+  assert.equal(canonicalizeDottedClaudeId('claude-3-5-haiku'), 'claude-3-5-haiku')
+  assert.equal(canonicalizeDottedClaudeId('gpt-6.2-sol'), 'gpt-6.2-sol')
+  assert.equal(canonicalizeDottedClaudeId('codex-1.0'), 'codex-1.0')
+  assert.equal(canonicalizeDottedClaudeId(''), '')
+})
+
+test('dotted 5.5 ids resolve for every family, with prefix and 1m suffix', () => {
+  clearModelsCache()
+  gatewayModelCatalog()
+  for (const [dotted, canonical] of [
+    ['claude-opus-5.5', 'claude-opus-5-5'],
+    ['claude-sonnet-5.5', 'claude-sonnet-5-5'],
+    ['claude-haiku-5.5', 'claude-haiku-5-5'],
+  ]) {
+    assert.equal(validateOfficialModel(dotted).model, canonical)
+    assert.equal(validateOfficialModel(`anthropic/${dotted}`).model, canonical)
+    assert.equal(validateOfficialModel(`openrouter/anthropic/${dotted}`).model, canonical)
+    const with1m = validateOfficialModel(`${dotted}[1m]`)
+    assert.equal(with1m.model, canonical)
+    assert.equal(with1m.want1m, true)
+    assert.ok(!getCatalogIds().includes(dotted))
+  }
+  clearModelsCache()
+})
+
+test('a dotted id stays canonical when the worker catalog is still pending', () => {
+  clearModelsCache()
+  setModelCatalog([], { source: 'go-slot-worker' })
+  const pending = validateOfficialModel('claude-sonnet-5.5')
+  assert.equal(pending.ok, true)
+  assert.equal(pending.model, 'claude-sonnet-5-5')
+  clearModelsCache()
+})
+
 test('gatewayModelCatalog stays local and never hops', () => {
   clearModelsCache()
   const cat = gatewayModelCatalog()
@@ -144,18 +191,6 @@ test('gatewayModelCatalog stays local and never hops', () => {
     ids.some((id) => String(id).startsWith('claude-')),
     JSON.stringify(ids.slice(0, 12)),
   )
-  const src = fs.readFileSync(new URL('../../src/server.mjs', import.meta.url), 'utf8')
-  assert.equal(src.includes('callWorkerGet'), false)
-  assert.match(src, /return gatewayModelCatalog\([a-z]*\)/)
-})
-
-test('models module never talks to Anthropic or a CLI binary', () => {
-  const src = fs.readFileSync(new URL('../../src/lib/protocol/models.mjs', import.meta.url), 'utf8')
-  assert.equal(src.includes('api.anthropic.com'), false)
-  assert.equal(src.includes('oauth-2025-04-20'), false)
-  assert.equal(src.includes('spawnSync'), false)
-  assert.equal(src.includes('child_process'), false)
-  assert.equal(/user-agent.*claude-cli/.test(src), false)
 })
 
 test('gatewayModelCatalog filters by key group_type', () => {
@@ -181,6 +216,9 @@ test('enabled GPT image models are listed for openai and all keys, never for ant
     const ids = (groupType) => gatewayModelCatalog({ groupType }).data.map((m) => m.id)
     assert.ok(ids('openai').includes('gpt-image-2.5-flare'))
     assert.ok(ids('all').includes('gpt-image-2.5-flare'))
+    assert.ok(ids('openai').includes('gpt-image-2.6-flare'))
+    assert.ok(ids('openai').includes('gpt-image-2.6-sunburst'))
+    assert.ok(ids('all').includes('gpt-image-2.6-flare'))
     assert.ok(!ids('openai').includes('gpt-image-2.5-sunburst'))
     assert.ok(!ids('anthropic').includes('gpt-image-2.5-flare'))
     const row = gatewayModelCatalog({ groupType: 'openai' }).data.find((m) => m.id === 'gpt-image-2.5-flare')

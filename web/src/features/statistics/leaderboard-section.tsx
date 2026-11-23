@@ -34,18 +34,23 @@ import {
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { EntryName } from './leaderboard-card'
 import { leaderboardQueryOptions } from './queries'
+import { STATS_RANGES } from './stats-format'
 
-const PERIODS: { id: StatsRange; label: string; empty: string }[] = [
-  { id: 'today', label: '今日', empty: '今日暂无数据' },
-  { id: '7days', label: '7天', empty: '暂无数据' },
-  { id: '30days', label: '30天', empty: '暂无数据' },
-  { id: 'thisMonth', label: '本月', empty: '本月暂无数据' },
-]
+const PERIODS: { id: StatsRange; label: string; empty: string }[] =
+  STATS_RANGES.map((range) => ({
+    ...range,
+    empty:
+      range.id === 'today'
+        ? '今日暂无数据'
+        : range.id === 'thisMonth'
+          ? '本月暂无数据'
+          : '暂无数据',
+  }))
 
 const SCOPE_LABELS: Record<LeaderboardScope, string> = {
   user: '用户',
   key: '密钥',
-  vm: '供应商',
+  vm: '虚拟机',
   model: '模型',
 }
 
@@ -54,6 +59,10 @@ const LIMIT = 50
 type SortKey =
   | 'totalRequests'
   | 'totalTokens'
+  | 'inputTokens'
+  | 'outputTokens'
+  | 'cacheCreationTokens'
+  | 'cacheReadTokens'
   | 'totalCost'
   | 'totalActualCost'
   | 'successRate'
@@ -89,6 +98,30 @@ const COLUMNS: Column[] = [
     header: 'Token 数',
     value: (row) => row.totalTokens,
     cell: (row) => formatTokenAmount(row.totalTokens),
+  },
+  {
+    key: 'inputTokens',
+    header: '输入',
+    value: (row) => row.inputTokens,
+    cell: (row) => formatTokenAmount(row.inputTokens),
+  },
+  {
+    key: 'outputTokens',
+    header: '输出',
+    value: (row) => row.outputTokens,
+    cell: (row) => formatTokenAmount(row.outputTokens),
+  },
+  {
+    key: 'cacheCreationTokens',
+    header: '缓存写入',
+    value: (row) => row.cacheCreationTokens,
+    cell: (row) => formatTokenAmount(row.cacheCreationTokens),
+  },
+  {
+    key: 'cacheReadTokens',
+    header: '缓存读取',
+    value: (row) => row.cacheReadTokens,
+    cell: (row) => formatTokenAmount(row.cacheReadTokens),
   },
   {
     key: 'totalCost',
@@ -177,18 +210,26 @@ function RankCell({ rank }: { rank: number }) {
 export function LeaderboardSection({
   scopes,
   tz,
+  global = false,
   scope,
   onScopeChange,
+  scopeLabels,
+  entryLimit = LIMIT,
 }: {
   scopes: LeaderboardScope[]
   tz: string
+  global?: boolean
   scope: LeaderboardScope
   onScopeChange: (scope: LeaderboardScope) => void
+  scopeLabels?: Partial<Record<LeaderboardScope, string>>
+  entryLimit?: number
 }) {
   const [period, setPeriod] = useState<StatsRange>('today')
   const [sortKey, setSortKey] = useState<SortKey | null>(null)
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc')
-  const board = useQuery(leaderboardQueryOptions(period, scope, LIMIT, tz))
+  const board = useQuery(
+    leaderboardQueryOptions(period, scope, entryLimit, tz, global)
+  )
   const entries = board.data?.entries
 
   const sorted = useMemo(() => {
@@ -239,7 +280,7 @@ export function LeaderboardSection({
             >
               {scopes.map((item) => (
                 <TabsTrigger key={item} value={item}>
-                  {SCOPE_LABELS[item]}
+                  {scopeLabels?.[item] ?? SCOPE_LABELS[item]}
                 </TabsTrigger>
               ))}
             </TabsList>
@@ -247,7 +288,7 @@ export function LeaderboardSection({
         </div>
       </div>
 
-      <div className='mb-6 flex items-center gap-1'>
+      <div className='mb-6 flex flex-wrap items-center gap-1'>
         {PERIODS.map((item) => (
           <Button
             key={item.id}
@@ -261,7 +302,7 @@ export function LeaderboardSection({
         ))}
       </div>
 
-      {board.isLoading ? (
+      {board.isLoading || board.isPlaceholderData ? (
         <Card>
           <CardContent className='space-y-4 py-6'>
             <div className='space-y-2'>
@@ -306,7 +347,9 @@ export function LeaderboardSection({
                 <TableHeader>
                   <TableRow>
                     <TableHead className='w-24'>排名</TableHead>
-                    <TableHead>{SCOPE_LABELS[scope]}</TableHead>
+                    <TableHead>
+                      {scopeLabels?.[scope] ?? SCOPE_LABELS[scope]}
+                    </TableHead>
                     {COLUMNS.map((col) => (
                       <TableHead
                         key={col.key}

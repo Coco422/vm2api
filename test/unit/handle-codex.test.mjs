@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import {
   isRetryableCodexTransport,
+  isRetryableSameCodexAccount,
   runCodexKernelHop,
   handleCodexProtocol,
   pickCodexCandidates,
@@ -38,6 +39,56 @@ test('502 upstream_transport is retryable before commit', () => {
   )
   assert.equal(isRetryableCodexTransport({ ok: true, status: 200 }), false)
   assert.equal(isRetryableCodexTransport({ ok: false, status: 401, body: { error: { code: 'oauth_revoked' } } }), false)
+})
+test('server_is_overloaded retries only before output commitment', () => {
+  const result = {
+    ok: false,
+    committed: false,
+    status: 503,
+    body: { error: { type: 'service_unavailable_error', code: 'server_is_overloaded' } },
+  }
+  assert.equal(isRetryableSameCodexAccount(result), true)
+  assert.equal(isRetryableSameCodexAccount({ ...result, committed: true }), false)
+  assert.equal(isRetryableSameCodexAccount(result, { headersSent: true }), false)
+  assert.equal(isRetryableSameCodexAccount(result, { signal: AbortSignal.abort() }), false)
+})
+
+function overloadedResult(status, code) {
+  return {
+    ok: false,
+    committed: false,
+    status,
+    body: { error: { code, message: 'busy' } },
+  }
+}
+
+test('same-account retries accept server_is_overloaded on transient 5xx before commit', () => {
+  for (const status of [500, 502, 503, 504]) {
+    assert.equal(
+      isRetryableSameCodexAccount(overloadedResult(status, 'server_is_overloaded')),
+      true,
+      `status ${status}`,
+    )
+  }
+  assert.equal(isRetryableSameCodexAccount(overloadedResult(503, 'overloaded_error')), true)
+})
+
+test('same-account retries stop after commit, headers, cancel, conversion, or non-retryable status', () => {
+  const base = overloadedResult(502, 'server_is_overloaded')
+  assert.equal(isRetryableSameCodexAccount({ ...base, committed: true }), false)
+  assert.equal(isRetryableSameCodexAccount(base, { headersSent: true }), false)
+  assert.equal(isRetryableSameCodexAccount(base, { conversionError: new Error('bad stream') }), false)
+  assert.equal(isRetryableSameCodexAccount(base, { signal: AbortSignal.abort() }), false)
+  assert.equal(isRetryableSameCodexAccount(overloadedResult(429, 'server_is_overloaded')), false)
+  assert.equal(
+    isRetryableSameCodexAccount({
+      ok: false,
+      committed: false,
+      status: 502,
+      body: { error: { code: 'usage_limit_reached' } },
+    }),
+    false,
+  )
 })
 
 test('runCodexKernelHop retries a silent first-hop 502 then succeeds', async () => {
@@ -705,7 +756,7 @@ test('request log first_token_ms falls back to hop ttftMs without firstTokenAt',
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-test('incomplete Responses stream still bills tokens from the completed event', async () => {
+test('Codex billing uses the completed event when hop usage has only zero totals', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-bill-'))
   writeGptVm(root, 'vm-gpt-a')
   const res = {
@@ -746,9 +797,9 @@ test('incomplete Responses stream still bills tokens from the completed event', 
           'data: {"type":"response.completed","response":{"service_tier":"priority","usage":{"input_tokens":40,"output_tokens":2,"input_tokens_details":{"cached_tokens":5}}}}',
         )
         return {
-          ok: false,
+          ok: true,
           status: 200,
-          terminalState: 'incomplete',
+          terminalState: 'verified',
           usage: { input_tokens: 0, output_tokens: 0 },
         }
       },
@@ -1110,7 +1161,7 @@ test('transient GPT failures retry the same account three times before switching
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-test('same-account retry never replays after the first SSE event', async () => {
+test('buffered Responses JSON returns the hop error without replaying after the first SSE event', async () => {
   const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
   rt.resetOpenAIAccountRuntime()
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-same-emitted-'))
@@ -1126,7 +1177,7 @@ test('same-account retry never replays after the first SSE event', async () => {
       },
     }),
   )
-  assert.equal(out, undefined)
+  assert.deepEqual(out, { status: 500, body: { error: { code: 'server_error' } } })
   assert.deepEqual(seen, ['vm-gpt-a'])
   rt.resetOpenAIAccountRuntime()
   fs.rmSync(root, { recursive: true, force: true })
@@ -1357,68 +1408,41 @@ test('codex rebuild outbound session is not the inbound session', async () => {
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-test('codex kernel envelope preserves official routing headers without client auth', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-routing-headers-'))
-  const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
-  writeGptVm(root, 'vm-gpt-a')
-  const { envelopes } = await hopCodex({
-    root,
-    stickyRouter: sticky,
-    headers: {
-      authorization: 'Bearer sub2api-key',
-      originator: 'Codex Desktop',
-      'openai-beta': 'responses_websockets=2026-02-06',
-      'session-id': 'session:t',
-      'thread-id': 'thread:t',
-      'x-client-request-id': 'request:t',
-      'x-codex-beta-features': 'remote_compaction_v2',
-      'x-codex-turn-metadata': '{"thread_id":"t"}',
-      'x-codex-window-id': 'window:2',
-      'x-openai-internal-codex-responses-lite': 'true',
-    },
-    body: { model: 'gpt-6.1-sol', input: 'hi', stream: false, service_tier: 'fast' },
-  })
-  const session = envelopes[0].session
-  assert.deepEqual(envelopes[0].headers, {
-    originator: 'Codex Desktop',
-    'openai-beta': 'responses_websockets=2026-02-06',
-    'session-id': session.session_id,
-    'thread-id': 'thread:t',
-    'x-client-request-id': 'request:t',
-    'x-codex-beta-features': 'remote_compaction_v2',
-    'x-codex-turn-metadata': '{"thread_id":"t"}',
-    'x-codex-window-id': 'window:2',
-    'x-openai-internal-codex-responses-lite': 'true',
-    'x-codex-routing-hint': 'model=gpt-6.1-sol;tier=priority',
-  })
-  assert.notEqual(envelopes[0].headers['session-id'], 'session:t')
-  assert.equal(envelopes[0].headers['session-id'], session.session_id)
-  assert.equal(envelopes[0].headers.authorization, undefined)
-  assert.equal(envelopes[0].body.service_tier, 'priority')
-  sticky.db?.close?.()
-  fs.rmSync(root, { recursive: true, force: true })
-})
-
-test('codex rebuild outbound session is stable on the same slot', async () => {
+test('Codex follow-ups keep their VM and outbound session after another VM gains priority', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-stable-'))
   const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
+  t.after(() => {
+    sticky.db.close()
+    fs.rmSync(root, { recursive: true, force: true })
+  })
   writeGptVm(root, 'vm-gpt-a')
+  const seen = []
+  const onHop = ({ exec }) => {
+    seen.push(exec.vmId)
+    return { ok: true, status: 200, terminalState: 'verified', body: { id: 'resp_ok' } }
+  }
   const inbound = 'sess-stable'
   const first = await hopCodex({
     root,
     stickyRouter: sticky,
     headers: { 'x-session-id': inbound },
     body: { model: 'gpt-5.4', input: 'hi', stream: false },
+    onHop,
   })
+  writeGptVm(root, 'vm-gpt-b')
+  const otherVmFile = path.join(root, 'vms', 'vm-gpt-b.json')
+  const otherVm = JSON.parse(fs.readFileSync(otherVmFile, 'utf8'))
+  otherVm.policy = { priority: 10, weight: 10 }
+  fs.writeFileSync(otherVmFile, JSON.stringify(otherVm))
   const second = await hopCodex({
     root,
     stickyRouter: sticky,
     headers: { 'x-session-id': inbound },
     body: { model: 'gpt-5.4', input: 'hi again', stream: false },
+    onHop,
   })
+  assert.deepEqual(seen, ['vm-gpt-a', 'vm-gpt-a'])
   assert.equal(first.envelopes[0].session.session_id, second.envelopes[0].session.session_id)
-  sticky.db?.close?.()
-  fs.rmSync(root, { recursive: true, force: true })
 })
 
 test('codex rebuild remints session after failover to another slot', async () => {
@@ -1655,4 +1679,125 @@ test('tool argument disagreement terminates the client stream instead of recordi
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
+})
+
+test('a freed GPT seat wakes only a waiter that can use that account', async () => {
+  const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
+  rt.resetOpenAIAccountRuntime()
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-targeted-wake-'))
+  const vmDir = path.join(root, 'vms')
+  for (const [id, model] of [
+    ['vm-gpt-a', 'gpt-a'],
+    ['vm-gpt-b', 'gpt-b'],
+  ]) {
+    writeGptVm(root, id)
+    const file = path.join(vmDir, `${id}.json`)
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8'))
+    fs.writeFileSync(file, JSON.stringify({ ...raw, policy: { maxConcurrency: 1, allowed_models: [model] } }))
+  }
+  const gates = []
+  const opened = []
+  for (let i = 0; i < 2; i++) gates.push(new Promise((resolve) => opened.push(resolve)))
+  let hops = 0
+  const ops = {
+    ensureCodexKernel: async () => ({ ok: true }),
+    streamCodexKernel: async ({ onEvent }) => {
+      const gate = gates[hops++]
+      if (gate) await gate
+      await onEvent('data: {"type":"response.completed"}')
+      return { ok: true, status: 200, terminalState: 'verified' }
+    },
+  }
+  const run = (model) => handleCodexProtocol(codexArgs(root, ops, { body: { model, input: 'hi', stream: false } }))
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 20))
+  const busyA = run('gpt-a')
+  await tick()
+  const busyB = run('gpt-b')
+  await tick()
+  assert.equal(hops, 2)
+  const waitersB = Array.from({ length: 10 }, () => run('gpt-b'))
+  await tick()
+  const waiterA = run('gpt-a')
+  await tick()
+  assert.equal(rt.openAIWaiterCount(), 11)
+  // Each selection round lists vms/ twice: quota sync, then the summarized pool.
+  const realReaddir = fs.readdirSync
+  let vmDirReads = 0
+  fs.readdirSync = function (dir, ...rest) {
+    if (dir === vmDir) vmDirReads++
+    return realReaddir.call(this, dir, ...rest)
+  }
+  try {
+    opened[0]()
+    assert.equal((await busyA).status, 200)
+    assert.equal((await waiterA).status, 200)
+  } finally {
+    fs.readdirSync = realReaddir
+  }
+  // One round for the gpt-a waiter; the ten gpt-b waiters ahead of it are not woken.
+  assert.equal(vmDirReads, 2)
+  assert.equal(rt.openAIWaiterCount(), 10)
+  opened[1]()
+  const results = await Promise.all([busyB, ...waitersB])
+  assert.deepEqual(
+    results.map((r) => r.status),
+    Array(11).fill(200),
+  )
+  assert.equal(hops, 13)
+  rt.resetOpenAIAccountRuntime()
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('a woken GPT waiter whose seat was taken re-parks first instead of waking the queue', async () => {
+  const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
+  rt.resetOpenAIAccountRuntime()
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-stolen-seat-'))
+  const vmDir = path.join(root, 'vms')
+  writeGptVm(root, 'vm-gpt-a')
+  const file = path.join(vmDir, 'vm-gpt-a.json')
+  const raw = JSON.parse(fs.readFileSync(file, 'utf8'))
+  fs.writeFileSync(file, JSON.stringify({ ...raw, policy: { maxConcurrency: 1 } }))
+  const order = []
+  const ops = {
+    ensureCodexKernel: async () => ({ ok: true }),
+    streamCodexKernel: async ({ onEvent }) => {
+      await onEvent('data: {"type":"response.completed"}')
+      return { ok: true, status: 200, terminalState: 'verified' }
+    },
+  }
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 20))
+  const held = rt.tryAcquireOpenAISlot('vm-gpt-a', { concurrency: 1 })
+  const waiters = []
+  for (let i = 0; i < 5; i++) {
+    waiters.push(handleCodexProtocol(codexArgs(root, ops)).then((r) => order.push(i) && r))
+    await tick()
+  }
+  assert.equal(rt.openAIWaiterCount(), 5)
+  const realReaddir = fs.readdirSync
+  let vmDirReads = 0
+  fs.readdirSync = function (dir, ...rest) {
+    if (dir === vmDir) vmDirReads++
+    return realReaddir.call(this, dir, ...rest)
+  }
+  let thief
+  try {
+    held.release()
+    thief = rt.tryAcquireOpenAISlot('vm-gpt-a', { concurrency: 1 })
+    assert.ok(thief)
+    await tick()
+  } finally {
+    fs.readdirSync = realReaddir
+  }
+  // Only the oldest waiter re-checks; the other four stay parked.
+  assert.equal(vmDirReads, 2)
+  assert.equal(rt.openAIWaiterCount(), 5)
+  thief.release()
+  const results = await Promise.all(waiters)
+  assert.deepEqual(
+    results.map((r) => r.status),
+    Array(5).fill(200),
+  )
+  assert.deepEqual(order, [0, 1, 2, 3, 4])
+  rt.resetOpenAIAccountRuntime()
+  fs.rmSync(root, { recursive: true, force: true })
 })

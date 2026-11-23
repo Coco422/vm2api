@@ -1,11 +1,11 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
+import http from 'node:http'
 import os from 'node:os'
-import net from 'node:net'
 import path from 'node:path'
-import { runFleetUpdate, fleetStatus, isWorkerProcessUp, restartLocalEgress } from '../../src/lib/vm/fleet-update.mjs'
-import { startEgressProcess, inspectEgressProcess } from '../../src/lib/vm/egress.mjs'
+import { runFleetUpdate, fleetStatus, isWorkerProcessUp, applyNativeTelemetry } from '../../src/lib/vm/fleet-update.mjs'
+import { readSlotProcessStatus } from '../../src/lib/vm/slot-process-status.mjs'
 
 function writeSlot(root, id, extra = {}) {
   const dir = path.join(root, 'vms')
@@ -83,56 +83,6 @@ test('degraded worker without OAuth still counts as up', () => {
   assert.equal(isWorkerProcessUp({ code: 'worker_unavailable' }), false)
 })
 
-test('fleet telemetry skips db rows whose container is absent on this host', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-fleet-skip-'))
-  writeSlot(root, 'vm-07')
-  const report = await runFleetUpdate(root, {
-    action: 'telemetry',
-    telemetryFn: async () => ({ ok: false, error: 'Error: No such container: kin-07' }),
-  })
-  assert.equal(report.total, 1)
-  assert.equal(report.ok_count, 1)
-  assert.equal(report.skipped_count, 1)
-  assert.equal(report.failed_count, 0)
-  assert.equal(report.items[0].skipped, true)
-  assert.equal(report.items[0].skip_reason, 'container_unavailable')
-  assert.equal(report.items[0].telemetry.skipped, true)
-  fs.rmSync(root, { recursive: true, force: true })
-})
-
-test('fleet telemetry still fails when a present container refresh errors', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-fleet-hard-'))
-  writeSlot(root, 'vm-08')
-  const report = await runFleetUpdate(root, {
-    action: 'telemetry',
-    telemetryFn: async () => ({ ok: false, error: 'docker exec failed: permission denied' }),
-  })
-  assert.equal(report.failed_count, 1)
-  assert.equal(report.ok_count, 0)
-  assert.equal(report.items[0].skipped, undefined)
-  assert.equal(report.items[0].code, 'telemetry_update_failed')
-  fs.rmSync(root, { recursive: true, force: true })
-})
-
-test('fleet telemetry uses injected telemetryFn with options object', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-fleet-tel-'))
-  writeSlot(root, 'vm-01', { node_id: 'node-a' })
-  const calls = []
-  const report = await runFleetUpdate(root, {
-    action: 'telemetry',
-    telemetryFn: async (opts) => {
-      calls.push(opts)
-      return { ok: true, action: 'restarted' }
-    },
-  })
-  assert.equal(report.ok_count, 1)
-  assert.equal(calls.length, 1)
-  assert.equal(calls[0].vm.id, 'vm-01')
-  assert.equal(calls[0].projectRoot, root)
-  assert.equal(calls[0].enabled, calls[0].telemetryEnabled)
-  fs.rmSync(root, { recursive: true, force: true })
-})
-
 test('fleet collect skips reload', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-fleet-c-'))
   writeSlot(root, 'vm-01')
@@ -152,112 +102,253 @@ test('fleet collect skips reload', async () => {
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-test('fleet refresh replaces an egress process whose binary was deleted', {
-  skip: process.platform !== 'linux',
-}, async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-fleet-egress-'))
-  const oldBin = path.join(root, 'kin-egress-old')
-  const newBin = path.join(root, 'kin-egress')
-  const source = process.env.KIN_EGRESS_BIN || path.resolve(import.meta.dirname, '../../bin/kin-egress')
-  fs.copyFileSync(source, oldBin)
-  fs.copyFileSync(source, newBin)
-  fs.chmodSync(oldBin, 0o755)
-  fs.chmodSync(newBin, 0o755)
-  const proxy = { id: 'px-fleet', scheme: 'socks5', host: '192.0.2.1', port: 1080, url: 'socks5://192.0.2.1:1080' }
-  writeSlot(root, 'vm-01', { proxy })
-  const probe = net.createServer()
-  const port = await new Promise((resolve) => probe.listen(0, '127.0.0.1', () => resolve(probe.address().port)))
-  await new Promise((resolve) => probe.close(resolve))
-  const previous = process.env.KIN_EGRESS_BIN
-  process.env.KIN_EGRESS_BIN = newBin
-  const orphan = await startEgressProcess({
-    projectRoot: root,
-    proxyId: proxy.id,
-    proxyUrl: 'socks5h://192.0.2.1:1080',
-    listenHost: '127.0.0.1',
-    tcpPort: port,
-    dnsPort: 0,
-    bin: oldBin,
+test('fleet collection bounds concurrency and visits every slot', { timeout: 2000 }, async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-fleet-concurrency-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  for (const id of ['vm-01', 'vm-02', 'vm-03', 'vm-04']) writeSlot(root, id)
+  let release
+  const gate = new Promise((resolve) => {
+    release = resolve
   })
-  assert.equal(orphan.ok, true, orphan.error)
-  fs.unlinkSync(oldBin)
-  fs.writeFileSync(path.join(root, 'data/run/egress/px-fleet/egress.pid'), '999999999\n')
-  const egressOpts = {
-    runDocker: (args) =>
-      args[0] === 'network' && args[1] === 'inspect' ? { ok: true, stdout: '127.0.0.0/8|127.0.0.1' } : { ok: true },
-    runIptables: () => ({ ok: true }),
-    listenHost: '127.0.0.1',
-    ports: { tcp: port, dns: 0 },
-    bin: newBin,
-  }
+  let notifyStarted
+  const started = new Promise((resolve) => {
+    notifyStarted = resolve
+  })
+  const collected = []
+  let active = 0
+  let peak = 0
+  const pending = runFleetUpdate(root, {
+    action: 'collect',
+    concurrency: 2,
+    collectFn: async (_root, vm) => {
+      collected.push(vm.id)
+      active += 1
+      peak = Math.max(peak, active)
+      if (collected.length === 2) notifyStarted()
+      await gate
+      active -= 1
+      return { ok: true, id: vm.id }
+    },
+  })
   try {
-    const report = await runFleetUpdate(root, {
-      action: 'telemetry',
-      telemetryFn: async ({ projectRoot, vm }) => restartLocalEgress(projectRoot, vm, egressOpts),
-      healthFn: async () => ({ ok: true }),
-    })
-    assert.equal(report.failed_count, 0, JSON.stringify(report.items))
-    const current = inspectEgressProcess(root, proxy.id)
-    assert.equal(current.ok, true, JSON.stringify(current))
-    assert.notEqual(current.pid, orphan.pid)
-    assert.equal(fs.readlinkSync(`/proc/${current.pid}/exe`), newBin)
-    // The orphan is this test process's own child: after SIGTERM it lingers as a zombie until Node reaps it.
-    for (let i = 0; i < 100 && fs.existsSync(`/proc/${orphan.pid}`); i++) {
-      await new Promise((resolve) => setTimeout(resolve, 50))
-    }
-    assert.equal(fs.existsSync(`/proc/${orphan.pid}`), false)
-    assert.equal(
-      JSON.parse(fs.readFileSync(path.join(root, 'data/run/egress/px-fleet/egress.json'), 'utf8')).listen_tcp,
-      `127.0.0.1:${port}`,
-    )
-    process.kill(current.pid, 'SIGTERM')
+    await started
+    assert.equal(active, 2)
+    assert.equal(collected.length, 2, 'queued slots must wait for a free worker')
   } finally {
-    if (previous === undefined) delete process.env.KIN_EGRESS_BIN
-    else process.env.KIN_EGRESS_BIN = previous
+    release()
+  }
+  const report = await pending
+  assert.equal(peak, 2)
+  assert.equal(active, 0)
+  assert.deepEqual(collected.sort(), ['vm-01', 'vm-02', 'vm-03', 'vm-04'])
+  assert.equal(report.total, 4)
+  assert.equal(report.ok_count, 4)
+  assert.equal(report.failed_count, 0)
+})
+
+test('native telemetry publication uses the current stored VM kind and reports unsupported without writes', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-fleet-current-kind-'))
+  try {
+    writeSlot(root, 'vm-01', { family: 'codex', seed_policy: { telemetry_disabled: true } })
+    const file = path.join(root, 'vms', 'vm-01.json')
+    const before = fs.readFileSync(file, 'utf8')
+    const result = await applyNativeTelemetry({
+      projectRoot: root,
+      vm: { id: 'vm-01', family: 'claude', seed_policy: { telemetry_disabled: false } },
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.supported, false)
+    assert.equal(result.state, 'unsupported')
+    assert.equal(result.code, 'telemetry_unsupported')
+    assert.equal(result.wrote, false)
+    assert.equal(result.published, false)
+    assert.equal(result.applied, false)
+    assert.equal(fs.readFileSync(file, 'utf8'), before)
+    assert.equal(fs.existsSync(path.join(root, 'vms', 'vm-01', 'cli-home')), false)
+  } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
 })
 
-test('concurrent fleet telemetry on two slots sharing one proxy restarts egress once', {
-  skip: process.platform !== 'linux',
-}, async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-fleet-shared-'))
-  const bin = process.env.KIN_EGRESS_BIN || path.resolve(import.meta.dirname, '../../bin/kin-egress')
-  const proxy = { id: 'px-shared', scheme: 'socks5', host: '192.0.2.1', port: 1080, url: 'socks5://192.0.2.1:1080' }
-  writeSlot(root, 'vm-01', { proxy })
-  writeSlot(root, 'vm-02', { proxy })
-  const probe = net.createServer()
-  const port = await new Promise((resolve) => probe.listen(0, '127.0.0.1', () => resolve(probe.address().port)))
-  await new Promise((resolve) => probe.close(resolve))
-  const egressOpts = {
-    runDocker: (args) =>
-      args[0] === 'network' && args[1] === 'inspect' ? { ok: true, stdout: '127.0.0.0/8|127.0.0.1' } : { ok: true },
-    runIptables: () => ({ ok: true }),
-    listenHost: '127.0.0.1',
-    ports: { tcp: port, dns: 0 },
-    bin,
-  }
-  let restartCalls = 0
-  try {
-    const report = await runFleetUpdate(root, {
-      action: 'telemetry',
-      concurrency: 4,
-      telemetryFn: async ({ projectRoot, vm }) => {
-        restartCalls += 1
-        return restartLocalEgress(projectRoot, vm, egressOpts)
-      },
-      healthFn: async () => ({ ok: true }),
-    })
-    assert.equal(restartCalls, 2)
-    assert.equal(report.failed_count, 0, JSON.stringify(report.items))
-    const current = inspectEgressProcess(root, proxy.id)
-    assert.equal(current.ok, true, JSON.stringify(current))
-    assert.equal(
-      JSON.parse(fs.readFileSync(path.join(root, 'data/run/egress/px-shared/egress.json'), 'utf8')).listen_tcp,
-      `127.0.0.1:${port}`,
+test('CRAG telemetry publishes settings, uses authenticated apply, and restores scheduling after restart', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-crag-telemetry-'))
+  const id = 'vm-01'
+  const slotDir = path.join(root, 'vms', id)
+  const runDir = path.join(slotDir, 'run')
+  const settingsPath = path.join(slotDir, 'cli-home', '.claude', 'settings.json')
+  const vmPath = path.join(root, 'vms', `${id}.json`)
+  const read = (file) => JSON.parse(fs.readFileSync(file, 'utf8'))
+  writeSlot(root, id, { dataplane: 'crag', schedulable: true, seed_policy: { telemetry_disabled: false } })
+  fs.mkdirSync(runDir, { recursive: true })
+  fs.writeFileSync(path.join(runDir, 'internal.token'), 'fixture-internal-token')
+  fs.writeFileSync(
+    path.join(runDir, 'kernel.json'),
+    JSON.stringify({ vm_id: id, dataplane: 'crag', runtime_variant: 'crag-v2' }),
+  )
+  const events = []
+  let capability = true
+  let active = 0
+  let bootEnabled = false
+  let nextError = null
+  const server = http.createServer(async (req, res) => {
+    res.setHeader('content-type', 'application/json')
+    if (req.headers['x-internal-token'] !== 'fixture-internal-token') {
+      res.writeHead(401).end('{}')
+      return
+    }
+    if (req.url === '/internal/health') {
+      res.end(
+        JSON.stringify({
+          ok: true,
+          runtime_variant: 'crag-v2',
+          crag_telemetry_apply_v1: capability,
+          active,
+          waiting: 0,
+          queued: 0,
+        }),
+      )
+      return
+    }
+    if (req.url !== '/internal/v1/telemetry/apply' || req.method !== 'POST') {
+      res.writeHead(404).end('{}')
+      return
+    }
+    let value = ''
+    for await (const chunk of req) value += chunk
+    const { enabled } = JSON.parse(value)
+    events.push(['apply', enabled])
+    if (nextError || enabled !== bootEnabled) {
+      res.writeHead(409).end(JSON.stringify({ error: { type: nextError || 'telemetry_restart_required' } }))
+      return
+    }
+    res.end(
+      JSON.stringify({ ok: true, applied: true, enabled, scope: 'native_claude_launch', upload_confirmed: false }),
     )
-    process.kill(current.pid, 'SIGTERM')
-  } finally {
+  })
+  await new Promise((resolve, reject) => server.once('error', reject).listen(path.join(runDir, 'kernel.sock'), resolve))
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve))
     fs.rmSync(root, { recursive: true, force: true })
+  })
+  const vm = { id }
+  const probe = () => readSlotProcessStatus({ projectRoot: root, vm: read(vmPath) })
+  let running = true
+  const lifecycle = {
+    watchdog: {
+      hold: () => events.push(['hold']),
+      release: () => events.push(['release']),
+    },
+    poolScheduler: { vmInflight: new Map(), healthCache: new Map() },
   }
+  const ops = {
+    retire: async () => ({ ok: true, running }),
+    restart: async () => {
+      assert.equal(read(vmPath).schedule_hold.reason, 'maintenance')
+      assert.equal(read(vmPath).schedulable, false)
+      events.push(['restart'])
+      bootEnabled =
+        read(path.join(path.dirname(settingsPath), 'kin-seed.json')).seed_policy.telemetry_disabled === false
+      return { ok: true }
+    },
+  }
+  const apply = () => applyNativeTelemetry({ projectRoot: root, vm, lifecycle, ops })
+  const enabled = await apply()
+  assert.equal(enabled.ok, true, enabled.error)
+  assert.equal(enabled.applied, true)
+  assert.equal(enabled.upload_confirmed, false)
+  assert.equal(enabled.scope, 'native_claude_launch')
+  assert.deepEqual(events.splice(0), [
+    ['apply', true],
+    ['hold'],
+    ['apply', true],
+    ['restart'],
+    ['apply', true],
+    ['release'],
+  ])
+  assert.equal(read(vmPath).schedulable, true)
+  assert.equal(read(vmPath).schedule_hold, undefined)
+  assert.equal(read(settingsPath).env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, undefined)
+  assert.equal((await apply()).applied, true)
+  assert.deepEqual(events.splice(0), [['apply', true]])
+  const settingsBeforeProbe = fs.readFileSync(settingsPath, 'utf8')
+  const vmBeforeProbe = fs.readFileSync(vmPath, 'utf8')
+  assert.deepEqual((await probe()).telemetry, {
+    state: 'launch_policy',
+    enabled: true,
+    error: null,
+    upload_confirmed: false,
+  })
+  assert.deepEqual(events.splice(0), [['apply', true]])
+  assert.equal(fs.readFileSync(settingsPath, 'utf8'), settingsBeforeProbe)
+  assert.equal(fs.readFileSync(vmPath, 'utf8'), vmBeforeProbe)
+
+  writeSlot(root, id, {
+    dataplane: 'crag',
+    status: 'paused',
+    schedulable: false,
+    schedule_off: true,
+    seed_policy: { telemetry_disabled: true },
+  })
+  active = 1
+  const beforeRestart = (await probe()).telemetry
+  assert.equal(beforeRestart.enabled, null)
+  assert.match(beforeRestart.error, /重启 CRAG/)
+  assert.deepEqual(events.splice(0), [['apply', false]])
+  assert.equal((await apply()).code, 'telemetry_slot_busy')
+  assert.equal(
+    events.some(([event]) => event === 'restart'),
+    false,
+  )
+  assert.equal(read(vmPath).schedule_off, true)
+  assert.equal(read(vmPath).status, 'paused')
+  assert.equal(read(vmPath).schedule_hold, undefined)
+  events.length = 0
+  active = 0
+  const configPath = path.join(runDir, 'kernel.json')
+  const originalConfig = fs.readFileSync(configPath)
+  fs.writeFileSync(configPath, JSON.stringify({ vm_id: id, dataplane: 'wrap' }))
+  assert.equal((await apply()).code, 'crag_telemetry_kernel_mismatch')
+  assert.equal(
+    events.some(([event]) => event === 'restart'),
+    false,
+  )
+  fs.writeFileSync(configPath, originalConfig)
+  assert.equal((await apply()).applied, true)
+  assert.equal(bootEnabled, false)
+  assert.equal(read(settingsPath).env.DISABLE_TELEMETRY, '1')
+  assert.equal(read(settingsPath).env.CLAUDE_CODE_DISABLE_TELEMETRY, '1')
+  assert.equal(read(vmPath).schedulable, false)
+  assert.equal(read(vmPath).status, 'paused')
+  events.length = 0
+  assert.deepEqual((await probe()).telemetry, {
+    state: 'launch_policy',
+    enabled: false,
+    error: null,
+    upload_confirmed: false,
+  })
+  assert.deepEqual(events.splice(0), [['apply', false]])
+
+  nextError = 'telemetry_native_settings_blocked'
+  assert.equal((await apply()).code, nextError)
+  assert.deepEqual(events.splice(0), [['apply', false]])
+  nextError = null
+  capability = false
+  assert.equal((await apply()).code, 'crag_telemetry_apply_unavailable')
+  assert.equal((await probe()).telemetry.enabled, null)
+  assert.deepEqual(events, [])
+  running = false
+  writeSlot(root, id, { dataplane: 'crag', status: 'stopped', seed_policy: { telemetry_disabled: false } })
+  const stopped = await apply()
+  assert.equal(stopped.state, 'stopped')
+  assert.equal(stopped.published, true)
+  assert.equal(stopped.applied, false)
+  for (const key of [
+    'DISABLE_TELEMETRY',
+    'CLAUDE_CODE_DISABLE_TELEMETRY',
+    'DO_NOT_TRACK',
+    'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC',
+  ]) {
+    assert.equal(Object.hasOwn(read(settingsPath).env, key), false)
+  }
+  assert.deepEqual(events, [])
 })

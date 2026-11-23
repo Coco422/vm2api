@@ -77,9 +77,17 @@ export type SpecialSetting = {
 /** 缓存写入 TTL 口径，由 5m / 1h 写入量派生。`mixed` = 两者都写了。 */
 export type CacheTtlApplied = '5m' | '1h' | 'mixed' | null
 
-/** 归一后的思考强度。原始字段见后端 `reasoningEffortOf()`。 */
+/** 发往槽位的思考强度。调用方值优先，否则模型缺省。见 `loggedReasoningEffort()`。 */
 export type ReasoningEffort =
-  'none' | 'minimal' | 'auto' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+  | 'none'
+  | 'minimal'
+  | 'auto'
+  | 'low'
+  | 'medium'
+  | 'high'
+  | 'xhigh'
+  | 'max'
+  | 'ultra'
 
 /** 滚动日志的一行。`null` = 本行该字段为空（vm2api 不产出的 hub 字段已整体删去）。 */
 export type UsageLogRow = {
@@ -101,6 +109,8 @@ export type UsageLogRow = {
   clientSessionId: string | null
   /** 入站剥离前的客户端 device id。 */
   inboundDeviceId: string | null
+  upstreamStatus?: number | null
+  upstream400Message?: string | null
   /** 最终服务的账号展示名（`final_account_id` 优先）。 */
   providerName: string | null
   accountId: string | null
@@ -289,6 +299,8 @@ export type UsageLogSessionSuggestions = string[]
 /** 近 N 分钟内有请求的出站会话（vm2api 只在请求完成时落库，没有「进行中」态）。 */
 export type ActiveSession = {
   sessionId: string
+  /** 窗口内仅 1 次请求且无工具（旁路请求），不与其它会话合并。 */
+  oneOff: boolean
   /** 该出站会话最近一行对应的客户端会话 id。 */
   clientSessionId: string | null
   userName: string | null
@@ -312,6 +324,8 @@ export type ActiveSessionsData = {
   minutes: number
   /** 窗口内去重会话数（不受 limit 截断）。 */
   total: number
+  /** total 中「单次、无工具」的会话数。 */
+  oneOffTotal: number
   sessions: ActiveSession[]
 }
 
@@ -328,7 +342,17 @@ export type UsageLogsOverview = {
   todayCost: number
   todayActualCost: number
   todayErrors: number
+  todayTokens: number
+  todayInputTokens: number
+  todayOutputTokens: number
+  todayCacheReadTokens: number
+  todayCacheCreationTokens: number
+  todayCacheCreation5mTokens: number
+  todayCacheCreation1hTokens: number
+  /** cache_read / (input + cache_read + cache_write)，0-1。 */
+  todayCacheHitRate: number
   todayAvgDurationMs: number | null
+  todayAvgTtftMs: number | null
   /** 昨日同一时刻之前的累计，用于「较昨日同期」。 */
   yesterdayRequests: number
   yesterdayCost: number

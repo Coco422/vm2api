@@ -77,3 +77,31 @@ test('a named pool is the only schedule set and a dead pool does not widen', () 
   assert.equal(replaced.vm_pool_id, null)
   assert.deepEqual(replaced.allowed_vms, ['vm-01'])
 })
+
+test('api category allows anthropic and openai groups without VMs', () => {
+  const anthropic = normalizeKeyScope({ group_type: 'anthropic', allowed_vms: [], category: 'api' })
+  assert.deepEqual(anthropic, { group_type: 'anthropic', allowed_vms: [], vm_pool_id: null })
+
+  const openai = normalizeKeyScope({ group_type: 'openai', allowed_vms: [] }, { isApi: true })
+  assert.deepEqual(openai, { group_type: 'openai', allowed_vms: [], vm_pool_id: null })
+
+  const current = { group_type: 'all', allowed_vms: '[]', category: 'api' }
+  const patched = normalizeKeyScope({ group_type: 'openai' }, { partial: true, current })
+  assert.deepEqual(patched, { group_type: 'openai', allowed_vms: [], vm_pool_id: null })
+})
+
+test('Gemini is a dedicated OAuth scope and cannot inherit VM or API access', () => {
+  const scope = normalizeKeyScope({ group_type: ' Gemini ' })
+  assert.deepEqual(scope, { group_type: 'gemini', allowed_vms: [], vm_pool_id: null })
+  assert.deepEqual(keyScopeFromRecord({ ...scope, allowed_vms: [codex.id], vm_pool_id: 'pool_abcd1234' }), scope)
+  assert.equal(keyAllowsVm({ ...scope, allowed_vms: [codex.id] }, codex), false)
+  assert.throws(() => normalizeKeyScope({ group_type: 'gemini', allowed_vms: [codex.id] }), {
+    code: 'invalid_gemini_key_scope',
+  })
+  assert.throws(() => normalizeKeyScope({ group_type: 'gemini', vm_pool_id: 'pool_abcd1234' }), {
+    code: 'invalid_gemini_key_scope',
+  })
+  assert.throws(() => normalizeKeyScope({ category: 'api' }, { partial: true, current: scope }), {
+    code: 'invalid_gemini_key_scope',
+  })
+})

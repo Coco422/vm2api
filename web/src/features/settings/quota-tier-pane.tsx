@@ -6,6 +6,7 @@ import {
   ChevronRight,
   Clock3,
   Gauge,
+  HardDrive,
   Info,
   ServerCog,
 } from 'lucide-react'
@@ -67,6 +68,8 @@ const TIER_DEFAULTS: Record<
   pro: { max_concurrency: 2, max_rpm: 0, limit_5h: 0.85, limit_7d: 0.8 },
   max: { max_concurrency: 4, max_rpm: 0, limit_5h: 0.95, limit_7d: 0.95 },
 }
+
+const REQUEST_BODY_DEFAULT_MIB = 32
 
 function cloneTiers(
   source: Record<string, QuotaTierPolicy>
@@ -186,6 +189,55 @@ function ClaudeGates({
             onCheckedChange={(block_on_7d) => onQuotaChange({ block_on_7d })}
           />
         </div>
+      </div>
+      <div className='space-y-3 rounded-lg border p-3'>
+        <div className='flex items-center justify-between gap-4'>
+          <div>
+            <Label>额度耗尽保护</Label>
+            <p className='text-xs text-muted-foreground'>
+              不把账号的 5h / 周额度用到底（用尽时有额外风险）。取 5h
+              与周用量较高者：到「不接新对话」线后只让已绑在该账号上的老会话继续（保住缓存），新对话去别的账号；到「完全停用」线后该账号不再接任何请求，直到窗口重置。关闭时，已被上游判为用尽（rejected）的窗口仍会停用到重置。
+            </p>
+          </div>
+          <Switch
+            checked={quota.exhaustion_guard === true}
+            onCheckedChange={(exhaustion_guard) =>
+              onQuotaChange({ exhaustion_guard })
+            }
+          />
+        </div>
+        <SliderSetting
+          id='claude-exhaustion-new-session'
+          label='不接新对话'
+          desc='5h 或周用量达到此值，只保留老的缓存会话。'
+          value={Math.round(
+            numberOf(quota.exhaustion_guard_new_session, 0.85) * 100
+          )}
+          min={50}
+          max={99}
+          step={1}
+          format={(value) => `${value}%`}
+          fallback={85}
+          presets={[80, 85, 90]}
+          onChange={(value) =>
+            onQuotaChange({ exhaustion_guard_new_session: value / 100 })
+          }
+        />
+        <SliderSetting
+          id='claude-exhaustion-stop'
+          label='完全停用'
+          desc='5h 或周用量达到此值，该账号不再接任何请求，直到窗口重置。'
+          value={Math.round(numberOf(quota.exhaustion_guard_stop, 0.95) * 100)}
+          min={50}
+          max={100}
+          step={1}
+          format={(value) => `${value}%`}
+          fallback={95}
+          presets={[90, 95, 98]}
+          onChange={(value) =>
+            onQuotaChange({ exhaustion_guard_stop: value / 100 })
+          }
+        />
       </div>
       <div className='space-y-3 rounded-lg border p-3'>
         <SliderSetting
@@ -392,15 +444,19 @@ function ClaudeRpm({
 export function QuotaTierPane({
   tiers,
   quota,
+  failover,
   onChange,
   onQuotaChange,
+  onFailoverChange,
   saving = false,
   pending = false,
 }: {
   tiers: Record<string, QuotaTierPolicy>
   quota: Obj
+  failover: Obj
   onChange: (tier: QuotaTierKey, patch: QuotaTierPolicy) => void
   onQuotaChange: (patch: Obj) => void
+  onFailoverChange: (patch: Obj) => void
   saving?: boolean
   pending?: boolean
 }) {
@@ -454,6 +510,15 @@ export function QuotaTierPane({
         block_on_5h: draftQuota.block_on_5h !== false,
         block_on_7d: draftQuota.block_on_7d !== false,
         guard_large_cold: draftQuota.guard_large_cold !== false,
+        exhaustion_guard: draftQuota.exhaustion_guard === true,
+        exhaustion_guard_new_session: Math.min(
+          0.99,
+          Math.max(0.5, numberOf(draftQuota.exhaustion_guard_new_session, 0.85))
+        ),
+        exhaustion_guard_stop: Math.min(
+          1,
+          Math.max(0.5, numberOf(draftQuota.exhaustion_guard_stop, 0.95))
+        ),
         critical_band: Math.min(
           0.15,
           Math.max(0.01, numberOf(draftQuota.critical_band, 0.05))
@@ -580,6 +645,31 @@ export function QuotaTierPane({
             </span>
           </span>
         </Button>
+      </PaneSection>
+
+      <PaneSection
+        icon={HardDrive}
+        title='请求体上限'
+        desc='入站请求正文的最大大小，图片和工具写入的大文件都算在内。Claude 与 GPT 共用。超过返回 413。保存后各槽 kernel 在没有请求时重启。不能超过 KIN_MAX_BODY。'
+      >
+        <fieldset disabled={saving} className='min-w-0 border-0 p-0'>
+          <SliderSetting
+            id='quota-max-request'
+            label='允许的最大请求体'
+            value={numberOf(failover.max_request_mib, REQUEST_BODY_DEFAULT_MIB)}
+            min={8}
+            max={128}
+            step={8}
+            format={(value) => `${value} MiB`}
+            fallback={REQUEST_BODY_DEFAULT_MIB}
+            presets={[32, 64, 128]}
+            onChange={(value) =>
+              onFailoverChange({
+                max_request_mib: Math.min(128, Math.max(8, Math.round(value))),
+              })
+            }
+          />
+        </fieldset>
       </PaneSection>
 
       <Dialog

@@ -4,6 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import http from 'node:http'
+import { EventEmitter } from 'node:events'
 import { WebSocket } from 'ws'
 import { ApiKeyStore } from '../../src/lib/admin/api-keys.mjs'
 import { createDatabase } from '../../src/lib/db/database.mjs'
@@ -148,7 +149,7 @@ test('all HTTP inference handlers reject panel sessions before reading input or 
   for (const protocol of ['anthropic.messages', 'openai.chat', 'openai.completions', 'openai.responses']) {
     const res = { on() {}, once() {} }
     await handlers.handleProtocol(
-      { headers: { cookie: `kin_panel_token=${f.session}` }, method: 'POST' },
+      Object.assign(new EventEmitter(), { headers: { cookie: `kin_panel_token=${f.session}` }, method: 'POST' }),
       res,
       protocol,
       '/fixture',
@@ -157,7 +158,7 @@ test('all HTTP inference handlers reject panel sessions before reading input or 
   }
   for (const kind of ['search', 'images']) {
     const res = { on() {}, once() {} },
-      req = { headers: { cookie: `kin_panel_token=${f.session}` }, method: 'POST' }
+      req = Object.assign(new EventEmitter(), { headers: { cookie: `kin_panel_token=${f.session}` }, method: 'POST' })
     if (kind === 'search') await handlers.handleSearch(req, res, '/v1/alpha/search')
     else await handlers.handleImages(req, res, '/v1/images/generations', 'generations')
     assert.equal(res.status, 401)

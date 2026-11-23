@@ -26,6 +26,7 @@ describe('vmSchedulableProps', () => {
       })
     )
     expect(bad.schedulable).toBe(false)
+    expect(bad.tenantState).toBe('enabled')
     expect(bad.unschedulableText).toBe('代理失配')
     expect(vmSchedulableProps(vm({ schedule_state: 'off' })).schedulable).toBe(
       false
@@ -33,5 +34,25 @@ describe('vmSchedulableProps', () => {
     expect(vmSchedulableProps(vm({ schedule_state: 'on' })).schedulable).toBe(
       true
     )
+  })
+
+  it('distinguishes a resumable tenant pause from an operator stop', () => {
+    const paused = vm({
+      schedule_state: 'off',
+      schedule_off: true,
+      schedulable: false,
+    })
+    expect(vmSchedulableProps(paused).tenantState).toBe('operator-off')
+    expect(
+      vmSchedulableProps({
+        ...paused,
+        schedule_disabled_reason: 'tenant_paused',
+      }).tenantState
+    ).toBe('paused')
+    expect(
+      vmSchedulableProps(
+        vm({ schedule_state: 'restricted', schedulable: false })
+      ).tenantState
+    ).toBe('enabled')
   })
 })

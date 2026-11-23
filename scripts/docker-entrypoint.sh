@@ -3,7 +3,17 @@ set -eu
 
 ROOT="${KIN_PROJECT_ROOT:-/opt/vm2api}"
 IMAGE_BIN="/opt/vm2api/image-bin"
-mkdir -p "$ROOT/vms" "$ROOT/data" "$ROOT/bin"
+mkdir -p "$ROOT/data"
+# Match the Node startup lock before replacing any shared binaries or configuration.
+exec 9<"$ROOT/data"
+flock -n -E 75 9 || {
+  rc=$?
+  if [ "$rc" = 75 ]; then
+    echo 'vm2api_control_plane_already_running: stop the other controller first' >&2
+  fi
+  exit "$rc"
+}
+mkdir -p "$ROOT/vms" "$ROOT/bin"
 
 # 镜像安装没有仓库 checkout：把镜像内默认配置补进被 bind-mount 覆盖的 src/config。
 mkdir -p "$ROOT/src/config"
@@ -13,6 +23,19 @@ if [ -d /opt/vm2api/image-config ]; then
     dest="$ROOT/src/config/$(basename "$f")"
     [ -f "$dest" ] || cp "$f" "$dest"
   done
+fi
+
+# ARM64 主机上 slot 是 amd64，依赖宿主 qemu-x86_64 binfmt handler（重启后可能丢失）。
+# 静态 amd64 kin-worker 无参数时以 2 退出；shell 返回 126/127 表示无法执行 x86 程序。
+# 只提示不阻塞：面板仍要能打开。
+X86_PROBE="${KIN_X86_PROBE_BIN:-/opt/vm2api/cluster-bin-amd64/kin-worker}"
+if [ "$(uname -m)" = aarch64 ] && [ -f "$X86_PROBE" ]; then
+  probe_rc=0
+  "$X86_PROBE" >/dev/null 2>&1 || probe_rc=$?
+  if [ "$probe_rc" -eq 126 ] || [ "$probe_rc" -eq 127 ]; then
+    echo "vm2api: 宿主缺少 qemu-x86_64 binfmt handler，amd64 slot 将无法启动。" >&2
+    echo "vm2api: 在宿主执行 python3 deploy/prepare-arm64.py（详见 docs/ARM64.md）。" >&2
+  fi
 fi
 
 # No seeded vm-01. A fresh fleet is empty. Seeding an active placeholder made
@@ -39,6 +62,7 @@ ensure_bin kin-egress
 ensure_bin kin-slot-gate
 ensure_bin kin-worker
 ensure_bin kin-api-kernel
+ensure_bin kin-redact
 ensure_bin kin-codex-kernel
 ensure_bin kin-oauth-auth
 ensure_bin kin-computer
@@ -85,6 +109,8 @@ if [ -f /opt/vm2api/image-crag/kin-kernel ]; then
     WRAP_CHANGED=1
   fi
 fi
+# Bind-mounted share starts empty; seed the image's signed native package once.
+node /opt/vm2api/scripts/seed-crag.mjs "$ROOT" /opt/vm2api/image-crag
 
 if [ ! -S /var/run/docker.sock ]; then
   echo "vm2api: /var/run/docker.sock not mounted; slot create/start will fail." >&2
@@ -150,9 +176,6 @@ if [ -z "${VM2API_DB_SECRET:-}" ] && [ -z "${KIN_DB_SECRET:-}" ]; then
   env_upsert_if_empty VM2API_DB_SECRET "$VM2API_DB_SECRET" "$ENVF"
 fi
 
-if [ "$WRAP_CHANGED" = 1 ] && [ "${KIN_AUTO_SYNC_WRAP:-0}" = 1 ]; then
-  node /opt/vm2api/scripts/sync-wrap-cli.mjs &
-fi
-
+export VM2API_BOOTSTRAP_LOCK_FD=9 VM2API_BOOTSTRAP_WRAP_CHANGED="$WRAP_CHANGED"
 cd /opt/vm2api
 exec node src/server.mjs

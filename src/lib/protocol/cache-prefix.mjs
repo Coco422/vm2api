@@ -9,6 +9,7 @@
  */
 import { createHash } from 'node:crypto'
 import { listCacheMarkers, normalizeCacheTtl } from './cache-ttl.mjs'
+import { contextMessageIdentity, contextValueDigest } from './request-body-context.mjs'
 
 const SESSION_LIMIT = 10_000
 /** Longest cache TTL; an older turn cannot be read anyway. */
@@ -300,14 +301,19 @@ function identityOf(clean, hash = null) {
   return bare === clean && hash ? hash : digest(bare)
 }
 
-function messageIdentity(message) {
+export function computeMessageIdentity(message) {
   return identityOf(withoutCacheControl(message))
 }
 
-function messageRecord(message) {
+function messageIdentity(message, ctx = null) {
+  if (!ctx) return computeMessageIdentity(message)
+  return contextMessageIdentity(ctx, message, computeMessageIdentity)
+}
+
+function messageRecord(message, ctx = null) {
   const clean = withoutCacheControl(message)
   const images = messageImageCount(message)
-  const hash = digest(clean)
+  const hash = ctx ? contextValueDigest(ctx, clean, () => digest(clean)) : digest(clean)
   const record = {
     hash,
     role: message?.role || null,
@@ -371,14 +377,25 @@ function messageDiff(previous, current) {
   return keyDelta(previous.keys, current.keys) || { reason: 'digest' }
 }
 
-function snapshotBody(body) {
+function snapshotBody(body, { previous = null, ctx = null } = {}) {
   const messages = Array.isArray(body?.messages) ? body.messages : []
   const tools = Array.isArray(body?.tools) ? body.tools : []
+  const prevMessages = previous?.messages
+  const digestTools = () => digest(withoutCacheControl(body?.tools))
+  const digestSystem = () => digest(withoutCacheControl(body?.system))
   return {
-    tools: digest(withoutCacheControl(body?.tools)),
+    tools: ctx ? contextValueDigest(ctx, body?.tools, digestTools) : digestTools(),
     tool_names: tools.map((tool) => tool?.name || null),
-    system: digest(withoutCacheControl(body?.system)),
-    messages: messages.map(messageRecord),
+    system: ctx ? contextValueDigest(ctx, body?.system, digestSystem) : digestSystem(),
+    messages: messages.map((message, index) => {
+      const prev = prevMessages?.[index]
+      if (prev) {
+        const id = messageIdentity(message, ctx)
+        const images = messageImageCount(message)
+        if (prev.id === id && prev.role === (message?.role || null) && (prev.images || 0) === images) return prev
+      }
+      return messageRecord(message, ctx)
+    }),
   }
 }
 
@@ -447,11 +464,20 @@ function classifyParts(previous, current) {
  * the block list changed: a tool_result body edit, an extra key, or key order
  * also land here.
  */
-export function firstHistoryDiff(inbound, outbound) {
+/**
+ * Where the gateway's rewrite first diverges from what the client sent.
+ *
+ * Diagnostics only. `ctx` is the request's body context: passing it reuses the
+ * digests `prepareCachePrefix` just computed for the outbound body instead of
+ * hashing every message, content block and `valueStamp` level again, twice per
+ * level, on every attempt (#1497). The memo returns what the direct call
+ * returns, so the reported break is the same either way.
+ */
+export function firstHistoryDiff(inbound, outbound, { ctx = null } = {}) {
   if (!inbound || !outbound || typeof inbound !== 'object' || typeof outbound !== 'object') {
     return { section: null, index: null, kind: null, sections: [] }
   }
-  const sections = sectionDiffs(snapshotBody(inbound), snapshotBody(outbound))
+  const sections = sectionDiffs(snapshotBody(inbound, { ctx }), snapshotBody(outbound, { ctx }))
   if (!sections.length) return { section: null, index: null, kind: null, sections: [] }
   return { ...sections[0], sections }
 }
@@ -487,9 +513,10 @@ export function describeCacheContinuity({
   vmId = null,
   accountId = null,
   requestId = null,
+  ctx = null,
 } = {}) {
   const observed = layer === 'cli_final_wire'
-  const inboundToNode = firstHistoryDiff(inbound, outbound)
+  const inboundToNode = firstHistoryDiff(inbound, outbound, { ctx })
   return {
     layer,
     wire_observed: observed,
@@ -511,16 +538,29 @@ export function describeCacheContinuity({
  * Compare `body` with the stored turn of `sessionKey` without recording.
  * `confirmed` is true only after a successful hop called confirmCachePrefix.
  */
-export function peekCachePrefix(sessionKey, body, now = Date.now(), { preserveMessageCache = null } = {}) {
+export function peekCachePrefix(sessionKey, body, now = Date.now(), { preserveMessageCache = null, ctx = null } = {}) {
   const key = String(sessionKey || '').trim()
   if (!key || !body || typeof body !== 'object') return null
   const previous = liveSession(key, now)
+  // Scheduling asks this for every candidate account, and only the one holding
+  // the session has a previous turn. Without one `comparePrefix` answers
+  // `{ turn: 1, break: null }` and never looks at the snapshot, so building it
+  // cost candidates x body size in JSON.stringify and SHA-256 for nothing
+  // (#1496). The shape below is what the full path returns in that case.
+  if (!previous) return { turn: 1, break: null, confirmed: false, intercept: null }
   // Compare what prepareCachePrefix would send, not the client's raw images.
   const images = liveImageState(previous?.image_key || key, now)
   const preserve = preserveMessageCache ?? previous?.preserve_message_cache ?? false
-  const current = snapshotBody(preserve ? body : retainImages(images, body).body)
+  const current = snapshotBody(preserve ? body : retainImages(images, body, ctx).body, { previous, ctx })
   const compared = comparePrefix(previous, current)
-  return { ...compared, confirmed: !!previous?.confirmed }
+  return { ...compared, confirmed: !!previous?.confirmed, intercept: previous?.intercept || null }
+}
+
+export function peekInterceptSession(sessionKey, now = Date.now()) {
+  const key = String(sessionKey || '').trim()
+  if (!key) return null
+  const previous = liveSession(key, now)
+  return previous?.intercept && previous?.confirmed ? previous.intercept : null
 }
 
 function liveSession(key, now) {
@@ -531,6 +571,17 @@ function liveSession(key, now) {
 function liveImageState(key, now) {
   const hit = imageSessions.get(key)
   return hit && now - hit.at < IMAGE_SESSION_IDLE_MS ? hit : null
+}
+
+/**
+ * Writes re-insert their key, so map order is last-write order. Drop from the
+ * front what a lookup already ignores, then the oldest past SESSION_LIMIT.
+ */
+function sweep(map, idleMs, now) {
+  for (const [key, hit] of map) {
+    if (map.size <= SESSION_LIMIT && now - hit.at < idleMs) break
+    map.delete(key)
+  }
 }
 
 /** First message whose images stay: the newer half of those after `dropped`. */
@@ -566,7 +617,7 @@ function firstImageAt(messages, from) {
  * State is per caller session, so an account switch keeps the floor. Clients
  * that never drop an image are never touched.
  */
-function retainImages(state, body) {
+function retainImages(state, body, ctx = null) {
   const messages = Array.isArray(body?.messages) ? body.messages : null
   if (!messages) return { body, floor: 0, active: false, moved: false }
   const priorLength = state?.ids.length ?? 0
@@ -574,7 +625,7 @@ function retainImages(state, body) {
   // a compaction or rewind that replaces it must not lose the new images.
   let rewritten = !!state && messages.length < priorLength
   for (let i = 0; !rewritten && i < (state?.floor || 0); i++) {
-    rewritten = state.roles[i] !== messages[i]?.role || state.ids[i] !== messageIdentity(messages[i])
+    rewritten = state.roles[i] !== messages[i]?.role || state.ids[i] !== messageIdentity(messages[i], ctx)
   }
   const start = rewritten ? 0 : state?.floor || 0
   let floor = start
@@ -582,7 +633,7 @@ function retainImages(state, body) {
   let dropped = -1
   for (let i = floor; state && !rewritten && i < priorLength; i++) {
     if (!state.images[i] || messageImageCount(messages[i]) >= state.images[i]) continue
-    if (state.roles[i] !== messages[i]?.role || state.ids[i] !== messageIdentity(messages[i])) continue
+    if (state.roles[i] !== messages[i]?.role || state.ids[i] !== messageIdentity(messages[i], ctx)) continue
     dropped = i
   }
   if (dropped >= 0) {
@@ -741,7 +792,7 @@ export function prepareCachePrefix(
   sessionKey,
   body,
   now = Date.now(),
-  { imageKey = null, preserveMessageCache = false } = {},
+  { imageKey = null, preserveMessageCache = false, ctx = null } = {},
 ) {
   const key = String(sessionKey || '').trim()
   if (!key || !body || typeof body !== 'object') return null
@@ -749,8 +800,8 @@ export function prepareCachePrefix(
   const previous = liveSession(key, now)
   const retained = preserveMessageCache
     ? { body, floor: 0, active: false, moved: false }
-    : retainImages(liveImageState(imagesAt, now), body)
-  const current = snapshotBody(retained.body)
+    : retainImages(liveImageState(imagesAt, now), body, ctx)
+  const current = snapshotBody(retained.body, { previous, ctx })
   const compared = comparePrefix(previous, current)
   const br = compared.break
   const writes = liveWrites(previous, br, now)
@@ -772,8 +823,11 @@ export function prepareCachePrefix(
     pending: markerWrites(sent, now),
     // Where the caller's tail marker sat; a later turn reads it if it was written.
     tail: lastMarkedMessage(retained.body),
+    intercept: {
+      messageIds: current.messages.map((record) => record.id),
+    },
   })
-  if (sessions.size > SESSION_LIMIT) sessions.delete(sessions.keys().next().value)
+  sweep(sessions, SESSION_IDLE_MS, now)
   imageSessions.delete(imagesAt)
   imageSessions.set(imagesAt, {
     at: now,
@@ -783,7 +837,7 @@ export function prepareCachePrefix(
     ids: current.messages.map((record) => record.id),
     images: current.messages.map((record) => record.images || 0),
   })
-  if (imageSessions.size > SESSION_LIMIT) imageSessions.delete(imageSessions.keys().next().value)
+  sweep(imageSessions, IMAGE_SESSION_IDLE_MS, now)
   return {
     body: sent,
     turn: compared.turn,
@@ -796,16 +850,21 @@ export function prepareCachePrefix(
 }
 
 /** Mark the latest attempted snapshot as a confirmed cache write/read. */
-export function confirmCachePrefix(sessionKey, now = Date.now()) {
+export function confirmCachePrefix(sessionKey, now = Date.now(), { intercept = null } = {}) {
   const key = String(sessionKey || '').trim()
   if (!key) return false
   const hit = sessions.get(key)
   if (!hit || now - hit.at >= SESSION_IDLE_MS) return false
   hit.confirmed = true
+  if (intercept && typeof intercept === 'object') hit.intercept = intercept
   return true
 }
 
 export function clearCachePrefixSessions() {
   sessions.clear()
   imageSessions.clear()
+}
+
+export function cachePrefixSessionCountsForTest() {
+  return { sessions: sessions.size, images: imageSessions.size }
 }

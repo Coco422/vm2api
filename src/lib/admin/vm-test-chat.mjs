@@ -26,7 +26,12 @@ import { applyCrsUnofficialPersona } from '../identity/crs-persona.mjs'
 import { claudeCodeInboundBody, claudeCodeInboundHeaders } from '../protocol/claude-code-inbound.mjs'
 import { credentialModeFromOauth, credentialModeOfVm } from '../oauth/credential-mode.mjs'
 import { isModelEnabled, getModelParams, getCapabilities, listPolicyModels } from '../protocol/model-policy.mjs'
-import { listGptPolicyModels, isGptModelEnabled, syncGptIdsIntoPolicy } from '../protocol/gpt-model-policy.mjs'
+import {
+  listGptPolicyModels,
+  isGptModelEnabled,
+  resolveGptFastAlias,
+  syncGptIdsIntoPolicy,
+} from '../protocol/gpt-model-policy.mjs'
 import { modelsDevMeta } from './price-catalog.mjs'
 import { listOfficialModels, validateOfficialModel } from '../protocol/models.mjs'
 import {
@@ -41,6 +46,7 @@ import {
   resolveOfficialCcInference,
   resolveCliSystemLayout,
   resolveKernelDataplane,
+  resolveCragKernelVersion,
 } from '../vm/slot-engine.mjs'
 import {
   codexTextInput,
@@ -435,7 +441,9 @@ export function buildVmTestInbound({
   personaMode = 'rewrite',
 } = {}) {
   const caps = getCapabilities(model) || {}
-  const thinking = caps.requires_adaptive || caps.thinking_mode === 'adaptive_only' ? { type: 'adaptive' } : null
+  // Omission lets the CLI enable thinking and spend the probe's small output budget.
+  const thinking =
+    caps.requires_adaptive || caps.thinking_mode === 'adaptive_only' ? { type: 'adaptive' } : { type: 'disabled' }
   let inbound = claudeCodeInboundBody({
     model,
     messages: [{ role: 'user', content: prompt }],
@@ -898,12 +906,21 @@ export async function runVmTestChat(opts = {}) {
   const inferenceEngine = codex ? null : resolveInferenceEngine(vm, routing)
   const cliHop = !codex && resolveOfficialCcInference(vm, routing) === 'cli-hop'
   const dataplane = codex ? null : resolveKernelDataplane(vm, routing) || 'wrap'
+  const cragVersion = dataplane === 'crag' ? resolveCragKernelVersion(vm, routing) : null
+  const kernelRoute =
+    dataplane === 'crag' && cragVersion === 'v2'
+      ? 'CRAG v2 原生 worker'
+      : dataplane === 'crag'
+        ? 'cc-node + CRAG kernel'
+        : dataplane === 'cc'
+          ? 'cc-node + wrap kernel'
+          : 'cli-node + wrap kernel'
   push(
     'info',
     codex
       ? '推理 codex-kernel / ChatGPT'
       : cliHop
-        ? `推理 ${inferenceEngine} / cli-hop ${dataplane}`
+        ? `推理 ${inferenceEngine} / ${kernelRoute}`
         : `推理 ${inferenceEngine} / http hop`,
   )
 
@@ -944,13 +961,15 @@ export async function runVmTestChat(opts = {}) {
     codex
       ? '凭证 Codex OAuth · OpenAI Responses 入站'
       : `凭证 ${credMode}${
-          cliHop
-            ? cliLayout === 'identity'
-              ? ' · cli-hop CLI 官方提示词'
-              : ' · cli-hop 0注入'
-            : unofficial
-              ? ' · 非官方 inference 入站'
-              : ' · 官方 Claude Code 入站'
+          dataplane === 'crag'
+            ? ` · ${kernelRoute}`
+            : cliHop
+              ? cliLayout === 'identity'
+                ? ' · cli-hop · CLI 官方提示词'
+                : ' · cli-hop · 0注入'
+              : unofficial
+                ? ' · 非官方 inference 入站'
+                : ' · 官方 Claude Code 入站'
         }`,
   )
 
@@ -967,6 +986,7 @@ export async function runVmTestChat(opts = {}) {
   push('info', `代理 ${vm.proxy?.host || 'bound'}`)
 
   let model = String(opts.model || '').trim()
+  let serviceTier = null
   if (!model) {
     const models = listTestableModels(codex ? 'openai' : 'anthropic')
     model = models[0]?.id || (codex ? 'gpt-5.4' : 'claude-haiku-4-5-20251001')
@@ -974,6 +994,22 @@ export async function runVmTestChat(opts = {}) {
   push('info', `模型 ${model}`)
 
   if (codex) {
+    const fast = resolveGptFastAlias(model)
+    if (fast.kind === 'unavailable') {
+      push('error', `模型不可用: ${model}`)
+      return done({
+        ok: false,
+        vm_id: vmId,
+        model,
+        error: { code: 'model_fast_unavailable', message: 'Fast alias is unavailable' },
+        log,
+        duration_ms: Date.now() - started,
+      })
+    }
+    if (fast.kind === 'fast') {
+      model = fast.base
+      serviceTier = fast.service_tier
+    }
     if (!isGptSeriesId(model) || !isGptModelEnabled(model)) {
       push('error', `模型不可用: ${model}`)
       return done({
@@ -1054,6 +1090,7 @@ export async function runVmTestChat(opts = {}) {
       store: false,
     }
     if (effort) inbound.reasoning = { effort }
+    if (serviceTier) inbound.service_tier = serviceTier
     headers = {
       'user-agent': CODEX_USER_AGENT,
       'x-codex-installation-id': String(vm.device_id || vm.id),
@@ -1070,6 +1107,10 @@ export async function runVmTestChat(opts = {}) {
         max_tokens: maxTokens,
         stream: true,
         temperature: 1,
+        thinking:
+          caps.requires_adaptive || caps.thinking_mode === 'adaptive_only'
+            ? { type: 'adaptive' }
+            : { type: 'disabled' },
         messages: [{ role: 'user', content: prompt }],
       }
       headers = {
@@ -1111,7 +1152,7 @@ export async function runVmTestChat(opts = {}) {
       timeoutMs,
       extraHeaders: opts.extraHeaders || {},
     })
-    if (codex && !result?.ok && looksLikeCodexUnauthorized(result)) {
+    if (opts.allowCredentialRefresh !== false && codex && !result?.ok && looksLikeCodexUnauthorized(result)) {
       const first = readCodexAccounts(projectRoot, vmId)[0] || {}
       const refreshToken = String(first.refresh_token || '').trim()
       if (refreshToken) {

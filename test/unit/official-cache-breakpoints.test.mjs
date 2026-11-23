@@ -106,7 +106,7 @@ for (const ttl of [undefined, '5m', '1h']) {
     const before = structuredClone(input)
     const out = prepareCliHopBody(input)
     assert.equal(out.tools[0].cache_control, undefined)
-    assert.equal(out.tools[0].eager_input_streaming, undefined)
+    assert.equal(out.tools[0].eager_input_streaming, true)
     assert.deepEqual(out.system, input.system)
     assert.deepEqual(
       messageMarkers(out).map((m) => m.ttl),
@@ -127,11 +127,34 @@ test('shaped leaves caller message anchors and mixed TTLs untouched', () => {
   validateCacheBreakpoints(out)
 })
 
-for (const options of [
-  { outboundShape: 'lean' },
-  { preserveSystem: true },
-  { requestContext: { purpose: 'auto_mode_classifier' } },
-]) {
+for (const personaPreset of ['official', 'official_full']) {
+  for (const ttl of ['5m', '1h']) {
+    test(`${personaPreset} reserves CLI system markers when caller expansions leave three message anchors (${ttl})`, () => {
+      const input = shaped([marker(ttl)])
+      for (const index of [0, 1, 4]) {
+        input.messages[index].content = [{ type: 'text', text: `turn ${index}`, cache_control: marker(ttl) }]
+      }
+      const before = structuredClone(input)
+      const out = prepareCliHopBody(input, { personaPreset, cacheTtl: ttl })
+      assert.deepEqual(
+        messageMarkers(out).map((m) => m.index),
+        [1, 4],
+      )
+      assert.deepEqual(input, before)
+      assert.deepEqual(out.system, input.system)
+      assert.deepEqual(
+        out.messages.map((m) => m.content.map((b) => b.text)),
+        input.messages.map((m) => (typeof m.content === 'string' ? [m.content] : m.content.map((b) => b.text))),
+      )
+      assert.deepEqual(prepareCliHopBody(out, { personaPreset, cacheTtl: ttl }), out)
+      const wire = structuredClone(out)
+      wire.system.push({ type: 'text', text: 'CLI restored system boundary', cache_control: marker(ttl) })
+      validateCacheBreakpoints(wire)
+    })
+  }
+}
+
+for (const options of [{ preserveSystem: true }, { requestContext: { purpose: 'auto_mode_classifier' } }]) {
   for (const personaPreset of [null, 'official', 'official_full']) {
     test(`shaped ${personaPreset ?? 'legacy'} fallback excludes ${JSON.stringify(options)}`, () => {
       const input = shaped()

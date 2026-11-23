@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { keyLimitsPayload, type KeyLimitsDraft } from './key-payload'
+import {
+  keyLimitsPayload,
+  parseModelList,
+  type KeyLimitsDraft,
+} from './key-payload'
 
 const draft: KeyLimitsDraft = {
   name: ' ops ',
@@ -11,21 +15,48 @@ const draft: KeyLimitsDraft = {
   expires_in_days: 30,
   group_type: 'anthropic',
   allowed_vms: ['vm-01', 'vm-01', ' '],
+  allowed_models: '',
 }
 
 describe('API key limit payload', () => {
-  it('assigns an employee only from the admin form, and keeps existing defaults when unspecified', () => {
-    expect(
-      keyLimitsPayload({ ...draft, user_id: ' employee-1 ' }, 'create', {
-        isAdmin: true,
-      }).user_id
-    ).toBe('employee-1')
-    expect(
-      keyLimitsPayload({ ...draft, user_id: 'employee-1' }, 'edit', {
-        isAdmin: false,
+  it('saves Gemini as admin-only OAuth without a VM scope', () => {
+    const gemini = {
+      ...draft,
+      category: 'oauth',
+      group_type: 'gemini',
+      vm_pool_id: '',
+    } as const
+    for (const mode of ['create', 'edit'] as const) {
+      expect(keyLimitsPayload(gemini, mode)).toMatchObject({
+        group_type: 'gemini',
+        category: 'oauth',
+        allowed_vms: [],
+        vm_pool_id: null,
       })
-    ).not.toHaveProperty('user_id')
-    expect(keyLimitsPayload(draft, 'edit')).not.toHaveProperty('user_id')
+    }
+    expect(() =>
+      keyLimitsPayload(gemini, 'create', { isAdmin: false })
+    ).toThrow('只允许管理员')
+    expect(() =>
+      keyLimitsPayload({ ...gemini, category: 'api' }, 'create')
+    ).toThrow('宿主机 OAuth')
+  })
+  it('tenant create and edit send only a name, never administrator policy fields', () => {
+    for (const mode of ['create', 'edit'] as const) {
+      expect(keyLimitsPayload(draft, mode, { isAdmin: false })).toEqual({
+        name: 'ops',
+      })
+      expect(() =>
+        keyLimitsPayload({ ...draft, name: ' ' }, mode, { isAdmin: false })
+      ).toThrow('名称')
+    }
+  })
+  it('never sends a user owner from the client', () => {
+    for (const isAdmin of [true, false]) {
+      expect(keyLimitsPayload(draft, 'create', { isAdmin })).not.toHaveProperty(
+        'user_id'
+      )
+    }
   })
   it('keeps request and USD quotas separate', () => {
     expect(keyLimitsPayload(draft, 'create')).toEqual({
@@ -38,7 +69,35 @@ describe('API key limit payload', () => {
       expires_in_days: 30,
       group_type: 'anthropic',
       allowed_vms: ['vm-01'],
+      allowed_models: [],
     })
+  })
+
+  it('splits allowed models on commas, spaces and new lines, deduping by case', () => {
+    expect(
+      parseModelList(
+        ' claude-sonnet-5, gpt-6-sol，CLAUDE-SONNET-5\nclaude-haiku-4-5  '
+      )
+    ).toEqual(['claude-sonnet-5', 'gpt-6-sol', 'claude-haiku-4-5'])
+    expect(parseModelList(' ,  ')).toEqual([])
+  })
+
+  it('sends allowed models on create and edit; empty clears the limit', () => {
+    const limited = { ...draft, allowed_models: 'claude-sonnet-5, gpt-6-sol' }
+    for (const mode of ['create', 'edit'] as const) {
+      expect(keyLimitsPayload(limited, mode).allowed_models).toEqual([
+        'claude-sonnet-5',
+        'gpt-6-sol',
+      ])
+      expect(keyLimitsPayload(limited, mode, { isAdmin: false })).toEqual({
+        name: limited.name.trim(),
+      })
+    }
+    expect(keyLimitsPayload(draft, 'edit').allowed_models).toEqual([])
+    const tooMany = Array.from({ length: 201 }, (_, i) => `m-${i}`).join(',')
+    expect(() =>
+      keyLimitsPayload({ ...draft, allowed_models: tooMany }, 'create')
+    ).toThrow('最多 200 个')
   })
 
   it('sends category only for admins', () => {
@@ -74,8 +133,21 @@ describe('API key limit payload', () => {
       allowed_vms: [],
     })
     expect(() =>
-      keyLimitsPayload({ ...draft, allowed_vms: [] }, 'create')
+      keyLimitsPayload(
+        { ...draft, category: 'oauth', allowed_vms: [] },
+        'create'
+      )
     ).toThrow('至少选择一台 VM')
+    expect(
+      keyLimitsPayload(
+        { ...draft, category: 'api', group_type: 'openai', allowed_vms: [] },
+        'create'
+      )
+    ).toMatchObject({
+      category: 'api',
+      group_type: 'openai',
+      allowed_vms: [],
+    })
   })
 
   it('handles vm_pool_id for admin and strips it for non-admin', () => {
@@ -121,6 +193,6 @@ describe('API key limit payload', () => {
       isAdmin: false,
     })
     expect(tenantTampered).not.toHaveProperty('vm_pool_id')
-    expect(tenantTampered.group_type).toBe('all')
+    expect(tenantTampered).toEqual({ name: 'ops' })
   })
 })

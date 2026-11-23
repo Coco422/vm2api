@@ -9,15 +9,18 @@ import { rustKernelHealth } from '../transport/rust-kernel-client.mjs'
 import { vmJsonPath } from '../vm/execution-context.mjs'
 import { slotExec } from '../vm/slot-runtime.mjs'
 import { CREDENTIAL_REFRESH_FAIL } from '../pool/availability.mjs'
+import fs from 'node:fs'
 
 export const LIVE_CREDENTIAL_SKEW_MS = 5 * 60 * 1000
 export const LIVE_CREDENTIAL_CACHE_MS = 3000
 const MIRROR_NEWER_MS = 2000
 
-let cache = { at: 0, map: null }
+const cache = new Map()
+let generation = 0
 
 export function invalidateLiveCredentialCache() {
-  cache = { at: 0, map: null }
+  generation += 1
+  cache.clear()
 }
 
 function mapPool(items, concurrency, fn) {
@@ -92,34 +95,90 @@ function shouldMirror(vm, live) {
   return !!(liveMs && liveMs > (vmMs || 0) + MIRROR_NEWER_MS && (live.has_access || live.has_refresh))
 }
 
+function collectionKey(projectRoot, list) {
+  return JSON.stringify([
+    projectRoot,
+    list
+      .map((vm) => {
+        let signature = null
+        try {
+          const s = fs.statSync(vmJsonPath(projectRoot, vm.id))
+          signature = [s.ino, s.mtimeMs, s.size]
+        } catch {}
+        return [vm.id, vm.status, vm.node_id, vm.owner_user_id, vm.account_uuid, vm.runtime, signature]
+      })
+      .sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
+  ])
+}
+
+function fileCredentialMap(projectRoot, list) {
+  const map = new Map()
+  for (const vm of list) {
+    const exec = slotExec(projectRoot, vm)
+    if (!exec) continue
+    const live = publicLiveCredential(null, readSlotCredentialIdentity(exec.homeDir))
+    if (live.has_access || live.has_refresh || live.expires_at) map.set(vm.id, live)
+  }
+  return map
+}
+
 export async function collectLivePanelCredentials(
   projectRoot,
   vms = [],
-  { concurrency = 10, timeoutMs = 1200, cacheMs = LIVE_CREDENTIAL_CACHE_MS } = {},
+  { concurrency = 10, timeoutMs = 1200, cacheMs = LIVE_CREDENTIAL_CACHE_MS, background = false } = {},
 ) {
   const now = Date.now()
-  if (cache.map && cacheMs > 0 && now - cache.at < cacheMs) return cache.map
   const list = Array.isArray(vms) ? vms.filter((vm) => vm?.id) : []
+  const key = collectionKey(projectRoot, list)
+  let entry = cacheMs > 0 ? cache.get(key) : null
+  if (entry?.map && now - entry.at < cacheMs) return entry.map
+  if (entry?.pending) return background ? entry.map || fileCredentialMap(projectRoot, list) : entry.pending
+  entry ||= { at: 0, map: null, pending: null }
+  if (cacheMs > 0) {
+    cache.set(key, entry)
+    if (cache.size > 32) cache.delete(cache.keys().next().value)
+  }
+  const startedGeneration = generation
+  const current = () => generation === startedGeneration && (cacheMs <= 0 || cache.get(key) === entry)
   const map = new Map()
-  await mapPool(list, concurrency, async (vm) => {
+  const pending = mapPool(list, concurrency, async (vm) => {
     const exec = slotExec(projectRoot, vm)
     if (!exec) return
     const file = readSlotCredentialIdentity(exec.homeDir)
     let health = null
-    try {
-      health = await rustKernelHealth(exec, { timeoutMs })
-    } catch (error) {
-      health = { ok: false, code: 'worker_unavailable', error: String(error.message || error) }
+    if (vm.status !== 'stopped') {
+      try {
+        health = await rustKernelHealth(exec, { timeoutMs })
+      } catch (error) {
+        health = { ok: false, code: 'worker_unavailable', error: String(error.message || error) }
+      }
     }
     const live = publicLiveCredential(health, file)
     if (!live.has_access && !live.has_refresh && !live.expires_at) return
     map.set(vm.id, live)
-    if (shouldMirror(vm, live) && exec.homeDir) {
+    if (current() && shouldMirror(vm, live) && exec.homeDir) {
       try {
         mirrorWorkerCredentialsToVm(vmJsonPath(projectRoot, vm.id), exec.homeDir)
       } catch {}
     }
+  }).then(() => {
+    if (current()) {
+      entry.at = Date.now()
+      entry.map = map
+    }
+    return map
   })
-  cache = { at: Date.now(), map }
-  return map
+  entry.pending = pending
+  // A failed background refresh must not become an unhandled rejection or a
+  // permanently poisoned cache. Detail/diagnostic callers still await freshness.
+  void pending.then(
+    () => {
+      entry.pending = null
+    },
+    () => {
+      entry.pending = null
+      if (cache.get(key) === entry) cache.delete(key)
+    },
+  )
+  return background ? entry.map || fileCredentialMap(projectRoot, list) : pending
 }

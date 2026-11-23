@@ -23,6 +23,7 @@ import { QueryGate } from '@/components/query-gate'
 import { dashboardQueryOptions } from '@/features/overview/queries'
 import { AboutPane } from '@/features/settings/about-pane'
 import { BackupPane } from '@/features/settings/backup-pane'
+import { GeminiInstallPane } from '@/features/settings/gemini-install-pane'
 import { HealthPane } from '@/features/settings/health-pane'
 import { LogsPane } from '@/features/settings/logs-pane'
 import {
@@ -54,6 +55,7 @@ import { StickyPane } from '@/features/settings/sticky-pane'
 import { uploadIntervalOf } from '@/features/settings/telemetry-interval'
 import { TelemetryPane } from '@/features/settings/telemetry-pane'
 import { ProtocolPane } from './protocol-pane'
+import { RedactionPane } from './redaction-pane'
 
 export function SettingsPage() {
   const { tab: raw } = useParams({ from: '/_authenticated/settings/$tab' })
@@ -86,6 +88,7 @@ export function SettingsPage() {
   const save = useMutation({
     mutationFn: () => {
       const body = { ...draft }
+      delete body.redaction_runtime
       const compat = (body.compatibility as Record<string, unknown>) || {}
       if (tab === 'protocol') {
         const preset = personaPresetFromCompat(compat)
@@ -160,14 +163,17 @@ export function SettingsPage() {
           )
         }
       }
-      toast.success(
-        settingsSaveToast(
-          tab,
-          inherited,
-          saved?.kernel_persona,
-          saved?.telemetry_sync
-        )
+      const message = settingsSaveToast(
+        tab,
+        inherited,
+        saved?.kernel_persona,
+        saved?.telemetry_sync
       )
+      if (tab === 'telemetry' && saved?.telemetry_sync?.failed?.length) {
+        toast.warning(message)
+      } else {
+        toast.success(message)
+      }
       acceptNextServer.current = true
       await Promise.all([
         qc.invalidateQueries({ queryKey: routingQueryOptions().queryKey }),
@@ -194,7 +200,8 @@ export function SettingsPage() {
     serverJson !== null &&
     Object.keys(draft).length > 0 &&
     JSON.stringify(draft) !== serverJson
-  const hideSave = tab === 'socks5' || tab === 'backup' || tab === 'about'
+  const hideSave =
+    tab === 'socks5' || tab === 'backup' || tab === 'about' || tab === 'gemini'
   const showSaveBar = dirty && !hideSave
 
   const discard = () => {
@@ -222,10 +229,12 @@ export function SettingsPage() {
       title={VIEW_TITLES.settings}
       description={
         tab === 'quota'
-          ? 'Claude 配额闸线、并发和 RPM。GPT 配额在 OpenAI 页。个人自用引导会把闸关掉并拉到上限；这里仍可再改。'
+          ? 'Claude 配额闸线、并发、RPM，以及请求体上限。GPT 配额在 OpenAI 页。个人自用引导会把闸关掉并拉到上限；这里仍可再改。'
           : tab === 'openai'
             ? 'GPT 传输、准入、配额与客户端画像。全局 WebSocket 只作用于推理，不影响终端或集群。'
-            : undefined
+            : tab === 'logs'
+              ? '设置请求日志的记录模式、保留时间和存储上限。逐条记录在日志页查看。'
+              : undefined
       }
     >
       <div className='@2xl/content:grid @2xl/content:grid-cols-[10.5rem_1fr] @2xl/content:gap-8'>
@@ -308,6 +317,7 @@ export function SettingsPage() {
                       Record<string, QuotaTierPolicy> | undefined) || {}
                   }
                   quota={quota}
+                  failover={failover}
                   onChange={(tier, next) =>
                     setDraft((current) => {
                       const currentTiers =
@@ -351,6 +361,16 @@ export function SettingsPage() {
                         },
                       }
                     })
+                  }
+                  onFailoverChange={(patch) =>
+                    setDraft((current) => ({
+                      ...current,
+                      failover: {
+                        ...((current.failover as Record<string, unknown>) ||
+                          {}),
+                        ...patch,
+                      },
+                    }))
                   }
                   saving={save.isPending}
                   pending={dirty}
@@ -412,6 +432,30 @@ export function SettingsPage() {
                   }
                 />
               ) : null}
+              {tab === 'redaction' ? (
+                <RedactionPane
+                  redaction={
+                    (draft.redaction as
+                      Record<string, unknown> | undefined) || {
+                      enabled: false,
+                      secrets: true,
+                      personal: true,
+                      words: [],
+                      wordsAnyCase: false,
+                      rules: [],
+                      kinds: {},
+                      allow: [],
+                    }
+                  }
+                  runtime={
+                    (draft.redaction_runtime as
+                      Record<string, unknown> | undefined) || {}
+                  }
+                  onChange={(next) =>
+                    setDraft((current) => ({ ...current, redaction: next }))
+                  }
+                />
+              ) : null}
               {tab === 'health' ? (
                 <HealthPane
                   title={SETTINGS_TAB_LABELS[tab]}
@@ -446,6 +490,10 @@ export function SettingsPage() {
                     (draft.telemetry as Record<string, unknown> | undefined)
                       ?.upload_interval_seconds
                   )}
+                  defaultEnabled={
+                    (draft.telemetry as Record<string, unknown> | undefined)
+                      ?.default_enabled === true
+                  }
                   onIntervalChange={(seconds) =>
                     setDraft((current) => ({
                       ...current,
@@ -456,11 +504,22 @@ export function SettingsPage() {
                       },
                     }))
                   }
+                  onDefaultEnabledChange={(enabled) =>
+                    setDraft((current) => ({
+                      ...current,
+                      telemetry: {
+                        ...((current.telemetry as Record<string, unknown>) ||
+                          {}),
+                        default_enabled: enabled,
+                      },
+                    }))
+                  }
                 />
               ) : null}
               {tab === 'socks5' ? <Socks5Pane /> : null}
               {tab === 'backup' ? <BackupPane /> : null}
               {tab === 'about' ? <AboutPane /> : null}
+              {tab === 'gemini' ? <GeminiInstallPane /> : null}
             </div>
           </QueryGate>
         </div>
@@ -494,13 +553,10 @@ function settingsSaveToast(
   }
   if (tab === 'openai') return '已保存 · GPT 配置'
   if (tab === 'telemetry' && telemetry) {
-    const queued = telemetry.queued
-      ? ` · ${telemetry.queued} 个集群槽已排队推送到节点`
-      : ''
     const failed = telemetry.failed?.length
-      ? ` · ${telemetry.failed.length} 个写入失败：${telemetry.failed.slice(0, 3).join('、')}`
+      ? ` · ${telemetry.failed.length} 个未生效：${telemetry.failed.slice(0, 3).join('、')}`
       : ''
-    return `已保存 · ${telemetry.updated ?? 0} 个本机槽已热更新${queued}${failed}`
+    return `已保存 · ${telemetry.updated ?? 0} 个 VM 配置已确认发布${failed}`
   }
   return '已保存'
 }
@@ -516,7 +572,6 @@ type RoutingSaveResult = {
   kernel_persona?: { updated?: number; skipped?: number } | null
   telemetry_sync?: {
     updated?: number
-    queued?: number
     skipped?: number
     failed?: string[]
   } | null

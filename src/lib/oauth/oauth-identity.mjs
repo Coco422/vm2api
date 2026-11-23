@@ -4,8 +4,8 @@
  * This is part of ticket exchange, not official Claude Code first-run.
  */
 import { makeProxyFetch } from '../protocol/codex-models.mjs'
-import { OFFICIAL_STAINLESS } from '../identity/vm-identity.mjs'
-import { BETA_OAUTH, BOOTSTRAP_UA, BOOTSTRAP_URL } from './oauth-contract.mjs'
+import { officialClaudeCliUa, OFFICIAL_STAINLESS } from '../identity/vm-identity.mjs'
+import { BETA_OAUTH, BOOTSTRAP_URL } from './oauth-contract.mjs'
 
 export const CLAUDE_CLI_BOOTSTRAP_URL = BOOTSTRAP_URL
 
@@ -21,7 +21,7 @@ function asObject(value) {
   return value && typeof value === 'object' && !Array.isArray(value) ? value : {}
 }
 
-const SUBSCRIPTION_TYPES = new Set(['pro', 'max', 'team', 'enterprise'])
+const SUBSCRIPTION_TYPES = new Set(['free', 'pro', 'max', 'team', 'enterprise'])
 
 export function normalizeSubscriptionType(value) {
   const key = String(value || '')
@@ -43,13 +43,16 @@ function subscriptionTypeFromText(text) {
 function planFromProfile(profile) {
   const account = profile?.account || {}
   const org = profile?.organization || {}
-  if (account.has_claude_max === true) return 'max'
   const orgType = String(org.organization_type || profile.organization_type || '').toLowerCase()
-  const rateTier = String(org.rate_limit_tier || '').toLowerCase()
-  if (orgType === 'claude_max' || rateTier.includes('max')) return 'max'
-  if (account.has_claude_pro === true || orgType === 'claude_pro' || rateTier.includes('pro')) return 'pro'
-  if (orgType === 'claude_enterprise') return 'enterprise'
-  if (orgType === 'claude_team') return 'team'
+  const orgPlan = normalizeSubscriptionType(orgType.replace(/^claude_/, ''))
+  if (orgPlan === 'team' || orgPlan === 'enterprise') return orgPlan
+  if (account.has_claude_max === true || orgPlan === 'max') return 'max'
+  const rateTier = String(org.rate_limit_tier || profile.rate_limit_tier || profile.rateLimitTier || '').toLowerCase()
+  for (const tier of SUBSCRIPTION_TYPES) {
+    if (new RegExp(`(?:^|_)claude_${tier}(?:_|$)`).test(rateTier)) return tier
+  }
+  if (orgPlan) return orgPlan
+  if (account.has_claude_pro === true) return 'pro'
   return null
 }
 
@@ -67,7 +70,7 @@ export function subscriptionTypeFromOauthRaw(raw) {
     const tier = planFromProfile(profile)
     if (tier) return tier
   }
-  return subscriptionTypeFromText(JSON.stringify(raw))
+  return subscriptionTypeFromText(raw.text)
 }
 
 export function flattenOauthIdentity(raw = {}) {
@@ -105,6 +108,21 @@ export function flattenOauthIdentity(raw = {}) {
       profile.organization_uuid,
     ),
     subscription_type: subscriptionTypeFromOauthRaw(raw),
+    rate_limit_tier: firstText(
+      raw.rate_limit_tier,
+      raw.rateLimitTier,
+      raw.claudeAiOauth?.rateLimitTier,
+      organization.rate_limit_tier,
+      profile.organization?.rate_limit_tier,
+      raw.oauth_profile?.organization?.rate_limit_tier,
+    ),
+    organization_role: firstText(raw.organization_role, raw.organizationRole, raw.oauthAccount?.organizationRole),
+    subscription_created_at: firstText(
+      raw.subscription_created_at,
+      raw.subscriptionCreatedAt,
+      organization.subscription_created_at,
+      profile.organization?.subscription_created_at,
+    ),
   }
 }
 
@@ -121,6 +139,9 @@ export function applyOauthIdentity(cred = {}, identity = {}) {
   if (identity.account_uuid) next.account_uuid = identity.account_uuid
   if (identity.org_uuid) next.org_uuid = identity.org_uuid
   if (identity.subscription_type) next.subscription_type = identity.subscription_type
+  if (identity.rate_limit_tier) next.rate_limit_tier = identity.rate_limit_tier
+  if (identity.organization_role) next.organization_role = identity.organization_role
+  if (identity.subscription_created_at) next.subscription_created_at = identity.subscription_created_at
   return next
 }
 
@@ -128,7 +149,9 @@ export function bootstrapRequestHeaders(accessToken) {
   return {
     accept: 'application/json',
     authorization: `Bearer ${String(accessToken || '').trim()}`,
-    'user-agent': BOOTSTRAP_UA,
+    // The CLI's own entrypoint, pinned to OFFICIAL_CLI_VERSION rather than a
+    // hand-synced literal that had drifted to 2.1.303.
+    'user-agent': officialClaudeCliUa(undefined, 'cli'),
     'anthropic-beta': BETA_OAUTH,
     'anthropic-version': '2023-06-01',
     'x-stainless-lang': OFFICIAL_STAINLESS.stainless_lang,

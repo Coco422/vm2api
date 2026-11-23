@@ -1,45 +1,192 @@
 import { queryOptions } from '@tanstack/react-query'
-import { api } from '@/lib/api'
+import type { CragLicenseStatus } from '@/types/panel-vm'
+import { ApiError, api, isApiError } from '@/lib/api'
 
-export type WrapSampleMeta = {
-  source?: string
-  source_vm?: string
-  captured_at?: string
-  kernel?: string
+export type KernelId = 'cli-node' | 'crag'
+
+export type KernelProduct = {
+  id: KernelId
+  name: string
+  paid: boolean
+  ready: boolean
+  version: string | null
   release_tag?: string
-  glibc_shim?: boolean
-  files?: string[]
-}
-
-export type WrapKernelPayload = {
-  source?: 'configured' | 'sample' | 'missing' | string
-  path?: string
-  size?: number
-  mtime?: string
-}
-
-export type WrapSample = {
-  ok: boolean
-  dir?: string
-  kernel_bin?: boolean
-  glibc_shim?: boolean
-  wrapper?: boolean
+  updated_at: string | null
+  release_options?: { tag: string; label: string }[]
+  payload_tag?: string
   code?: string
   error?: string
-  meta?: WrapSampleMeta | null
-  kernel?: WrapKernelPayload | null
-  cli_node?: WrapKernelPayload | null
-  cc_node?: WrapKernelPayload | null
-  crag?: (WrapKernelPayload & { ok?: boolean }) | null
-  dataplane?: 'wrap' | 'cc' | 'crag'
-  written?: string[]
-  sample_ok?: boolean
 }
 
+export type KernelInstallation = {
+  kernel: KernelId
+  version: string | null
+  installed_at: string
+  payload_tag?: string
+}
+
+export type KernelCatalog = {
+  kernels: KernelProduct[]
+  /** The CRAG payload this deployment pins, or null when nothing is pinned. */
+  crag_pin?: { tag: string; label?: string } | null
+  licenses: Record<string, CragLicenseStatus>
+  install_licenses?: Record<string, CragLicenseStatus>
+  installations?: Record<string, KernelInstallation>
+}
+
+export type KernelTarget = {
+  id: string
+  kernel: KernelId
+  expected_tag?: string
+  payload_tag?: string
+  /** Explicit operator approval to migrate an existing host grant to this package. */
+  reissue?: true
+}
+
+export type KernelInstallItem = KernelTarget & {
+  ok: boolean
+  stopped: boolean
+  restarted?: boolean
+  rolled_back?: boolean
+  reclaim_pending?: boolean
+  schedulable?: boolean
+  status?: string
+  version?: string | null
+  code?: string
+  error?: string
+}
+
+export type KernelInstallReport = {
+  ok: boolean
+  total: number
+  ok_count: number
+  failed_count: number
+  items: KernelInstallItem[]
+}
+
+export function kernelCatalogQueryOptions() {
+  return queryOptions({
+    queryKey: ['panel', 'kernels'] as const,
+    queryFn: () => api<KernelCatalog>('/api/panel/kernels'),
+  })
+}
+
+export function kernelVersionsQueryOptions() {
+  return queryOptions({
+    queryKey: ['panel', 'kernel-releases'] as const,
+    queryFn: () =>
+      api<Record<KernelId, string[]>>('/api/panel/kernels/releases'),
+    staleTime: 5 * 60_000,
+    retry: false,
+  })
+}
+
+export function pullKernelRelease(body: {
+  kernel: KernelId
+  tag?: string
+  /** Pass false to fetch the payload this deployment pins instead of the newest release. */
+  latest?: boolean
+}) {
+  return api<{
+    kernel: KernelProduct
+    release?: {
+      tag: string
+      version: string
+      asset: string
+      payload_tag?: string
+    }
+  }>('/api/panel/kernels/pull', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+}
+
+async function runKernelJob(endpoint: string, targets: KernelTarget[]) {
+  const unknown = () =>
+    new ApiError(
+      '无法确认安装结果，请先核对槽位状态，不要重复提交。',
+      0,
+      'kernel_install_unconfirmed'
+    )
+  const receipt = await api<{ job_id?: string }>(endpoint, {
+    method: 'POST',
+    body: JSON.stringify({ targets, background: true }),
+    signal: AbortSignal.timeout(15_000),
+  }).catch((error: unknown) => {
+    if (
+      isApiError(error) &&
+      error.status >= 400 &&
+      error.status < 500 &&
+      error.status !== 408 &&
+      error.status !== 499
+    )
+      throw error
+    throw unknown()
+  })
+  if (!receipt?.job_id) throw unknown()
+  // Both endpoints report progress through the shared install job.
+  const statusUrl = `/api/panel/kernels/install?${new URLSearchParams({ job_id: receipt.job_id })}`
+  const deadline = Date.now() + 15 * 60_000
+  while (Date.now() < deadline) {
+    const job = await api<{
+      state: 'running' | 'completed' | 'unknown'
+      report?: KernelInstallReport
+    }>(statusUrl, {
+      cache: 'no-store',
+      signal: AbortSignal.timeout(10_000),
+    }).catch((error: unknown) => {
+      if (
+        isApiError(error) &&
+        error.status >= 400 &&
+        error.status !== 408 &&
+        error.status !== 429 &&
+        error.status !== 499 &&
+        error.status < 500
+      )
+        throw unknown()
+      return null
+    })
+    if (job?.state === 'completed' && Array.isArray(job.report?.items))
+      return job.report
+    if (job && job.state !== 'running') throw unknown()
+    await new Promise((resolve) => setTimeout(resolve, 1000))
+  }
+  throw unknown()
+}
+
+export function installKernelTargets(targets: KernelTarget[]) {
+  return runKernelJob('/api/panel/kernels/install', targets)
+}
+
+/**
+ * Replaces the CRAG payload on slots that already run it. Every target must
+ * carry the release pin; the endpoint rejects the batch otherwise.
+ */
+export function updateCragTargets(targets: KernelTarget[]) {
+  return runKernelJob('/api/panel/kernels/crag-update', targets)
+}
+
+/** Abandons one VM's in-flight install and frees the kernel cache for other VMs. */
+export function cancelKernelInstall(id: string) {
+  return api<{ id: string; kernel: string; phase: string }>(
+    '/api/panel/kernels/install/cancel',
+    { method: 'POST', body: JSON.stringify({ id }) }
+  )
+}
+
+// Fleet actions outside /wrap still consume the existing runtime-sync report.
 export type WrapSyncReport = {
   ok?: boolean
   src?: string
-  meta?: WrapSampleMeta | null
+  meta?: {
+    source?: string
+    source_vm?: string
+    captured_at?: string
+    kernel?: string
+    release_tag?: string
+    glibc_shim?: boolean
+    files?: string[]
+  } | null
   total?: number
   ok_count?: number
   failed_count?: number
@@ -50,105 +197,4 @@ export type WrapSyncReport = {
     code?: string
     kernel?: { ok?: boolean; skipped?: boolean; error?: string }
   }[]
-}
-
-export type WrapRepairReport = {
-  wrap?: { ok?: boolean; dest?: string; error?: string }
-  kernel?: { ok?: boolean; skipped?: boolean; reason?: string; error?: string }
-}
-
-export function wrapSampleQueryOptions() {
-  return queryOptions({
-    queryKey: ['panel', 'wrap-cli'] as const,
-    queryFn: () => api<WrapSample>('/api/panel/wrap-cli'),
-  })
-}
-
-export function syncWrapSample(
-  body: { ids?: string[]; restart?: boolean } = {}
-) {
-  return api<WrapSyncReport>('/api/panel/wrap-cli/sync', {
-    method: 'POST',
-    body: JSON.stringify(body),
-  })
-}
-
-export function makeWrapSample(body: { glibc_vm?: string } = {}) {
-  const glibc_vm = String(body.glibc_vm || '').trim()
-  return api<WrapSample>('/api/panel/wrap-cli/make', {
-    method: 'POST',
-    body: JSON.stringify(glibc_vm ? { glibc_vm } : {}),
-  })
-}
-
-export function promoteWrapSample(id: string) {
-  return api<WrapSample>(
-    `/api/panel/vms/${encodeURIComponent(id)}/wrap-cli/promote`,
-    { method: 'POST', body: JSON.stringify({}) }
-  )
-}
-
-export function repairWrapSample(id: string) {
-  return api<WrapRepairReport>(
-    `/api/panel/vms/${encodeURIComponent(id)}/wrap-cli/repair`,
-    { method: 'POST', body: JSON.stringify({}) }
-  )
-}
-
-export type WrapReleaseUpdate = {
-  release?: {
-    tag?: string
-    version?: string
-    asset?: string
-    size?: number
-    cli_node?: string
-    cli_node_size?: number
-    cc_node?: string
-    cc_node_size?: number
-    crag?: string | null
-    crag_size?: number
-    crag_skipped?: boolean
-  }
-  kernel?: WrapSample
-  sync?: WrapSyncReport
-}
-
-export function installReleaseKernel(
-  body: { ids?: string[]; restart?: boolean } = {}
-) {
-  return api<WrapReleaseUpdate>('/api/panel/wrap-cli/kernel/release', {
-    method: 'POST',
-    body: JSON.stringify(body),
-  })
-}
-
-export function uploadKernelBinary(file: Blob) {
-  return api<WrapSample>('/api/panel/wrap-cli/kernel', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/octet-stream' },
-    body: file,
-  })
-}
-
-export function uploadCragKernelBinary(file: Blob) {
-  return api<WrapSample>('/api/panel/wrap-cli/crag-kernel', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/octet-stream' },
-    body: file,
-  })
-}
-
-export function setKernelDataplane(body: {
-  dataplane: 'wrap' | 'cc' | 'crag'
-  ids?: string[]
-  all?: boolean
-  restart?: boolean
-}) {
-  return api<WrapSyncReport & { dataplane?: 'wrap' | 'cc' | 'crag' }>(
-    '/api/panel/dataplane',
-    {
-      method: 'POST',
-      body: JSON.stringify(body),
-    }
-  )
 }

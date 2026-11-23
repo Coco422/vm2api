@@ -10,6 +10,7 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
+import { randomUUID } from 'node:crypto'
 import { atomicWriteJson } from '../vm/vm-file.mjs'
 import { applyClearUnschedulable, applyUnschedulable, migrateScheduleRecord } from '../pool/schedule-state.mjs'
 import {
@@ -23,6 +24,15 @@ import { resolveAuthScheme } from './auth-scheme.mjs'
 import { flattenOauthIdentity, normalizeSubscriptionType } from './oauth-identity.mjs'
 
 export const REFRESH_SKEW_MS = 5 * 60 * 1000
+
+/**
+ * Scheduled refresh lead. The official CLI inside the slot refreshes on its own
+ * once a grant is within 5 minutes of expiry (same as REFRESH_SKEW_MS) and takes
+ * a different lock than the host. Refreshing 15 minutes ahead (monitor ticks
+ * every 5) means the CLI never sees an expiring grant, so only one party ever
+ * spends a refresh token.
+ */
+export const PROACTIVE_REFRESH_SKEW_MS = 15 * 60 * 1000
 
 export const SENSITIVE_CREDENTIAL_KEYS = [
   'access_token',
@@ -70,6 +80,8 @@ export function normalizeOauth(cred = {}) {
     email: identity.email,
     account_uuid: identity.account_uuid,
     org_uuid: identity.org_uuid,
+    subscription_type: identity.subscription_type,
+    rate_limit_tier: identity.rate_limit_tier,
     scope: cred.scope || (scopes.length ? scopes.join(' ') : null),
     source: cred.source || null,
     session_key: cred.session_key || cred.sessionKey || null,
@@ -125,24 +137,6 @@ export function slotWorkerCredentialPath(homeDir) {
   return path.join(homeDir, '.claude', 'credentials.json')
 }
 
-const AUTH_LOGIN_REFRESH_HOLD_MS = 30 * 60 * 1000
-
-/** A live `claude auth login` is about to exchange a new grant. Do not spend the old RT. */
-export function authLoginBlocksRefresh(homeDir, now = Date.now()) {
-  if (!homeDir) return false
-  try {
-    const status = JSON.parse(fs.readFileSync(path.join(homeDir, '..', 'run', 'auth-login', 'status.json'), 'utf8'))
-    const state = String(status.status || '')
-    if (!state || state === 'login_ready' || state === 'error' || state === 'exited') return false
-    const expires = Number(status.expires_at || 0)
-    if (expires > 0) return now < expires
-    const created = Number(status.created_at || 0)
-    return !created || now < created + AUTH_LOGIN_REFRESH_HOLD_MS
-  } catch {
-    return false
-  }
-}
-
 function regularOauthGrant(file) {
   let st
   try {
@@ -158,6 +152,7 @@ function regularOauthGrant(file) {
     return {
       refresh: String(oauth.refreshToken || oauth.refresh_token || '').trim(),
       expires: Number(oauth.expiresAt || oauth.expires_at || 0) || 0,
+      account: String(oauth.accountUuid || oauth.account_uuid || '').trim(),
       mtimeMs: Number(st.mtimeMs) || 0,
     }
   } catch {
@@ -170,6 +165,8 @@ function officialGrantWins(official, worker) {
   if (!official?.refresh) return false
   if (!worker?.refresh) return true
   if (official.refresh === worker.refresh) return false
+  // Another account's grant is a leftover login, never a rotation of this slot's grant.
+  if (official.account && worker.account && official.account !== worker.account) return false
   if (official.expires !== worker.expires) {
     if (!worker.expires) return true
     if (!official.expires) return false
@@ -185,15 +182,22 @@ function officialGrantWins(official, worker) {
  * grant is copied onto the worker file first. Deleting it and refreshing
  * the older RT is what revokes the new grant.
  */
-export function ensureOfficialCredentialLink(homeDir, { uid, gid, create = false } = {}) {
+/**
+ * `adoptOfficial: 'rotation'` adopts only over an existing worker grant: it keeps a
+ * refresh the CLI made while the alias was a regular file, but a loose native
+ * login never seeds an empty slot.
+ */
+export function ensureOfficialCredentialLink(homeDir, { uid, gid, create = false, adoptOfficial = true } = {}) {
   const claudeDir = path.join(homeDir || '', '.claude')
   const workerFile = path.join(claudeDir, 'credentials.json')
   const officialFile = path.join(claudeDir, '.credentials.json')
   if (!homeDir) return { wrote: false, error: 'home missing' }
-  const officialGrant = regularOauthGrant(officialFile)
   const workerGrant = regularOauthGrant(workerFile)
-  const adopt = officialGrantWins(officialGrant, workerGrant)
-  if (!workerGrant && !fs.existsSync(workerFile)) {
+  const adopt =
+    !!adoptOfficial &&
+    (adoptOfficial !== 'rotation' || !!workerGrant?.refresh) &&
+    officialGrantWins(regularOauthGrant(officialFile), workerGrant)
+  if (!fs.existsSync(workerFile)) {
     if (!adopt && !create) return { wrote: false, error: 'worker credentials.json missing' }
     fs.mkdirSync(claudeDir, { recursive: true, mode: 0o700 })
     if (adopt) fs.copyFileSync(officialFile, workerFile)
@@ -217,22 +221,28 @@ export function ensureOfficialCredentialLink(homeDir, { uid, gid, create = false
   try {
     const st = fs.lstatSync(officialFile)
     if (st.isSymbolicLink()) {
-      const target = fs.readlinkSync(officialFile)
-      if (target === 'credentials.json' || path.resolve(claudeDir, target) === path.resolve(workerFile)) {
+      // An absolute host path can resolve here but dangle inside a container or KVM guest.
+      if (fs.readlinkSync(officialFile) === 'credentials.json') {
         return { wrote: true, path: officialFile, linked: true, adopted: adopt }
       }
     }
-    fs.rmSync(officialFile, { force: true })
-  } catch {}
-  try {
-    fs.symlinkSync('credentials.json', officialFile)
-  } catch (e) {
-    return { wrote: false, error: String(e.message || e).slice(0, 200) }
+  } catch (error) {
+    if (error.code !== 'ENOENT') return { wrote: false, error: String(error.message || error).slice(0, 200) }
   }
-  if (uid != null && gid != null) {
+  const tempLink = `${officialFile}.${randomUUID()}.tmp`
+  try {
+    fs.symlinkSync('credentials.json', tempLink)
+    if (uid != null && gid != null) {
+      try {
+        fs.lchownSync(tempLink, uid, gid)
+      } catch {}
+    }
+    fs.renameSync(tempLink, officialFile)
+  } catch (e) {
     try {
-      fs.lchownSync(officialFile, uid, gid)
+      fs.unlinkSync(tempLink)
     } catch {}
+    return { wrote: false, error: String(e.message || e).slice(0, 200) }
   }
   return { wrote: true, path: officialFile, linked: true, adopted: adopt }
 }
@@ -291,6 +301,7 @@ export function readWorkerCredentialFile(homeDir) {
       org_uuid: oauth.orgUuid || oauth.org_uuid || null,
       scope,
       subscription_type: oauth.subscriptionType || oauth.subscription_type || null,
+      rate_limit_tier: oauth.rateLimitTier || oauth.rate_limit_tier || null,
       source: 'go-slot-worker',
       auth_scheme: resolveAuthScheme({
         mode,
@@ -440,7 +451,7 @@ export function writeWorkerCredentialFile(homeDir, cred) {
     )
     chownSlotCredentialFile(homeDir, file)
     sealSlotCredentialFile(file)
-    ensureOfficialCredentialLink(homeDir)
+    ensureOfficialCredentialLink(homeDir, { adoptOfficial: false })
     return file
   }
   const n = normalizeOauth(cred)
@@ -478,6 +489,7 @@ export function writeWorkerCredentialFile(homeDir, cred) {
   if (isAnySetupTokenMode(mode)) oauth.type = mode
 
   if (subscriptionType) oauth.subscriptionType = subscriptionType
+  if (n.rate_limit_tier) oauth.rateLimitTier = n.rate_limit_tier
   const generation = Number(n._token_version || cred.kinGeneration || cred.kin_generation) || Date.now()
   oauth.kinGeneration = generation
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
@@ -488,15 +500,15 @@ export function writeWorkerCredentialFile(homeDir, cred) {
   atomicWriteJson(file, { type: mode, authScheme, kinGeneration: generation, claudeAiOauth: oauth }, { mode: 0o600 })
   chownSlotCredentialFile(homeDir, file)
   sealSlotCredentialFile(file)
-  ensureOfficialCredentialLink(homeDir)
+  ensureOfficialCredentialLink(homeDir, { adoptOfficial: false })
   return file
 }
 
 /**
  * Old slot files predate subscriptionType. Fill from the identified plan,
- * otherwise pro; repair the legacy pro fallback for an identified Max slot.
+ * otherwise pro. Only authoritative profile/usage can downgrade an old Max.
  */
-export function ensureSlotSubscriptionType(homeDir, accountTier = null) {
+export function ensureSlotSubscriptionType(homeDir, accountTier = null, { source = null } = {}) {
   const file = slotWorkerCredentialPath(homeDir)
   if (!file || !fs.existsSync(file)) return { wrote: false, reason: 'missing' }
   let doc
@@ -510,8 +522,13 @@ export function ensureSlotSubscriptionType(homeDir, accountTier = null) {
   const present = normalizeSubscriptionType(oauth.subscriptionType)
   const identified = normalizeSubscriptionType(accountTier)
   // Startup summaries used to lose the identified tier and write pro. A pro
-  // hint may itself be a default, so it must not downgrade an existing plan.
-  if (present && !(present === 'pro' && identified === 'max')) {
+  // hint may itself be a default; only an explicit source can downgrade a plan.
+  const authoritative = source === 'profile' || source === 'usage'
+  if (
+    present &&
+    !(present === 'pro' && identified === 'max') &&
+    !(authoritative && identified && present !== identified)
+  ) {
     chownSlotCredentialFile(homeDir, file)
     return { wrote: false, reason: 'present' }
   }
@@ -606,6 +623,16 @@ export function persistOauthToVm(vmPath, cred, { acceptLiveGrant = false, operat
     !!(n._token_version && prev._token_version && Number(n._token_version) > Number(prev._token_version))
   const mode = credentialModeFromOauth({ ...cred, mode: cred?.mode || cred?.type || prev.mode })
   vm.claude = stripCredentialSecrets({ ...prev })
+  if (
+    operatorImport ||
+    (n.account_uuid && prev.account_uuid && n.account_uuid !== prev.account_uuid) ||
+    (n.org_uuid && prev.org_uuid && n.org_uuid !== prev.org_uuid)
+  ) {
+    delete vm.claude.subscription_type
+    delete vm.claude.rate_limit_tier
+  }
+  if (n.subscription_type) vm.claude.subscription_type = n.subscription_type
+  if (n.rate_limit_tier) vm.claude.rate_limit_tier = n.rate_limit_tier
   if (n.access_token || cred.has_access || cred.has_api_key || cred.api_key) vm.claude.has_access = true
   if (n.refresh_token || cred.has_refresh) vm.claude.has_refresh = true
   if (n.expires_at) vm.claude.expires_at = n.expires_at
@@ -621,6 +648,7 @@ export function persistOauthToVm(vmPath, cred, { acceptLiveGrant = false, operat
   }
   if (n.source) vm.claude.source = n.source
   vm.claude.mode = mode
+  if (operatorImport) vm.claude.oauth_registration = cred.oauth_registration === 'console' ? 'console' : 'oauth'
   if (mode !== 'apikey' && vm.claude.account_tier !== 'max') {
     vm.claude.account_tier = 'pro'
     vm.claude.account_tier_source = vm.claude.account_tier_source || 'default'

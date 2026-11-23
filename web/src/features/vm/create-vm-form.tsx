@@ -15,6 +15,7 @@ import { importErrorMessage } from '@/lib/import-errors'
 import { cn } from '@/lib/utils'
 import { vmIdOf } from '@/lib/vm-name'
 import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
 import {
   Collapsible,
   CollapsibleContent,
@@ -78,6 +79,37 @@ export type CreateVmAfter = 'idle' | 'start' | 'proxy' | 'active' | 'full'
 
 type Platform = 'anthropic' | 'openai'
 
+type CreateVmDataplane = 'wrap' | 'crag'
+
+const DATAPLANE_LABEL: Record<CreateVmDataplane, string> = {
+  wrap: 'cli-node（标准，默认）',
+  crag: 'CRAG（需授权）',
+}
+
+const CRAG_UNSUPPORTED = '此机器不支持 CRAG，只安装标准内核'
+
+function cragDisabledReason(
+  placement: Placement,
+  localSupported: boolean | undefined,
+  localPending: boolean
+): string | null {
+  if (!placement.nodeId) {
+    if (localSupported === true) return null
+    return localPending ? '正在检测本机 CRAG 支持情况…' : CRAG_UNSUPPORTED
+  }
+
+  const node = placement.nodes.find((n) => n.id === placement.nodeId)
+  const preflight = placement.preflight.data
+  if (
+    node?.platform === 'darwin' ||
+    preflight?.checks.some((c) => c.id === 'arch' && !c.ok)
+  ) {
+    return CRAG_UNSUPPORTED
+  }
+  // Older nodes without a platform are Linux; their preflight already checks amd64.
+  return preflight?.ok === true ? null : '目标节点通过 Linux amd64 预检后可选。'
+}
+
 type CreateVmResponse = {
   id?: string
   vm_id?: string
@@ -105,6 +137,7 @@ const MEMORY_SHORT: Record<VmMemoryOption, string> = {
   '256m': '256M',
   '512m': '512M',
   '1g': '1G',
+  '1536m': '1.5G',
   '2g': '2G',
   '4g': '4G',
   '8g': '8G',
@@ -119,6 +152,9 @@ export interface CreateVmDraft {
   pinnedAfter?: CreateVmAfter
   platform: Platform
   setPlatform: (next: Platform) => void
+  dataplane: CreateVmDataplane
+  setDataplane: (next: CreateVmDataplane) => void
+  cragDisabledReason: string | null
   kernel: string
   setKernel: (next: string) => void
   name: string
@@ -144,6 +180,11 @@ export interface CreateVmDraft {
   kvmBlocked: boolean
   exit: CreateExit
   wantsExit: boolean
+  /** 浏览器桌面伴生（仅 Claude 容器槽可勾选）。 */
+  desktop: boolean
+  setDesktop: (next: boolean) => void
+  /** 管理员 + Claude 容器槽才显示勾选项并提交。 */
+  desktopAllowed: boolean
   create: UseMutationResult<CreateVmResult, Error, void>
   /** 预检未过 / KVM 仍在检测：提交按钮禁用。 */
   blocked: boolean
@@ -159,12 +200,16 @@ export interface CreateVmDraft {
 export function useCreateVmDraft({
   pinnedAfter,
   onCreated,
+  nodeId,
 }: {
   pinnedAfter?: CreateVmAfter
   onCreated?: (id: string) => void
+  /** 预选的目标机器；空 = 本机。 */
+  nodeId?: string
 } = {}): CreateVmDraft {
   const qc = useQueryClient()
   const [platform, setPlatform] = useState<Platform>('anthropic')
+  const [preferredDataplane, setDataplane] = useState<CreateVmDataplane>('wrap')
   const [kernel, setKernel] = useState<string>(KERNELS[0].id)
   const [name, setName] = useState('')
   const [after, setAfter] = useState<string>(pinnedAfter || 'start')
@@ -186,7 +231,18 @@ export function useCreateVmDraft({
   const diskGb = diskOverride ?? vmCfg.disk_gb
 
   const typedName = name.trim()
-  const placement = usePlacement(kernel, preferredRuntime)
+  const placement = usePlacement(kernel, preferredRuntime, nodeId)
+  const disabledReason = cragDisabledReason(
+    placement,
+    createOptions.data?.crag_supported,
+    createOptions.isPending
+  )
+  const dataplane =
+    platform === 'anthropic' && disabledReason === null
+      ? preferredDataplane
+      : 'wrap'
+  // 清除失效的选择，切回受支持的目标也不会自动选中 CRAG。
+  if (preferredDataplane !== dataplane) setDataplane(dataplane)
   const kvmAvail: KvmAvailability = placement.nodeId
     ? kvmAvailabilityFromPreflight({
         fetching: placement.preflight.isFetching,
@@ -208,6 +264,12 @@ export function useCreateVmDraft({
     runtimeType === 'kvm' && !placement.nodeId && kvmAvail.status === 'loading'
   const exit = useCreateExit(placement.nodeId)
   const wantsExit = after !== 'idle'
+  const [desktop, setDesktop] = useState(false)
+  // 桌面伴生仅管理员可开（后端同口径），且只对 Claude 容器槽有意义。
+  const desktopAllowed =
+    me.data?.role === 'admin' &&
+    platform === 'anthropic' &&
+    runtimeType !== 'kvm'
 
   const create = useMutation({
     mutationFn: async () => {
@@ -227,8 +289,10 @@ export function useCreateVmDraft({
           ...deriveAfter(after),
           platform,
           family: platform === 'openai' ? 'codex' : 'claude',
+          ...(platform === 'anthropic' ? { dataplane } : {}),
           ...(nodeId ? { node_id: nodeId } : {}),
           ...(wantsExit && exit.proxyId ? { proxy_id: exit.proxyId } : {}),
+          ...(desktopAllowed && desktop ? { desktop: true } : {}),
           ...createMachinePayload({ runtimeType, memory, vcpus, diskGb }),
         }),
       })
@@ -273,6 +337,9 @@ export function useCreateVmDraft({
     pinnedAfter,
     platform,
     setPlatform,
+    dataplane,
+    setDataplane,
+    cragDisabledReason: disabledReason,
     kernel,
     setKernel,
     name,
@@ -302,6 +369,9 @@ export function useCreateVmDraft({
     kvmBlocked,
     exit,
     wantsExit,
+    desktop,
+    setDesktop,
+    desktopAllowed,
     create,
     blocked: placement.blocked || kvmPending,
     placementChecks: preflightChecksFromError(create.error),
@@ -361,6 +431,9 @@ export function draftSpecRows(d: CreateVmDraft): SpecRow[] {
         <PlatformChip kind={d.platform === 'openai' ? 'codex' : 'claude'} />
       ),
     },
+    ...(d.platform === 'anthropic'
+      ? [{ label: '推理内核', value: DATAPLANE_LABEL[d.dataplane] }]
+      : []),
     {
       label: '形态',
       value:
@@ -375,6 +448,9 @@ export function draftSpecRows(d: CreateVmDraft): SpecRow[] {
       label: '规格',
       value: machineLine(d.runtimeType, d.memory, d.vcpus, d.diskGb),
     },
+    ...(d.desktopAllowed
+      ? [{ label: '浏览器桌面', value: d.desktop ? '启用' : '关闭' }]
+      : []),
     {
       label: '放置',
       value: node ? node.label || node.host : '本机',
@@ -478,8 +554,8 @@ function kvmDetail(avail: KvmAvailability, remote: boolean): ReactNode {
 }
 
 /**
- * 创建槽位的表单。顺序即决策顺序：先定账号平台与机器形态，
- * 再定系统与规格，最后才是放置与名称这类可以不管的项。
+ * 创建槽位的表单。先定账号平台与推理内核，再定机器形态、系统与规格，
+ * 最后才是放置与名称这类可以不管的项。
  *
  * variant=flow：导入流程第 1 步，规格单在页面右栏，按钮是「创建空槽」。
  * variant=dialog：槽位页快捷创建，多一节「创建后」，带取消。
@@ -518,7 +594,48 @@ export function CreateVmForm({
         />
       </Section>
 
-      <Section title='形态' hint='容器轻、快；虚拟机给每个槽一台独立的机器。'>
+      {d.platform === 'anthropic' ? (
+        <Section
+          title='推理内核'
+          hint={
+            d.cragDisabledReason === null
+              ? '两套内核均预装，此处只选择运行内核'
+              : undefined
+          }
+        >
+          <ChoiceTiles
+            label='推理内核'
+            value={d.dataplane}
+            onChange={d.setDataplane}
+            choices={[
+              { value: 'wrap', title: DATAPLANE_LABEL.wrap },
+              {
+                value: 'crag',
+                title: DATAPLANE_LABEL.crag,
+                disabled: d.cragDisabledReason !== null,
+                detail: d.cragDisabledReason,
+              },
+            ]}
+          />
+        </Section>
+      ) : null}
+
+      <Section
+        title='形态'
+        hint='容器轻、快；虚拟机给每个槽一台独立的机器。勾选浏览器桌面会为 Claude 槽创建伴生容器，共享本槽出口；创建后也可在槽位「桌面」页签随时开启或关闭。'
+        action={
+          d.desktopAllowed ? (
+            <label className='flex cursor-pointer items-center gap-2 text-sm font-normal'>
+              <Checkbox
+                checked={d.desktop}
+                onCheckedChange={(v) => d.setDesktop(v === true)}
+                aria-label='创建时启用浏览器桌面'
+              />
+              浏览器桌面
+            </label>
+          ) : null
+        }
+      >
         <ChoiceTiles
           label='槽位形态'
           value={d.runtimeType}
@@ -688,14 +805,18 @@ export function CreateVmForm({
       <Section title='名称'>
         <Input
           aria-label='槽位名称'
+          aria-describedby='slot-name-help'
           value={d.name}
           onChange={(e) => d.setName(e.target.value)}
           placeholder='留空自动编号，如 vm-08'
           className='max-w-sm'
         />
+        <p id='slot-name-help' className='text-xs text-muted-foreground'>
+          名称会显示在列表中；可用的字母或数字也会用于生成槽位
+          ID。留空或只填中文时自动编号。
+        </p>
         <p className='text-xs text-muted-foreground'>
-          并发跟随设置里的全局默认（创建后可在槽位详情钉住单槽值），权重为默认
-          1。
+          并发跟随设置里的全局默认（创建后可在槽位详情钉住单槽值）。
         </p>
       </Section>
 

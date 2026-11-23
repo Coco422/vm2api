@@ -10,6 +10,7 @@ import {
   proxyNamedLabel,
 } from '@/lib/vm-status'
 import { meQueryOptions } from '@/features/auth/queries'
+import { TenantProxyBadge } from '@/features/company/tenant-proxy-badge'
 import { proxyIsLocal } from '@/features/proxies/proxy-sort'
 import { proxySurfaceClass, vmProxyTone } from '@/features/proxies/proxy-tone'
 import { useRefreshProxies } from '@/features/proxies/queries'
@@ -45,7 +46,10 @@ export function ProxyChip({
   // （集群槽经节点本机出网），返回真实的出口 IP 与地理。接口只对 admin 开放；
   // 未绑定或被策略封禁的槽位没有可测的出口。
   const canProbe =
-    me.data?.role === 'admin' && bound && !vm.proxy?.blocked_reason
+    !vm.gemini &&
+    me.data?.role === 'admin' &&
+    bound &&
+    !vm.proxy?.blocked_reason
   const probe = useMutation({
     onMutate: () => toast.loading('正在探测出口…'),
     mutationFn: () =>
@@ -71,6 +75,9 @@ export function ProxyChip({
   const runProbe = () => {
     if (canProbe && !probe.isPending) probe.mutate()
   }
+  if (me.data?.role !== 'admin' && me.data?.role !== 'super') {
+    return <TenantProxyBadge className={className} />
+  }
   const label = bound
     ? vm.proxy?.label?.trim() || host
     : tone === 'danger'
@@ -85,6 +92,21 @@ export function ProxyChip({
         : bound
           ? named
           : label
+
+  if (vm.gemini) {
+    return (
+      <span
+        className={cn(
+          'inline-flex min-w-0 items-center gap-1 text-xs text-muted-foreground',
+          className
+        )}
+        title={`绑定的 SOCKS5 代理 · ${vm.gemini.proxy_id}`}
+      >
+        <Globe className='size-3 shrink-0' aria-hidden />
+        <span className='truncate'>{vm.gemini.proxy_id}</span>
+      </span>
+    )
+  }
 
   return (
     <div

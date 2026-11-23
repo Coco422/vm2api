@@ -1,66 +1,96 @@
 {
   "repo": "dofastted/vm2api",
-  "release": "payload-2026.10.28-kernel-agent-id",
+  "release": "payload-2026.11.21-oauth-2paths",
+  "crag_release": "payload-2026.11.21-crag-3.1.12",
+  "crag_authorization": {
+    "family": "crag",
+    "product": "crag-v2",
+    "issuer_public_key_id": "9dbb4bc2109f1637e64174d80d659168910843b34dbe4870f70a14af49ccb902",
+    "payload_key_id": "835451e266145220a2e75b1f39ff22a0d7b17be48395553a24666b1946e0333a"
+  },
+  "geminiDefaultLinuxAmd64": {
+    "tag": "payload-2026.11.20-gemini-0.3.0-rc.2",
+    "assets": {
+      "craggemini": {
+        "size": 1700584,
+        "sha256": "2a1f4e3b037afe8aee12c2d3ed4955ffd407ad75cbb07d45eb389be3cf7aea31"
+      },
+      "libagy_bridge.so": {
+        "size": 593976,
+        "sha256": "e1d6de82ff0d8b0a7327be440dbeae4a85d30d23acac3d60f258a80655592d01"
+      },
+      "manifest.json": {
+        "size": 410,
+        "sha256": "ce55f4b8bdf1e8dbdb48249ee088ebe7f25b7284452d35e0a2456616b774c06c"
+      },
+      "manifest.sig": {
+        "size": 64,
+        "sha256": "ae63d37757e789d83977d074bf8b5989586d214feb9a6936c5a7da97cbfa4bcf"
+      },
+      "gemini-ed25519.pub": {
+        "size": 113,
+        "sha256": "29618d11448c07978867004ccf11373c6637ba4808051eed0cedfb8e75041e3e"
+      },
+      "gemini-release.json": {
+        "size": 168,
+        "sha256": "18087e02b72c40f42ce69e73e142bf800bd8f68502dcae059fce15a096b87e44"
+      }
+    }
+  },
   "files": [
     {
       "path": "bin/kin-kernel",
       "asset": "kin-kernel",
-      "size": 12947192,
-      "sha256": "8a61aaa3cba06567a4c3b0039d357b341975e2495ec7fc7e8b5c3425cc53ec16"
+      "size": 13193840,
+      "sha256": "25cd83e35466d914d109c627d10a6e6e88bb4e8df1e3f9288dc0dcc18ae108ca"
     },
     {
       "path": "bin/kin-codex-kernel",
       "asset": "kin-codex-kernel",
-      "size": 7892048,
-      "sha256": "0ffec538a57afbe66f13832513ee4c2a27ecc970faa9367c7cb8a13551196dd3"
+      "size": 5981528,
+      "sha256": "95727081222f4096e9e63d29e6c9c2e009ff00365a70add30a885063fe7f9993"
     },
     {
       "path": "bin/kin-oauth-auth",
       "asset": "kin-oauth-auth",
-      "size": 14430374,
-      "sha256": "fe64b4ea20ca694863f9041fd02fd2c0c4e6d30cce99e273ee693d7d730a8095"
+      "size": 47421686,
+      "sha256": "1d464e66e0aa3241814741da835b3bcb40ee2d1765424e83c9af315163e76a2a"
     },
     {
       "path": "bin/kin-computer",
       "asset": "kin-computer",
-      "size": 5531864,
-      "sha256": "a64970838469da0e3b86831212e8f6b0806e3433a65dd062f6556252403c2bb9"
+      "size": 5519576,
+      "sha256": "1512b4551f520528425f38c8e262fcab52f071bb7a435471eda9dccc1fc3f198"
     },
     {
       "path": "bin/kin-worker",
       "asset": "kin-worker",
-      "size": 16455001,
-      "sha256": "d6b29f1144cd389696fe11edd6b5a024499bfc598da6a9ac96a4c7a9f9d6071b"
+      "size": 11567288,
+      "sha256": "402716ec3a168a2f80dbb1b38fe37733546dafa37f9d482a5c5618eb22975300"
     },
     {
       "path": "bin/kin-egress",
       "asset": "kin-egress",
-      "size": 9047621,
-      "sha256": "0bf1eeb0424fb341ad371fed1e40c39e68e940770222a0ac940d3340f3b4e277"
+      "size": 6254776,
+      "sha256": "7dcae417108551390a0fdaea0ef7fd8cfd82b055636c8b287546165bc930049a"
     },
     {
       "path": "bin/kin-slot-gate",
       "asset": "kin-slot-gate",
-      "size": 8120583,
-      "sha256": "78f78d59e4f61917aca202a384eb687488a8f511acfc41662d3877223431c859"
+      "size": 5603512,
+      "sha256": "99233d86da0476100acf026fdaa2246da765d4f1792e9f6294edbdd0901d5d29"
     },
     {
       "path": "share/wrap-cli/cli-node",
       "asset": "cli-node",
-      "size": 27789668,
-      "sha256": "4975763790088a0eba226f20152b3c45261a0654b8bbc038701757b7699ab4e1"
-    },
-    {
-      "path": "share/wrap-cli/cc-node",
-      "asset": "cc-node",
-      "size": 32484148,
-      "sha256": "be5eec49a78345dd935e302e88c9d7ad0afbb09a195356d81be1bdea766f3960"
+      "size": 31005108,
+      "sha256": "f6c3744dda01f756049360113607d2bd9a25911de0fdaf30fe9bb1a1918a6788"
     },
     {
       "path": "share/wrap-cli/kin-kernel.bin",
       "asset": "kin-kernel",
-      "size": 12947192,
-      "sha256": "8a61aaa3cba06567a4c3b0039d357b341975e2495ec7fc7e8b5c3425cc53ec16"
+      "size": 13193840,
+      "sha256": "25cd83e35466d914d109c627d10a6e6e88bb4e8df1e3f9288dc0dcc18ae108ca"
     },
     {
       "path": "share/wrap-cli/glibc239/ld-linux-x86-64.so.2",
@@ -91,6 +121,66 @@
       "asset": "kin-kernel-crag",
       "size": 9734168,
       "sha256": "5764a186e3778278a8733ecaf924211070968def7c6648c6f6ecf3b76120a537"
+    },
+    {
+      "path": "share/crag/kernels/v2/amd64/LICENSES.txt",
+      "asset": "crag-v2-amd64-LICENSES.txt",
+      "size": 514,
+      "sha256": "80ee2b207aa7a45ad09360dd874d62b3be2e079bfa84de368092940889e84784"
+    },
+    {
+      "path": "share/crag/kernels/v2/amd64/claude-code-2.1.321/LICENSE.md",
+      "asset": "crag-v2-amd64-claude-code-2.1.321-LICENSE.md",
+      "size": 147,
+      "sha256": "8ce94b9478bb9868f9641f818e06cd722fbe55d4c22e2d2ed11971b20146173a"
+    },
+    {
+      "path": "share/crag/kernels/v2/amd64/claude-code-2.1.321/claude",
+      "asset": "crag-v2-amd64-claude-code-2.1.321-claude",
+      "size": 341910032,
+      "sha256": "426c33815ca6645a772f722fbff10dbf2cbdb124a8aeab733c1365dbf8bbf61f"
+    },
+    {
+      "path": "share/crag/kernels/v2/amd64/crag-license-public.pem",
+      "asset": "crag-v2-amd64-crag-license-public.pem",
+      "size": 113,
+      "sha256": "a38372fb87af66678f7823538f2cf8b9fa7e0f3cbefcd612a4d5c47ebef10126"
+    },
+    {
+      "path": "share/crag/kernels/v2/amd64/crag-v2",
+      "asset": "crag-v2-amd64-v3.1.12-crag-v2",
+      "size": 894488,
+      "sha256": "92d2e75813b5549fa99de06a80b9b7606e6f864b521da4b2e9254c87a61b4860"
+    },
+    {
+      "path": "share/crag/kernels/v2/amd64/crag-v2.payload.enc",
+      "asset": "crag-v2-amd64-v3.1.12-crag-v2.payload.enc",
+      "size": 13234980,
+      "sha256": "73045623f28cf6717b25cd1c81b39db9a4c817cb866cf53c07ebabd0f587143e"
+    },
+    {
+      "path": "share/crag/kernels/v2/amd64/kernel.json.example",
+      "asset": "crag-v2-amd64-kernel.json.example",
+      "size": 1208,
+      "sha256": "78f7efce48658da76d996c2c99b50127265d7c6cf6ce13947162f057cf6d2f42"
+    },
+    {
+      "path": "share/crag/kernels/v2/amd64/manifest.json",
+      "asset": "crag-v2-amd64-v3.1.12-manifest.json",
+      "size": 2721,
+      "sha256": "f5c00bd6fdafd23a9ef01ba0c449177da630235121b1f96eef2dc3abb74ef670"
+    },
+    {
+      "path": "share/crag/kernels/v2/amd64/unpack-note.md",
+      "asset": "crag-v2-amd64-unpack-note.md",
+      "size": 15874,
+      "sha256": "1f5cce1c9491f03ceeeffcafa80db4bcbff8f5042fa86ef344c97bcf3b62062d"
+    },
+    {
+      "path": "dist/crag-v2-licensed-amd64.tar.gz",
+      "asset": "crag-v2-licensed-amd64.tar.gz",
+      "size": 171069832,
+      "sha256": "222a323858fe60f4092f10ebbef391db86e9cbb14212199578303a33e9ce1eba"
     }
   ]
 }

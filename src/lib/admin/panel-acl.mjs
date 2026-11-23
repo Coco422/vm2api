@@ -1,9 +1,11 @@
+import { cragShopRoute } from './crag-shop.mjs'
+
 /**
  * Panel RBAC.
  *
  *   admin  — full console + user management
  *   super  — overview / cluster / logs / statistics + VM page (schedule only)
- *   user   — tenant: owned VM usage / client keys / logs / statistics; reset credits only
+ *   user   — tenant: owned VM usage, quota thresholds and reset credits; client keys, logs and statistics
  */
 
 export const PANEL_VIEWS = [
@@ -26,6 +28,7 @@ export const PANEL_VIEWS = [
   'users',
   'wrap',
   'billing',
+  'crag-subscription',
 ]
 
 const ROLE_VIEWS = {
@@ -35,7 +38,16 @@ const ROLE_VIEWS = {
 }
 
 const ROLE_CAPS = {
-  user: ['panel.read', 'vm.read', 'vm.reset_credits', 'keys.read'],
+  user: [
+    'panel.read',
+    'account.manage',
+    'vm.read',
+    'vm.schedule.self',
+    'vm.reset_credits',
+    'vm.quota_thresholds',
+    'keys.read',
+    'keys.manage',
+  ],
   super: ['panel.read', 'vm.read', 'vm.schedule'],
   admin: ['*'],
 }
@@ -79,6 +91,7 @@ export function panelIdentity(req) {
 const USER_EXACT_GET = new Set([
   '/api/panel/me',
   '/api/panel/onboarding',
+  '/api/panel/test-models',
   '/api/panel/vms',
   '/api/panel/pool/stream',
   '/api/panel/api-keys',
@@ -106,6 +119,7 @@ const LOG_STATS_GET = new Set([
   '/api/panel/usage-logs/overview',
   '/api/panel/statistics',
   '/api/panel/statistics/leaderboard',
+  '/api/panel/statistics/vm-batches',
 ])
 
 function isSuperVmRead(path) {
@@ -142,10 +156,17 @@ function isUserAllowed(method, path) {
     return /^\/api\/panel\/api-keys\/[^/]+(?:\/stats)?$/.test(p)
   }
   if (m === 'PUT' && p === '/api/panel/onboarding') return true
+  if (m === 'PATCH' && p === '/api/panel/me') return true
+  if (m === 'PATCH' && /^\/api\/panel\/vms\/[^/]+\/quota-thresholds$/.test(p)) return true
+  if ((m === 'PATCH' || m === 'DELETE') && /^\/api\/panel\/api-keys\/[^/]+$/.test(p)) return true
   if (m !== 'POST') return false
+  if (p === '/api/panel/api-keys') return true
+  if (/^\/api\/panel\/vms\/[^/]+\/(?:test-chat|count-tokens|schedulable)$/.test(p)) return true
   // Client keys are needed by the tenant's API client; VM/upstream secrets are never exposed.
-  if (/^\/api\/panel\/api-keys\/[^/]+\/reveal$/.test(p)) return true
-  return /^\/api\/panel\/vms\/[^/]+\/(?:openai-quota\/(?:refresh|reset)|claude-reset\/(?:query|redeem))$/.test(p)
+  if (/^\/api\/panel\/api-keys\/[^/]+\/(?:reveal|rotate|reset-quota)$/.test(p)) return true
+  return /^\/api\/panel\/vms\/[^/]+\/(?:usage\/query|openai-quota\/(?:refresh|reset)|claude-reset\/(?:query|redeem))$/.test(
+    p,
+  )
 }
 
 export function authorizePanelRoute(method, path, role) {
@@ -154,6 +175,17 @@ export function authorizePanelRoute(method, path, role) {
   const m = String(method || 'GET').toUpperCase()
   const p = String(path || '')
 
+  const shopRoute = cragShopRoute(m, p)
+  if (shopRoute) return { ok: false, role: r, code: 'forbidden', message: 'Forbidden' }
+
+  if (/^\/api\/panel\/vms\/[^/]+\/migration(?:\/|$)/.test(p)) {
+    return { ok: false, role: r, code: 'forbidden', message: '只有管理员可以迁移槽位' }
+  }
+
+  // Kernel cache, license inventory and installation are operator-only, like /wrap-cli.
+  if (p === '/api/panel/kernels' || p.startsWith('/api/panel/kernels/')) {
+    return { ok: false, role: r, code: 'forbidden', message: '只有管理员可以管理内核' }
+  }
   if (p === '/api/panel/test-schedule/default' && m === 'PUT') {
     return { ok: false, role: r, code: 'forbidden', message: '当前权限无法执行此操作' }
   }

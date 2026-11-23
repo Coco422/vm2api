@@ -1,8 +1,11 @@
-export type KeyGroupType = 'all' | 'anthropic' | 'openai' | 'pool'
+export type KeyGroupType = 'all' | 'anthropic' | 'openai' | 'gemini' | 'pool'
+
+export const KEY_ALLOWED_MODELS_MAX = 200
 
 export type KeyLimitsDraft = {
   name: string
   category: 'oauth' | 'api'
+  api_endpoint_id?: string
   max_concurrency: number
   quota_requests: number
   quota_usd: number
@@ -11,7 +14,8 @@ export type KeyLimitsDraft = {
   group_type: KeyGroupType
   allowed_vms: string[]
   vm_pool_id?: string
-  user_id?: string
+  /** 逗号、空格或换行分隔；留空不限。 */
+  allowed_models: string
 }
 
 function nonNegative(value: number, label: string): number {
@@ -20,8 +24,21 @@ function nonNegative(value: number, label: string): number {
   return value
 }
 
+/** 拆成模型名列表：去空白，按不分大小写去重，保留第一次的写法。 */
+export function parseModelList(text: string): string[] {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const name of text.split(/[\s,，]+/)) {
+    if (!name || seen.has(name.toLowerCase())) continue
+    seen.add(name.toLowerCase())
+    out.push(name)
+  }
+  return out
+}
+
 function groupTypeOf(value: string): KeyGroupType {
-  if (value === 'anthropic' || value === 'openai') return value
+  if (value === 'anthropic' || value === 'openai' || value === 'gemini')
+    return value
   return 'all'
 }
 
@@ -31,6 +48,14 @@ export function keyLimitsPayload(
   options: { isAdmin?: boolean } = {}
 ): Record<string, unknown> {
   const isAdmin = options.isAdmin ?? true
+  if (draft.group_type === 'gemini' && (!isAdmin || draft.category === 'api')) {
+    throw new Error('Gemini 平台只允许管理员创建宿主机 OAuth 密钥')
+  }
+  if (!isAdmin) {
+    const name = draft.name.trim()
+    if (!name || name.length > 100) throw new Error('密钥名称须为1至100个字符')
+    return { name }
+  }
   const requests = nonNegative(draft.quota_requests, '请求额度')
   if (!Number.isInteger(requests)) throw new Error('请求额度必须是整数')
   const body: Record<string, unknown> = {
@@ -39,9 +64,14 @@ export function keyLimitsPayload(
     quota_usd: nonNegative(draft.quota_usd, 'USD 额度'),
     rpm: nonNegative(draft.rpm, 'RPM'),
   }
-  if (isAdmin && draft.user_id?.trim()) body.user_id = draft.user_id.trim()
+  const isApi = draft.category === 'api'
   // API 直连不经过槽位，只有管理员可以设置
   if (isAdmin) body.category = draft.category
+  if (isAdmin && isApi && draft.api_endpoint_id !== undefined) {
+    const endpointId = draft.api_endpoint_id.trim()
+    if (mode === 'create' && !endpointId) throw new Error('请选择 API 渠道')
+    body.api_endpoint_id = endpointId || null
+  }
   if (isAdmin && draft.group_type === 'pool') {
     const vm_pool_id = String(draft.vm_pool_id || '').trim()
     if (!vm_pool_id) throw new Error('选择一个账号池')
@@ -51,16 +81,26 @@ export function keyLimitsPayload(
   } else {
     const group_type = groupTypeOf(draft.group_type)
     const allowed_vms =
-      group_type === 'all'
+      group_type === 'all' || group_type === 'gemini'
         ? []
         : [...new Set(draft.allowed_vms.map((id) => id.trim()).filter(Boolean))]
-    if (group_type !== 'all' && allowed_vms.length === 0) {
+    if (
+      !isApi &&
+      group_type !== 'all' &&
+      group_type !== 'gemini' &&
+      allowed_vms.length === 0
+    ) {
       throw new Error('至少选择一台 VM')
     }
     body.group_type = group_type
     body.allowed_vms = allowed_vms
     if (isAdmin && draft.vm_pool_id !== undefined) body.vm_pool_id = null
   }
+  const allowed_models = parseModelList(draft.allowed_models)
+  if (allowed_models.length > KEY_ALLOWED_MODELS_MAX) {
+    throw new Error(`允许的模型最多 ${KEY_ALLOWED_MODELS_MAX} 个`)
+  }
+  body.allowed_models = allowed_models
   if (mode === 'create') {
     body.name = draft.name.trim()
     const days = nonNegative(draft.expires_in_days, '有效期')
