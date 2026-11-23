@@ -3,13 +3,24 @@ import http from 'node:http'
 import { isIP } from 'node:net'
 import path from 'node:path'
 import { filterModelCatalogForKey, keyModelError } from '../admin/key-models.mjs'
+import {
+  buildGeminiRequest,
+  createGeminiProtocolStreamEncoder,
+  formatGeminiProtocolError,
+  formatGeminiProtocolStreamError,
+  parseInboundToGemini,
+  renderGeminiProtocolResponse,
+} from '../protocol/gemini-convert.mjs'
 import { createGeminiTerminalBridge } from './terminal.mjs'
+import { createGeminiMaintenanceHandler } from './maintenance.mjs'
+import { GEMINI_LICENSE_MESSAGES } from './subscription.mjs'
 
 const PANEL_PATH = '/api/panel/gemini'
 const PUBLIC_PATH = '/v1/gemini/sessions'
 const ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/
 const MODEL = /^[a-z0-9][a-z0-9._-]{0,99}$/
 const RUN_ID = /^[a-f0-9]{32}$/
+const MAX_CONCURRENCY = 64
 const MAX_PROMPT_BYTES = 4096
 const MAX_TEST_TEXT = 16 * 1024
 const AUTH_CODE = /^[A-Za-z0-9._~/-]{1,2048}$/
@@ -23,6 +34,11 @@ const RUN_STATES = new Set(['running', 'completed', 'failed'])
 const RUN_ERRORS = {
   gemini_oauth_required: [409, '请重新完成 Google OAuth 授权'],
   gemini_location_unsupported: [403, 'Google 判定当前账号所在地区不支持 Antigravity；拉取模型成功不代表可对话'],
+  gemini_account_verification_required: [
+    403,
+    'Google 要求先在浏览器完成该账号的身份验证后才能使用 Antigravity；拉取模型成功不代表可对话',
+  ],
+  gemini_account_ineligible: [403, 'Google 判定当前账号暂不符合 Antigravity 使用资格，请检查账号状态或更换账号'],
   gemini_proxy_error: [502, '无法通过绑定代理连接 Gemini，请检查代理'],
   gemini_model_unavailable: [409, '当前环境不支持所选模型，请重新获取模型列表'],
   gemini_models_empty: [502, 'Gemini 未返回可用模型'],
@@ -37,7 +53,20 @@ const RUN_ERRORS = {
   gemini_inference_failed: [502, 'Gemini 请求失败，请检查环境状态'],
   gemini_native_tty_unavailable: [503, '没有可用的 Linux 虚拟控制台运行 CRAGGemini'],
   gemini_native_worker_unavailable: [503, 'Gemini 原生 TUI worker 未就绪，请检查宿主机控制台和 CRAGGemini 载荷'],
+  license_required: [403, GEMINI_LICENSE_MESSAGES.license_required],
+  license_expired: [403, GEMINI_LICENSE_MESSAGES.license_expired],
+  license_not_yet_valid: [403, GEMINI_LICENSE_MESSAGES.license_not_yet_valid],
+  license_invalid: [403, GEMINI_LICENSE_MESSAGES.license_invalid],
+  license_binding_mismatch: [403, GEMINI_LICENSE_MESSAGES.license_binding_mismatch],
+  license_unconfigured: [403, GEMINI_LICENSE_MESSAGES.license_unconfigured],
 }
+const INFERENCE_STATES = new Set([...RUN_STATES, 'cancelled'])
+const INFERENCE_ERROR_CODES = new Set([
+  ...Object.keys(RUN_ERRORS),
+  'gemini_inference_bad_input',
+  'gemini_native_bridge_timeout',
+])
+const INFERENCE_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$/
 const FAILURE = 'gemini_host_unavailable'
 const PROTOCOL_ERROR = 'gemini_host_protocol_error'
 const SOCKET_ERRORS = new Map([
@@ -70,6 +99,8 @@ const OAUTH_ISSUES = new Set([
 const HOST_ERRORS = {
   ...RUN_ERRORS,
   gemini_operation_busy: [409, '此 Gemini 环境正在执行其他操作，请稍后重试'],
+  gemini_invalid_concurrency: [400, '并发数必须为 1 到 64 的整数'],
+  gemini_proxy_calibration_mismatch: [409, '绑定代理校验摘要不匹配，请重新校准代理'],
   gemini_run_not_found: [404, '测试会话不存在或已过期'],
   gemini_proxy_probe_failed: [502, '无法通过绑定代理连接 Gemini'],
   gemini_host_socket_missing: [503, '找不到 Gemini 控制 socket，请检查宿主服务和容器挂载'],
@@ -110,6 +141,22 @@ const HOST_ERRORS = {
   gemini_test_oauth_unsupported: [503, '当前签名载荷不支持 Google OAuth 推理测试'],
   gemini_test_auth_required: [409, '请先为 Gemini 环境完成授权'],
   gemini_test_invalid_input: [400, '请选择此环境的 Gemini 模型并输入有效的测试内容'],
+  gemini_maintenance_lock_invalid: [503, 'Gemini 维护锁不受信，请联系宿主管理员修复属主和权限'],
+  gemini_subscription_oauth_only: [409, GEMINI_LICENSE_MESSAGES.gemini_subscription_oauth_only],
+  gemini_subscription_not_active: [409, GEMINI_LICENSE_MESSAGES.gemini_subscription_not_active],
+  gemini_subscription_reclaim_unsupported: [409, GEMINI_LICENSE_MESSAGES.gemini_subscription_reclaim_unsupported],
+  gemini_subscription_authority_unavailable: [502, GEMINI_LICENSE_MESSAGES.gemini_subscription_authority_unavailable],
+  gemini_subscription_invalid_entitlement: [502, GEMINI_LICENSE_MESSAGES.gemini_subscription_invalid_entitlement],
+  gemini_subscription_invalid_voucher: [400, GEMINI_LICENSE_MESSAGES.gemini_subscription_invalid_voucher],
+  gemini_subscription_package_unready: [409, GEMINI_LICENSE_MESSAGES.gemini_subscription_package_unready],
+  gemini_subscription_busy: [409, GEMINI_LICENSE_MESSAGES.gemini_subscription_busy],
+  gemini_subscription_invalid_code: [400, GEMINI_LICENSE_MESSAGES.gemini_subscription_invalid_code],
+  slot_limit_reached: [409, GEMINI_LICENSE_MESSAGES.slot_limit_reached],
+  host_subscription_inactive: [403, GEMINI_LICENSE_MESSAGES.host_subscription_inactive],
+  host_binding_conflict: [409, GEMINI_LICENSE_MESSAGES.host_binding_conflict],
+  redeem_unavailable: [404, GEMINI_LICENSE_MESSAGES.redeem_unavailable],
+  host_redeem_conflict: [409, GEMINI_LICENSE_MESSAGES.host_redeem_conflict],
+  auth_forbidden: [403, GEMINI_LICENSE_MESSAGES.auth_forbidden],
 }
 
 export function isGeminiPanelPath(value) {
@@ -252,6 +299,10 @@ function validRunId(value) {
   return typeof value === 'string' && RUN_ID.test(value)
 }
 
+function parseConcurrency(value) {
+  return Number.isSafeInteger(value) && value >= 1 && value <= MAX_CONCURRENCY ? value : null
+}
+
 function validPrompt(value) {
   return (
     typeof value === 'string' &&
@@ -336,7 +387,52 @@ function accountView(account) {
   }
 }
 
-function environmentView(value, { id, proxyId } = {}) {
+function inferenceTimestamp(value) {
+  return typeof value === 'string' && INFERENCE_TIMESTAMP.test(value) && Number.isFinite(Date.parse(value))
+    ? value
+    : null
+}
+
+function lastInferenceView(value) {
+  if (!INFERENCE_STATES.has(value?.state)) return null
+  const { state } = value
+  const model = modelName(value.model)
+  const startedAt = inferenceTimestamp(value.started_at)
+  const finishedAt = state === 'running' ? null : inferenceTimestamp(value.finished_at)
+  if (!model || !startedAt || (state !== 'running' && !finishedAt)) return null
+  return {
+    state,
+    model,
+    started_at: startedAt,
+    finished_at: finishedAt,
+    error_code:
+      (state === 'failed' || state === 'cancelled') && INFERENCE_ERROR_CODES.has(value.error_code)
+        ? value.error_code
+        : null,
+  }
+}
+
+function cragLicenseView(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  return {
+    product: text(value.product, 32) || 'craggemini',
+    status: text(value.status, 32) || 'unlicensed',
+    valid: value.valid === true,
+    ...(typeof value.seat_required === 'boolean' ? { seat_required: value.seat_required } : {}),
+    ...(text(value.binding, 32) ? { binding: text(value.binding, 32) } : {}),
+    ...(text(value.kind, 32) ? { kind: text(value.kind, 32) } : {}),
+    ...(text(value.scope, 32) ? { scope: text(value.scope, 32) } : {}),
+    ...(Number.isSafeInteger(value.seat) && value.seat > 0 ? { seat: value.seat } : {}),
+    ...(text(value.license_id, 128) ? { license_id: text(value.license_id, 128) } : {}),
+    ...(Number.isSafeInteger(value.issued_at) ? { issued_at: value.issued_at } : {}),
+    ...(Number.isSafeInteger(value.not_before) ? { not_before: value.not_before } : {}),
+    ...(Number.isSafeInteger(value.expires_at) ? { expires_at: value.expires_at } : {}),
+    ...(text(value.code, 64) ? { code: text(value.code, 64) } : {}),
+    ...(text(value.message, 256) ? { message: text(value.message, 256) } : {}),
+  }
+}
+
+function environmentView(value, { id, proxyId, proxyPool, withProxyReady = false } = {}) {
   if (
     !validId(value?.id) ||
     !validId(value.proxy_id) ||
@@ -346,18 +442,50 @@ function environmentView(value, { id, proxyId } = {}) {
   ) {
     throw hostError(PROTOCOL_ERROR)
   }
+  let proxyUrl
+  if (proxyPool && (withProxyReady || value.last_inference != null)) {
+    try {
+      proxyUrl = proxyFor(proxyPool(), value.proxy_id)
+    } catch (error) {
+      if (error?.code !== 'gemini_proxy_unavailable') throw error
+    }
+  }
+  // Compare with the current configured endpoint and credentials, not only the ID.
+  // The digest is private to the host/control plane and is not projected out.
+  const matchesProxy =
+    proxyUrl &&
+    value.last_inference != null &&
+    crypto.createHash('sha256').update(proxyUrl).digest('hex') === value.last_inference_proxy_sha256
   return {
     id: value.id,
     proxy_id: value.proxy_id,
+    ...(withProxyReady && proxyPool && { proxy_ready: Boolean(proxyUrl) }),
     name: text(value.name, 80) || '',
     auth_state: value.auth_state,
     auth_method: value.auth_method === 'api_key' ? 'api_key' : 'oauth',
     ...(value.oauth_imported === true && value.auth_method === 'oauth' ? { oauth_imported: true } : {}),
     kernel_version: text(value.kernel_version),
     runtime_ready: value.runtime_ready === true,
+    ...(parseConcurrency(value.max_concurrency) != null
+      ? { max_concurrency: parseConcurrency(value.max_concurrency) }
+      : {}),
+    ...(Number.isSafeInteger(value.active_slots) && value.active_slots >= 0
+      ? { active_slots: value.active_slots }
+      : {}),
     models: items(value.models, 128, modelName),
     ...(value.models_discovered === true && { models_discovered: true }),
+    ...(Array.isArray(value.capabilities)
+      ? {
+          capabilities: items(value.capabilities, 32, (c) =>
+            typeof c === 'string' && /^[a-z0-9_]{1,40}$/.test(c) ? c : null,
+          ),
+        }
+      : {}),
     account: accountView(value.account),
+    ...(Object.hasOwn(value, 'last_inference') && {
+      last_inference: matchesProxy ? lastInferenceView(value.last_inference) : null,
+    }),
+    ...(value.crag_license ? { crag_license: cragLicenseView(value.crag_license) } : {}),
     created_at: text(value.created_at),
     updated_at: text(value.updated_at),
     billing_ready: false,
@@ -427,8 +555,42 @@ function boundProxy(proxyPool, environment, options) {
   return { proxy_id: environment.proxy_id, proxy_url: proxyFor(proxyPool(), environment.proxy_id, options) }
 }
 
+function hostStreamRequest(socketPath, operation, payload, { signal, timeoutMs = 300_000 } = {}) {
+  if (process.platform !== 'linux' || process.arch !== 'x64') throw hostError('gemini_host_unsupported_platform')
+  if (!path.isAbsolute(socketPath || '')) throw hostError('gemini_host_invalid_socket')
+  const body = JSON.stringify(payload)
+  const deadline = AbortSignal.timeout(timeoutMs)
+  const reqSignal = signal ? AbortSignal.any([signal, deadline]) : deadline
+  return new Promise((resolve, reject) => {
+    const request = http.request(
+      {
+        socketPath,
+        method: 'POST',
+        path: `/${operation}`,
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+        signal: reqSignal,
+      },
+      resolve,
+    )
+    request.once('error', (error) => {
+      if (signal?.aborted) return reject(error)
+      if (deadline.aborted) return reject(hostError('gemini_inference_timeout', 504))
+      reject(hostError(SOCKET_ERRORS.get(error.code) || FAILURE))
+    })
+    request.end(body)
+  })
+}
+
 export const callGeminiHost = (operation, payload) =>
   hostRequest(process.env.KIN_GEMINI_HOST_SOCKET ?? '/run/vm2api-gemini/control.sock', operation, payload)
+
+export const callGeminiHostStream = (operation, payload, options) =>
+  hostStreamRequest(
+    process.env.KIN_GEMINI_HOST_SOCKET ?? '/run/vm2api-gemini/control.sock',
+    operation,
+    payload,
+    options,
+  )
 
 export function createGeminiTerminal({ proxyPool, callHost = callGeminiHost }) {
   return createGeminiTerminalBridge({
@@ -466,33 +628,49 @@ export function createGeminiTerminal({ proxyPool, callHost = callGeminiHost }) {
   })
 }
 
-export function createGeminiPanelHandler({ json, readBody, proxyPool, terminal, callHost = callGeminiHost }) {
+export function createGeminiPanelHandler({
+  json,
+  readBody,
+  proxyPool,
+  terminal,
+  cragSubscription = null,
+  callHost = callGeminiHost,
+}) {
+  const maintenance = createGeminiMaintenanceHandler({ json, readBody })
   return async function handleGeminiPanel(req, res, pathname) {
     const ok = (data) => json(res, 200, { ok: true, data })
     const fail = (status, code, message = code) => json(res, status, { ok: false, error: { code, message } })
     res.setHeader('Cache-Control', 'no-store')
+    if (pathname === `${PANEL_PATH}/maintenance` || pathname.startsWith(`${PANEL_PATH}/maintenance/`)) {
+      return maintenance(req, res, pathname)
+    }
     try {
+      if (req.method === 'GET' && pathname === `${PANEL_PATH}/crag-subscription`) {
+        if (!cragSubscription) return fail(503, 'license_unconfigured', GEMINI_LICENSE_MESSAGES.license_unconfigured)
+        return ok(await cragSubscription.status())
+      }
+      if (req.method === 'POST' && pathname === `${PANEL_PATH}/crag-subscription/redeem`) {
+        if (!cragSubscription) return fail(503, 'license_unconfigured', GEMINI_LICENSE_MESSAGES.license_unconfigured)
+        const body = await readBody(req, 2048)
+        return ok(await cragSubscription.redeem(body?.redemption_code))
+      }
+      if (req.method === 'POST' && pathname === `${PANEL_PATH}/crag-subscription/upgrade`) {
+        if (!cragSubscription) return fail(503, 'license_unconfigured', GEMINI_LICENSE_MESSAGES.license_unconfigured)
+        return ok(await cragSubscription.upgrade())
+      }
       if (req.method === 'GET' && pathname === PANEL_PATH) {
         const view = await callHost('list', {})
         if (!Array.isArray(view?.environments)) throw hostError(PROTOCOL_ERROR)
+        const subscription = cragSubscription ? await cragSubscription.status().catch(() => null) : null
         return ok({
           available: true,
           payload_state: PAYLOAD_STATES.has(view.payload_state) ? view.payload_state : 'unknown',
+          ...(view.payload_mode === 'crag_subscription' ? { payload_mode: 'crag_subscription' } : {}),
           payload_issue: PAYLOAD_ISSUES.has(view.payload_issue) ? view.payload_issue : null,
           release_activated: typeof view.release_activated === 'boolean' ? view.release_activated : null,
           oauth_runtime_issue: OAUTH_ISSUES.has(view.oauth_runtime_issue) ? view.oauth_runtime_issue : null,
-          environments: view.environments.map((value) => {
-            const environment = environmentView(value)
-            if (!proxyPool) return environment
-            try {
-              proxyFor(proxyPool(), environment.proxy_id)
-              environment.proxy_ready = true
-            } catch (error) {
-              if (error?.code !== 'gemini_proxy_unavailable') throw error
-              environment.proxy_ready = false
-            }
-            return environment
-          }),
+          ...(subscription ? { crag_subscription: subscription } : {}),
+          environments: view.environments.map((value) => environmentView(value, { proxyPool, withProxyReady: true })),
         })
       }
       // All Gemini panel routes pass through the existing admin-only panel ACL.
@@ -520,6 +698,11 @@ export function createGeminiPanelHandler({ json, readBody, proxyPool, terminal, 
         if ((method === 'api_key' && !API_KEY.test(apiKey)) || (method === 'oauth' && body?.api_key != null)) {
           return fail(400, 'gemini_invalid_api_key', '请提供有效格式的 Gemini API Key')
         }
+        const hasConcurrency = body?.max_concurrency !== undefined
+        const maxConcurrency = hasConcurrency ? parseConcurrency(body.max_concurrency) : null
+        if (hasConcurrency && maxConcurrency == null) {
+          return fail(400, 'gemini_invalid_concurrency', HOST_ERRORS.gemini_invalid_concurrency[1])
+        }
         const imported = body?.oauth_account
         if (
           imported != null &&
@@ -538,20 +721,40 @@ export function createGeminiPanelHandler({ json, readBody, proxyPool, terminal, 
               name,
               proxy_id: body.proxy_id,
               proxy_url: proxyUrl,
+              ...(maxConcurrency != null ? { max_concurrency: maxConcurrency } : {}),
               ...(method === 'api_key' ? { auth_method: method, api_key: apiKey } : {}),
               ...(imported != null && {
                 oauth_account: { access_token: imported.access_token, expiry_timestamp: imported.expiry_timestamp },
               }),
             }),
+            { proxyPool },
           ),
         )
       }
       const match =
-        /^\/api\/panel\/gemini\/environments\/([A-Za-z0-9_-]{1,64})(?:\/(authorization|disable|refresh|terminal-ticket|proxy\/probe|proxy|models|test-chat)(?:\/([^/]+))?)?$/.exec(
+        /^\/api\/panel\/gemini\/environments\/([A-Za-z0-9_-]{1,64})(?:\/(authorization|concurrency|disable|refresh|terminal-ticket|proxy\/probe|proxy|models|test-chat|crag-license(?:\/(?:bind|activate|release))?)(?:\/([^/]+))?)?$/.exec(
           pathname,
         )
       if (!match || !validId(match[1])) return fail(404, 'not_found')
       const [, id, action, runId] = match
+      if (action?.startsWith('crag-license')) {
+        if (runId !== undefined) return fail(404, 'not_found')
+        if (!cragSubscription) return fail(503, 'license_unconfigured', GEMINI_LICENSE_MESSAGES.license_unconfigured)
+        if (req.method === 'GET' && action === 'crag-license') {
+          return ok(await cragSubscription.environmentStatus(id))
+        }
+        if (req.method === 'POST' && action === 'crag-license/bind') {
+          return ok(await cragSubscription.bindEnvironment(id))
+        }
+        if (req.method === 'POST' && action === 'crag-license/activate') {
+          const body = await readBody(req, 16384)
+          return ok(await cragSubscription.activateEnvironment(id, body?.code))
+        }
+        if (req.method === 'POST' && action === 'crag-license/release') {
+          return ok(await cragSubscription.releaseEnvironment(id))
+        }
+        return fail(404, 'not_found')
+      }
       if (runId !== undefined) {
         if (action !== 'test-chat' || !['GET', 'DELETE'].includes(req.method)) return fail(404, 'not_found')
         if (!validRunId(runId)) return fail(400, 'gemini_invalid_run_id')
@@ -560,6 +763,15 @@ export function createGeminiPanelHandler({ json, readBody, proxyPool, terminal, 
         const result = await callHost('test-chat-cancel', payload)
         if (result?.cancelled !== true) throw hostError(PROTOCOL_ERROR)
         return ok({ cancelled: true })
+      }
+      if (req.method === 'PUT' && action === 'concurrency') {
+        const body = await readBody(req, 1024)
+        const maxConcurrency = parseConcurrency(body?.max_concurrency)
+        if (maxConcurrency == null) {
+          return fail(400, 'gemini_invalid_concurrency', HOST_ERRORS.gemini_invalid_concurrency[1])
+        }
+        const result = await callHost('concurrency-set', { id, max_concurrency: maxConcurrency })
+        return ok(environmentView(result, { id, proxyPool }))
       }
       if (req.method === 'PUT' && action === 'proxy') {
         const body = await readBody(req, 4096)
@@ -572,7 +784,7 @@ export function createGeminiPanelHandler({ json, readBody, proxyPool, terminal, 
           proxy_id: proxyId,
           proxy_url: proxyFor(proxyPool(), proxyId),
         })
-        return ok(environmentView(result, { id, proxyId }))
+        return ok(environmentView(result, { id, proxyId, proxyPool }))
       }
       if (req.method === 'POST' && action === 'proxy/probe') {
         const environment = await readEnvironment(callHost, id)
@@ -584,7 +796,7 @@ export function createGeminiPanelHandler({ json, readBody, proxyPool, terminal, 
       if (req.method === 'POST' && action === 'models') {
         const environment = await readEnvironment(callHost, id)
         const result = await callHost('models', { id, ...boundProxy(proxyPool, environment) })
-        const view = environmentView(result, { id, proxyId: environment.proxy_id })
+        const view = environmentView(result, { id, proxyId: environment.proxy_id, proxyPool })
         if (!view.models.length) throw hostError('gemini_models_empty')
         return ok(view)
       }
@@ -605,8 +817,12 @@ export function createGeminiPanelHandler({ json, readBody, proxyPool, terminal, 
         return ok(await terminal.issueTicket(id))
       }
       if (req.method === 'DELETE' && !action) {
+        let seatRelease = null
+        if (cragSubscription) {
+          seatRelease = await cragSubscription.releaseEnvironment(id, { ignoreMissing: true })
+        }
         await callHost('delete', { id })
-        return ok({ deleted: true })
+        return ok({ deleted: true, ...(seatRelease ? { seat_released: seatRelease.released === true } : {}) })
       }
       if (req.method === 'POST' && action === 'disable') {
         await callHost('disable', { id })
@@ -616,14 +832,22 @@ export function createGeminiPanelHandler({ json, readBody, proxyPool, terminal, 
         const environment = environmentView(await callHost('get', { id }))
         const proxyUrl = proxyFor(proxyPool(), environment.proxy_id)
         return ok(
-          environmentView(await callHost('refresh', { id, proxy_id: environment.proxy_id, proxy_url: proxyUrl })),
+          environmentView(await callHost('refresh', { id, proxy_id: environment.proxy_id, proxy_url: proxyUrl }), {
+            proxyPool,
+          }),
         )
       }
       if (action !== 'authorization') return fail(404, 'not_found')
       if (req.method === 'POST') {
         const environment = environmentView(await callHost('get', { id }))
         const proxyUrl = proxyFor(proxyPool(), environment.proxy_id)
-        const auth = await callHost('authorize', { id, proxy_id: environment.proxy_id, proxy_url: proxyUrl })
+        const proxySha256 = crypto.createHash('sha256').update(proxyUrl).digest('hex')
+        const auth = await callHost('authorize', {
+          id,
+          proxy_id: environment.proxy_id,
+          proxy_url: proxyUrl,
+          proxy_sha256: proxySha256,
+        })
         const url = officialGeminiAuthUrl(auth?.url)
         if (!url || !ID.test(auth?.attempt_id ?? '')) throw hostError(FAILURE)
         return ok({ url, attempt_id: auth.attempt_id })
@@ -636,15 +860,18 @@ export function createGeminiPanelHandler({ json, readBody, proxyPool, terminal, 
         }
         const environment = environmentView(await callHost('get', { id }))
         const proxyUrl = proxyFor(proxyPool(), environment.proxy_id)
+        const proxySha256 = crypto.createHash('sha256').update(proxyUrl).digest('hex')
         return ok(
           environmentView(
             await callHost('complete', {
               id,
               proxy_id: environment.proxy_id,
               proxy_url: proxyUrl,
+              proxy_sha256: proxySha256,
               attempt_id: body.attempt_id,
               ...authorization,
             }),
+            { proxyPool },
           ),
         )
       }
@@ -892,38 +1119,8 @@ function writeStream(res, events) {
   res.end()
 }
 
-function protocolError(protocol, status, code, message) {
-  if (protocol === 'gemini') {
-    const statusName =
-      status === 400
-        ? 'INVALID_ARGUMENT'
-        : status === 401 || status === 403
-          ? 'PERMISSION_DENIED'
-          : status === 429
-            ? 'RESOURCE_EXHAUSTED'
-            : status >= 500
-              ? 'UNAVAILABLE'
-              : 'NOT_FOUND'
-    return {
-      code: status,
-      message,
-      status: statusName,
-      details: [{ '@type': 'type.googleapis.com/google.rpc.ErrorInfo', reason: code }],
-    }
-  }
-  return {
-    type: status === 429 ? 'rate_limit_error' : status >= 500 ? 'api_error' : 'invalid_request_error',
-    code,
-    message,
-  }
-}
-
 function protocolErrorBody(protocol, status, code, message) {
-  const error = protocolError(protocol, status, code, message)
-  if (protocol === 'gemini') return { error }
-  if (protocol === 'anthropic')
-    return { type: 'error', error: { type: error.type, message: error.message, code: error.code } }
-  return { error }
+  return formatGeminiProtocolError(protocol, status, code, message)
 }
 
 function publicModels(catalog, req) {
@@ -939,6 +1136,14 @@ function googleModelList(catalog, req) {
       supportedGenerationMethods: ['generateContent', 'streamGenerateContent'],
     })),
   }
+}
+
+function beginSse(res) {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+  })
 }
 
 export function createGeminiPublicHandler({ json, readBody, scheduler }) {
@@ -990,32 +1195,53 @@ export function createGeminiPublicHandler({ json, readBody, scheduler }) {
           : responses
             ? 'openai-responses'
             : 'gemini-session'
-    const stream = google ? google[2] === 'streamGenerateContent' : false
+    const routeStream = google ? google[2] === 'streamGenerateContent' : undefined
     const modelFromPath = google ? decodeURIComponent(google[1]) : null
+    const bodyLimit = protocol === 'gemini-session' ? 256 * 1024 : 4 * 1024 * 1024
     let body = req.body
     if (body == null) {
       try {
-        body = await readBody(req, 256 * 1024)
+        body = await readBody(req, bodyLimit)
       } catch (error) {
         const status = error?.status || 400
         return json(res, status, protocolErrorBody(protocol, status, 'invalid_json', 'Invalid JSON request body.'))
       }
     }
-    const requested = geminiTurnFromBody(body, protocol, modelFromPath)
-    if (!requested) {
-      const status = 400
-      return json(
-        res,
-        status,
-        protocolErrorBody(
-          protocol,
+
+    const supportsStream = typeof scheduler.stream === 'function'
+    let parsed = null
+    let requested = null
+    if (supportsStream) {
+      try {
+        parsed = parseInboundToGemini(protocol, body, {
+          routeModel: modelFromPath,
+          routeStream,
+          headers: req.headers,
+        })
+      } catch (error) {
+        const status = Number.isInteger(error?.status) ? error.status : 400
+        const code = typeof error?.code === 'string' ? error.code : 'gemini_invalid_request'
+        return json(res, status, protocolErrorBody(protocol, status, code, error?.message || 'Invalid Gemini request.'))
+      }
+    } else {
+      requested = geminiTurnFromBody(body, protocol, modelFromPath)
+      if (!requested) {
+        const status = 400
+        return json(
+          res,
           status,
-          'gemini_unsupported_turn',
-          'This CRAGGemini route accepts one plain-text user turn without tools or generation settings.',
-        ),
-      )
+          protocolErrorBody(
+            protocol,
+            status,
+            'gemini_unsupported_turn',
+            'This CRAGGemini route accepts one plain-text user turn without tools or generation settings.',
+          ),
+        )
+      }
     }
-    const denied = keyModelError(req, requested.model, { anthropic: messages })
+
+    const targetModel = supportsStream ? parsed.model : requested.model
+    const denied = keyModelError(req, targetModel, { anthropic: messages })
     if (denied) {
       return json(
         res,
@@ -1029,41 +1255,106 @@ export function createGeminiPublicHandler({ json, readBody, scheduler }) {
     res.once('close', () => {
       if (!res.writableEnded) controller.abort()
     })
+
+    if (!supportsStream) {
+      try {
+        const turn = await scheduler.complete({
+          model: requested.model,
+          text: requested.text,
+          signal: controller.signal,
+          apiKeyRecord: req.apiKeyRecord,
+        })
+        if (messages)
+          return requested.stream ? writeStream(res, anthropicStream(turn)) : json(res, 200, anthropicMessage(turn))
+        if (protocol === 'openai-chat') {
+          if (!requested.stream) return json(res, 200, chatCompletion(turn))
+          const id = `chatcmpl_${crypto.randomBytes(12).toString('hex')}`
+          return writeStream(res, [
+            `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', model: turn.model, choices: [{ index: 0, delta: { role: 'assistant', content: turn.text }, finish_reason: null }] })}\n\n`,
+            `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', model: turn.model, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: turn.usage?.input_tokens || 0, completion_tokens: turn.usage?.output_tokens || 0, total_tokens: turn.usage?.total_tokens || 0 } })}\n\n`,
+            'data: [DONE]\n\n',
+          ])
+        }
+        if (protocol === 'openai-responses') {
+          return requested.stream ? writeStream(res, responsesStream(turn)) : json(res, 200, responsesOutput(turn))
+        }
+        if (protocol === 'gemini') {
+          const response = googleOutput(turn)
+          return routeStream ? writeStream(res, [`data: ${JSON.stringify(response)}\n\n`]) : json(res, 200, response)
+        }
+        return json(res, 200, {
+          id: session[1],
+          model: turn.model,
+          account_id: turn.account_id,
+          output_text: turn.text,
+          usage: turn.usage,
+        })
+      } catch (error) {
+        if (controller.signal.aborted) return
+        const mapped = publicError(error)
+        return json(
+          res,
+          mapped.status,
+          protocolErrorBody(protocol, mapped.status, mapped.body.error.code, mapped.body.error.message),
+        )
+      }
+    }
+
+    const wantStream = protocol === 'gemini-session' ? false : parsed.stream === true
+    let headersSent = false
+    const encoder = wantStream ? createGeminiProtocolStreamEncoder(protocol, { model: parsed.model }) : null
+    const writeChunk = (text) => {
+      if (!text || controller.signal.aborted) return
+      if (!headersSent) {
+        beginSse(res)
+        headersSent = true
+      }
+      res.write(text)
+    }
+
     try {
-      const turn = await scheduler.complete({
-        model: requested.model,
-        text: requested.text,
+      const turn = await scheduler.stream({
+        model: parsed.model,
+        targetBodyFor: (target) => buildGeminiRequest(parsed, { target }),
+        requiredCapabilities: parsed.requiredCapabilities,
+        plainText: parsed.plainText,
         signal: controller.signal,
         apiKeyRecord: req.apiKeyRecord,
+        onEvent: wantStream
+          ? (event) => {
+              if (event?.kind === 'error') return
+              writeChunk(encoder.push(event))
+            }
+          : null,
       })
-      if (messages)
-        return requested.stream ? writeStream(res, anthropicStream(turn)) : json(res, 200, anthropicMessage(turn))
-      if (protocol === 'openai-chat') {
-        if (!requested.stream) return json(res, 200, chatCompletion(turn))
-        const id = `chatcmpl_${crypto.randomBytes(12).toString('hex')}`
-        return writeStream(res, [
-          `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', model: turn.model, choices: [{ index: 0, delta: { role: 'assistant', content: turn.text }, finish_reason: null }] })}\n\n`,
-          `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', model: turn.model, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: turn.usage?.input_tokens || 0, completion_tokens: turn.usage?.output_tokens || 0, total_tokens: turn.usage?.total_tokens || 0 } })}\n\n`,
-          'data: [DONE]\n\n',
-        ])
+      if (controller.signal.aborted) return
+      if (wantStream) {
+        writeChunk(encoder.finish())
+        if (!headersSent) beginSse(res)
+        res.end()
+        return
       }
-      if (protocol === 'openai-responses') {
-        return requested.stream ? writeStream(res, responsesStream(turn)) : json(res, 200, responsesOutput(turn))
-      }
-      if (protocol === 'gemini') {
-        const response = googleOutput(turn)
-        return stream ? writeStream(res, [`data: ${JSON.stringify(response)}\n\n`]) : json(res, 200, response)
-      }
-      return json(res, 200, {
-        id: session[1],
-        model: turn.model,
-        account_id: turn.account_id,
-        output_text: turn.text,
-        usage: turn.usage,
-      })
+      return json(
+        res,
+        200,
+        renderGeminiProtocolResponse(protocol, turn, {
+          model: parsed.model,
+          sessionId: session?.[1],
+          accountId: turn.account_id,
+        }),
+      )
     } catch (error) {
       if (controller.signal.aborted) return
       const mapped = publicError(error)
+      if (headersSent) {
+        try {
+          res.write(
+            formatGeminiProtocolStreamError(protocol, mapped.status, mapped.body.error.code, mapped.body.error.message),
+          )
+          res.end()
+        } catch {}
+        return
+      }
       return json(
         res,
         mapped.status,

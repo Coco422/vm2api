@@ -38,6 +38,7 @@ const state = vi.hoisted(() => ({
   hostForm: undefined as FormHTMLAttributes<HTMLFormElement> | undefined,
   hostInput: undefined as InputHTMLAttributes<HTMLInputElement> | undefined,
   confirmCancel: undefined as (() => void) | undefined,
+  recoverConfirm: undefined as ConfirmProps | undefined,
   queries: [] as Array<{
     queryKey: readonly unknown[]
     enabled?: boolean
@@ -168,6 +169,7 @@ vi.mock('@/components/confirm-dialog', () => ({
       state.recoveryConfirm = props
     if (props.open && props.confirmText === '取消订单')
       state.confirmCancel = props.handleConfirm
+    if (props.title === '用订单号找回订单') state.recoverConfirm = props
     return null
   },
 }))
@@ -225,6 +227,7 @@ function render(device = false) {
   state.upgradeConfirm = undefined
   state.recoveryConfirm = undefined
   state.confirmCancel = undefined
+  state.recoverConfirm = undefined
   return renderToStaticMarkup(
     device ? <CragDevicePurchasePage /> : <CragSubscriptionPage />
   )
@@ -394,6 +397,63 @@ describe('CRAG buyer presentation and activation wire', () => {
     ).toBe(true)
     finish({ ...order, activation: { state: 'active' } })
     await settle()
+  })
+
+  it('offers recovery by order id and explains why this browser may list nothing', async () => {
+    // An order bought in another browser leaves this listing empty, and the old copy read
+    // like "you never ordered anything" — so a paid order looked lost instead of findable.
+    state.values[3] = []
+    const empty = render(true)
+    expect(empty).toContain('这个浏览器没有订单记录')
+    expect(empty).toContain('已付款的订单不会丢')
+    expect(empty).toContain('找回订单')
+    // A panel buyer's orders are owned by the account, so recovery is not theirs to use.
+    expect(render(false)).not.toContain('找回订单')
+
+    render(true)
+    click('找回订单')
+    render(true)
+    expect(state.recoverConfirm?.open).toBe(true)
+    // A malformed id is refused before the request: the server could only answer 404,
+    // which reads as "no such order" and would send the buyer looking for a lost order.
+    expect(state.recoverConfirm?.disabled).toBe(true)
+
+    const id = '6945109e-80be-4d23-9793-68ba195765ce'
+    const field = state.recoverConfirm?.children as {
+      props?: { onChange?: (event: unknown) => void }
+    }
+    field?.props?.onChange?.({ target: { value: id } })
+    render(true)
+    expect(state.recoverConfirm?.disabled).toBe(false)
+
+    vi.mocked(cragDeviceApi).mockResolvedValue({ ...order, order_id: id })
+    state.recoverConfirm?.handleConfirm?.()
+    await settle()
+    expect(cragDeviceApi).toHaveBeenCalledWith(
+      `/orders/${id}/recover`,
+      expect.objectContaining({ method: 'POST' })
+    )
+  })
+
+  it('says which recovery failure is worth acting on when one order id is already held', async () => {
+    const id = '6945109e-80be-4d23-9793-68ba195765ce'
+    state.values[3] = []
+    render(true)
+    click('找回订单')
+    render(true)
+    const field = state.recoverConfirm?.children as {
+      props?: { onChange?: (event: unknown) => void }
+    }
+    field?.props?.onChange?.({ target: { value: id } })
+    render(true)
+    vi.mocked(cragDeviceApi).mockRejectedValue(
+      new ApiError('refused', 409, { code: 'shop_order_recover_conflict' })
+    )
+    state.recoverConfirm?.handleConfirm?.()
+    await settle()
+    // The UNIQUE(owner, request_id) collision is the one recovery refusal left, and
+    // retrying in this browser never clears it — the actionable part is saying so.
+    expect(render(true)).toContain('本浏览器已有一笔来自同一次结账的订单')
   })
 
   it('keeps a safe actionable package error beside its order, including the authority request id', async () => {
@@ -1223,6 +1283,78 @@ describe('CRAG buyer presentation and activation wire', () => {
     expect(
       state.buttons.some((button) => button.children === '重试自动激活')
     ).toBe(false)
+  })
+
+  it('renders sanitized diagnostics and order-preservation guidance for auth_forbidden needs_attention while keeping pinned restrictions', () => {
+    const reqId = '6945109e-80be-4d23-9793-68ba195765ce'
+    state.values[3] = [
+      {
+        ...order,
+        activation: {
+          state: 'needs_attention',
+          vm_id: 'vm-a',
+          error_code: 'auth_forbidden',
+          recovery: 'not_activated',
+          authority_request_id: reqId,
+        },
+      },
+    ]
+    const html = render()
+    const history = html.slice(html.indexOf('<section aria-label="历史订单"'))
+    expect(history).toContain('激活待处理')
+    expect(history).toContain('错误码：auth_forbidden (not_activated)')
+    expect(history).toContain(`请求 ID：${reqId}`)
+    expect(history).toContain('order_id')
+    expect(history).toContain('device_uuid')
+    expect(history).toContain('crag-shop-private/receipt.key')
+    expect(history).toContain('credential')
+    expect(history).not.toContain('请先完成兑换')
+    expect(history).not.toContain('领取兑换码')
+    expect(
+      state.buttons.some((button) => button.children === '重试自动激活')
+    ).toBe(true)
+
+    // Non-admin buyer sees safe contact-admin guidance without retry or manual claim buttons.
+    state.role = 'user'
+    const userHtml = render()
+    const userHistory = userHtml.slice(
+      userHtml.indexOf('<section aria-label="历史订单"')
+    )
+    expect(userHistory).toContain('错误码：auth_forbidden (not_activated)')
+    expect(userHistory).toContain(`请求 ID：${reqId}`)
+    expect(userHistory).not.toContain('重试自动激活')
+    expect(userHistory).not.toContain('领取兑换码')
+
+    // Untrusted values are stripped on the client as defense-in-depth.
+    state.role = 'admin'
+    const voucherLeak = `CRAGR1.${'x'.repeat(43)}`
+    state.values[3] = [
+      {
+        ...order,
+        activation: {
+          state: 'needs_attention',
+          vm_id: 'vm-a',
+          error_code: voucherLeak,
+          recovery: 'not_activated',
+          authority_request_id: voucherLeak,
+        },
+      },
+    ]
+    const stripped = render()
+    expect(stripped).not.toContain(voucherLeak)
+  })
+
+  it('surfaces credential_recovery fault warning in HostOverview on /crag-subscription', () => {
+    state.hostStatus = {
+      state: 'active',
+      ready: true,
+      slot_limit: 2,
+      credential_recovery: 'host_id_collision',
+    }
+    const html = render()
+    const overview = html.slice(html.indexOf('id="crag-host-overview"'))
+    expect(overview).toContain('role="alert"')
+    expect(overview).toContain('/etc/machine-id')
   })
 })
 

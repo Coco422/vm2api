@@ -99,12 +99,15 @@ export function liveState(
   return credit.state || (credit.redeemable ? 'ready' : 'unavailable')
 }
 
-export function shownCredits(snapshot: ResetSnapshot | null | undefined) {
+export function shownCredits(
+  snapshot: ResetSnapshot | null | undefined,
+  now: number
+) {
   return (snapshot?.credits || []).filter(
     (credit) =>
       credit.ref &&
-      credit.state !== 'unavailable' &&
-      Number(credit.resets_left) > 0
+      Number(credit.resets_left) > 0 &&
+      (!credit.expires_at || Date.parse(credit.expires_at) > now)
   )
 }
 
@@ -112,14 +115,16 @@ export function isLegacy(snapshot: ResetSnapshot | null | undefined) {
   return (snapshot?.credits || []).some((credit) => !credit.ref)
 }
 
-/** 总张数：上游不让用的卡不算；旧格式快照沿用原来的可兑换次数。 */
-export function claudeResetCount(snapshot: ResetSnapshot | null | undefined) {
+/** 从有效卡片计算持有数，兼容此前漏计暂不可兑卡片的快照。 */
+export function claudeResetCount(
+  snapshot: ResetSnapshot | null | undefined,
+  now = Date.now()
+) {
   if (!snapshot) return 0
   if (isLegacy(snapshot))
     return Math.max(0, Number(snapshot.available_count) || 0)
-  if (snapshot.held_count != null)
-    return Math.max(0, Number(snapshot.held_count) || 0)
-  return shownCredits(snapshot).reduce(
+  if (!snapshot.credits) return Math.max(0, Number(snapshot.held_count) || 0)
+  return shownCredits(snapshot, now).reduce(
     (sum, credit) => sum + Math.max(0, Number(credit.resets_left) || 0),
     0
   )

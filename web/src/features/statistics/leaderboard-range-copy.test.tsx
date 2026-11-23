@@ -14,7 +14,7 @@ function renderBoard() {
   for (const { id } of STATS_RANGES) {
     client.setQueryData(
       leaderboardQueryOptions(id, 'vm', 50, 'Asia/Shanghai').queryKey,
-      { entries: [] }
+      { scope: 'vm', range: id, tz: 'Asia/Shanghai', entries: [] }
     )
   }
   return renderToStaticMarkup(

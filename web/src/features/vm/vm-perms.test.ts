@@ -13,6 +13,7 @@ describe('vmPermsFor follows panel-acl roles', () => {
       admin: true,
       dashboard: true,
       power: true,
+      recovery: true,
       test: true,
       testModels: true,
       usageQuery: true,
@@ -31,6 +32,7 @@ describe('vmPermsFor follows panel-acl roles', () => {
     expect(p.admin).toBe(false)
     expect(p.dashboard).toBe(false)
     expect(p.power).toBe(false)
+    expect(p.recovery).toBe(true)
     expect(p.test).toBe(true)
     // The backend only serves GET /api/panel/test-models to admins.
     expect(p.testModels).toBe(true)

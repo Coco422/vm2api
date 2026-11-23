@@ -28,6 +28,7 @@ export type Diagnosis = {
   placement: 'local' | 'node'
   first_failure: CheckId | null
   checks: DiagnosisCheck[]
+  recovery_block?: { code: string; message: string; until?: number } | null
 }
 
 export type RecoverStep = {

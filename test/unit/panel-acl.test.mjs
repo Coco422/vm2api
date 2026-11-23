@@ -69,8 +69,8 @@ test('user can view owned vms and manage keys, not proxies or reauth', () => {
   assert.equal(authorizePanelRoute('GET', '/api/panel/database/metrics', 'user').ok, false)
   assert.equal(authorizePanelRoute('GET', '/api/panel/version', 'user').ok, false)
   assert.equal(authorizePanelRoute('POST', '/api/panel/update', 'user').ok, false)
-  assert.equal(authorizePanelRoute('GET', '/api/panel/vms/vm-01/diagnose', 'user').ok, false)
-  assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/recover', 'user').ok, false)
+  assert.equal(authorizePanelRoute('GET', '/api/panel/vms/vm-01/diagnose', 'user').ok, true)
+  assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/recover', 'user').ok, true)
   assert.equal(authorizePanelRoute('GET', '/api/panel/vms/vm-01/recover', 'user').ok, false)
   assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/recover', 'super').ok, false)
 })
@@ -277,8 +277,8 @@ test('tenant manual testing is allowed while background schedules and VM managem
     ['POST', 'start'],
     ['POST', 'stop'],
     ['PUT', 'test-schedule'],
-    ['GET', 'diagnose'],
-    ['POST', 'recover'],
+    ['POST', 'cooldown/clear'],
+    ['POST', 'circuit/reset'],
   ]) {
     assert.equal(authorizePanelRoute(method, '/api/panel/vms/vm-01/' + action, 'user').ok, false, action)
   }

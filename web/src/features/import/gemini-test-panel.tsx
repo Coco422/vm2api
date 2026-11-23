@@ -1,6 +1,7 @@
 import { useId, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { api } from '@/lib/api'
+import { isGeminiHostIssue } from '@/lib/gemini-recovery'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Label } from '@/components/ui/label'
@@ -12,6 +13,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
+import { GeminiMaintenanceLink } from '@/features/settings/gemini-maintenance-link'
 import type { GeminiEnvironment } from './gemini-environments'
 import {
   GEMINI_INVENTORY_KEY,
@@ -43,10 +45,13 @@ const resultLabels = {
 
 function ErrorMessage({ error }: { error: GeminiError }) {
   return (
-    <p role='alert' className='text-sm text-destructive'>
-      {error.message}
-      {error.code ? ` (${error.code})` : ''}
-    </p>
+    <div className='space-y-1'>
+      <p role='alert' className='text-sm text-destructive'>
+        {error.message}
+        {error.code ? ` (${error.code})` : ''}
+      </p>
+      {isGeminiHostIssue(error.code) ? <GeminiMaintenanceLink /> : null}
+    </div>
   )
 }
 
@@ -70,9 +75,18 @@ export function GeminiTestPanel({
   const unavailable =
     environment.auth_state !== 'authorized'
       ? authorizationHint
-      : !environment.proxy_id || environment.proxy_ready === false
-        ? '请在「代理」绑定可用的 IPv4 SOCKS5 代理。'
-        : null
+      : isOAuth && environment.oauth_imported
+        ? '已导入 OAuth 凭据，仍需在「账号」完成官方 Google 授权后再测试。'
+        : !environment.proxy_id || environment.proxy_ready === false
+          ? '请在「代理」绑定可用的 IPv4 SOCKS5 代理。'
+          : null
+  const licenseBlocked =
+    !unavailable &&
+    isOAuth &&
+    environment.crag_license &&
+    environment.crag_license.valid === false
+      ? '请先在「账号」绑定 CRAGGemini 订阅席位，再发起 OAuth 测试对话。'
+      : null
   const pull = useGeminiMutation({
     mutationFn: () =>
       api<GeminiEnvironment>(`${resource}/models`, { method: 'POST' }),
@@ -93,7 +107,11 @@ export function GeminiTestPanel({
     promptEncoder.encode(trimmedPrompt).length > MAX_PROMPT_BYTES
   const inputDisabled = busy || !!unavailable
   const startDisabled =
-    inputDisabled || !selected || !trimmedPrompt || promptTooLong
+    inputDisabled ||
+    Boolean(licenseBlocked) ||
+    !selected ||
+    !trimmedPrompt ||
+    promptTooLong
   const result = test.result
   const usage = result?.usage
 
@@ -118,9 +136,9 @@ export function GeminiTestPanel({
                 ? '使用此环境的 Google 授权。回复会在测试成功后显示。'
                 : '使用此环境的 Gemini API Key。回复会在测试成功后显示。'}
             </p>
-            {unavailable ? (
+            {unavailable || licenseBlocked ? (
               <p role='status' className='text-sm text-muted-foreground'>
-                {unavailable}
+                {unavailable || licenseBlocked}
               </p>
             ) : null}
             <div className='space-y-1.5'>

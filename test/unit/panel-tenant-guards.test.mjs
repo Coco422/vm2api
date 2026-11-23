@@ -49,13 +49,12 @@ test('VM batch counts are global, while each lifecycle follows existing VM owner
   const batchPath = '/api/panel/statistics/vm-batches'
   const initial = (await tenant.call('GET', batchPath + '?vm_id=vm-2-13')).body.data
   assert.deepEqual(initial.map(({ batch, started, active, stopped }) => [batch, started, active, stopped]), [
-    ['第一批', 11, 8, 3],
+    ['第一批', 14, 10, 4],
     ['第二批', 10, 9, 1],
-    ['第三批', 12, 11, 1],
+    ['第三批', 13, 12, 1],
     ['补机（11 月 20 日）', 1, 1, 0],
   ])
-  const vm06Days = (Date.parse('2026-11-18T04:15:17.684Z') - Date.parse('2026-11-01T09:10:37.555Z')) / 86_400_000
-  assert.equal(initial[0].medianSurvivalDays, vm06Days)
+  assert.equal(initial[0].medianSurvivalDays, null)
   for (const row of initial)
     assert.deepEqual(Object.keys(row).sort(), ['active', 'batch', 'medianSurvivalDays', 'started', 'stopped'])
   assert.equal((await tenant.call('POST', batchPath)).status, 403)
@@ -65,7 +64,7 @@ test('VM batch counts are global, while each lifecycle follows existing VM owner
   const vm = { id: 'vm-03', status: 'stopped', schedule_updated_at: '2026-11-01T08:16:14.894Z' }
   recordDeliveryShutdown({ ...vm, schedule_off_reason: 'tenant_paused' }, () => db)
   recordDeliveryShutdown({ ...vm, schedule_off_reason: 'stopped', created_at: '2026-11-01' }, () => db)
-  assert.equal((await tenant.call('GET', batchPath)).body.data[0].stopped, 3)
+  assert.equal((await tenant.call('GET', batchPath)).body.data[0].stopped, 4)
 
   recordDeliveryShutdown({ ...vm, schedule_off_reason: 'stopped' }, () => db)
   recordDeliveryShutdown({ ...vm, schedule_off_reason: 'stopped', schedule_updated_at: '2026-11-02' }, () => db)
@@ -73,9 +72,9 @@ test('VM batch counts are global, while each lifecycle follows existing VM owner
   assert.equal(detail.shutdownAt, vm.schedule_updated_at)
   assert.equal(detail.survivalDays, 1)
   const first = (await tenant.call('GET', batchPath)).body.data[0]
-  assert.equal(first.stopped, 4)
-  assert.equal(first.active, 7)
-  assert.equal(first.medianSurvivalDays, (1 + vm06Days) / 2)
+  assert.equal(first.stopped, 5)
+  assert.equal(first.active, 9)
+  assert.equal(first.medianSurvivalDays, null)
 
   const future = { id: 'vm-fourth', owner_user_id: 'u-1', status: 'running', created_at: '2026-11-20T00:00:00.000Z' }
   writeVm(root, future)
@@ -204,7 +203,7 @@ test('tenant management requests are rejected before any VM or credential mutati
     for (const [method, suffix] of [
       ['POST', 'start'],
       ['POST', 'stop'],
-      ['POST', 'recover'],
+      ['POST', 'cooldown/clear'],
       ['PATCH', ''],
       ['DELETE', ''],
       ['GET', 'package'],
@@ -862,4 +861,62 @@ process.stdout.write(JSON.stringify({ ok: status === 200, status, body }) + '\\n
   assert.deepEqual(scheduling, [[id, 0.35], 'signal', 'capacity'])
   assert.equal(fs.readFileSync(receipt, 'utf8'), savedReceipt)
   assert.equal(accountQuota.db.prepare('SELECT COUNT(*) AS count FROM usage_logs').get().count, 0)
+})
+
+test('tenant recovery uses the native lifecycle only for an owned, eligible VM', async (t) => {
+  const root = makeProject(t)
+  const slots = [
+    ['vm-eligible', {}],
+    ['vm-foreign', { owner_user_id: 'u-2' }],
+    ['vm-stopped', { status: 'stopped' }],
+    ['vm-maintenance', { schedule_hold: { reason: 'maintenance' } }],
+    ['vm-quota', {}],
+  ]
+  for (const [id, changes] of slots) writeVm(root, {
+    id,
+    owner_user_id: 'u-1',
+    status: 'running',
+    schedulable: true,
+    claude: { has_access: true, account_uuid: id },
+    proxy: { id: 'test-exit' },
+    ...changes,
+  })
+  const calls = []
+  const until = Date.now() + 3600_000
+  const handler = makeHandler(root, TENANT, {}, {
+    proxyPool: { getProxyForVm: () => ({ id: 'test-exit' }) },
+    accountQuota: {
+      snapshot: () => ({ accounts: [] }),
+      runtimeRepo: { get: (id) => id === 'vm-quota' ? { rate_limit_reset_at: until } : null },
+    },
+    kernelRecoveryOps: {
+      cluster: () => null,
+      settleMs: 0,
+      diagnose: async (vm) => ({
+        vm_id: vm.id,
+        ok: true,
+        checks: [{ id: 'kernel', status: 'ok', message: '就绪', detail: { raw: 'internal fixture' } }],
+      }),
+      stopSlot: async (vm) => { calls.push(['stop', vm.id]); return { ok: true } },
+      powerOn: async ({ id, keepProxy }) => { calls.push(['start', id, keepProxy]); return { ok: true } },
+    },
+  })
+  const call = (method, id, suffix, headers) => handler.call(method, `/api/panel/vms/${id}/${suffix}`, headers)
+  assert.equal((await call('GET', 'vm-foreign', 'diagnose')).status, 404)
+  assert.equal((await call('POST', 'vm-foreign', 'recover')).status, 404)
+  assert.equal((await call('POST', 'vm-stopped', 'recover')).body.error.code, 'operator_disabled')
+  assert.equal((await call('POST', 'vm-maintenance', 'recover')).body.error.code, 'maintenance')
+  assert.equal((await call('POST', 'vm-quota', 'recover')).body.error.code, 'quota_restricted')
+  assert.equal((await call('POST', 'vm-eligible', 'recover', { host: 'localhost', origin: 'https://other.invalid', 'content-type': 'application/json' })).status, 403)
+  assert.deepEqual(calls, [])
+  const diagnosis = (await call('GET', 'vm-eligible', 'diagnose')).body.data
+  assert.equal(diagnosis.recovery_block, null)
+  assert.equal(diagnosis.checks[0].detail, undefined)
+
+  const result = await call('POST', 'vm-eligible', 'recover')
+  assert.equal(result.status, 200)
+  assert.equal(result.body.data.ok, true)
+  assert.equal(result.body.data.diagnosis.recovery_block.code, 'recovery_cooldown')
+  assert.equal((await call('POST', 'vm-eligible', 'recover')).status, 429)
+  assert.deepEqual(calls, [['stop', 'vm-eligible'], ['start', 'vm-eligible', true]])
 })

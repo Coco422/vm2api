@@ -1,24 +1,28 @@
-import { useState } from 'react'
-import { useMutation, useQueryClient } from '@tanstack/react-query'
 import type { Vm } from '@/types/panel-vm'
-import { toast } from 'sonner'
-import { api } from '@/lib/api'
 import { fmtUsd } from '@/lib/format'
+import { cn } from '@/lib/utils'
 import { formatWindowSpend } from '@/lib/vm-usage'
 import { Button } from '@/components/ui/button'
 import { ConfirmDialog } from '@/components/confirm-dialog'
-import { dashboardQueryOptions } from '@/features/overview/queries'
 import { Meter, ResetAt } from '@/features/vm/detail-section-primitives'
-import { vmQueryOptions } from '@/features/vm/queries'
+import {
+  describeCodexCredits,
+  type CodexCreditsStatusKey,
+} from '@/features/vm/openai-credits'
+import { useOpenaiQuotaActions } from '@/features/vm/openai-quota-actions'
 import { useVmPerms } from '@/features/vm/vm-perms'
 
-type QuotaPayload = {
-  reset_credits?: {
-    available_count?: number
-    credits?: Array<{ expires_at?: string }>
-    fetched_at?: string
-  } | null
-  warning?: string
+function creditStatusTone(statusKey: CodexCreditsStatusKey): string {
+  switch (statusKey) {
+    case 'spendable':
+      return 'text-[color:var(--status-ok)]'
+    case 'stale':
+      return 'text-[color:var(--status-warn)]'
+    case 'rate_limited':
+      return 'text-[color:var(--status-bad)]'
+    default:
+      return 'text-muted-foreground'
+  }
 }
 
 export function OpenaiQuotaPanel({
@@ -36,57 +40,18 @@ export function OpenaiQuotaPanel({
   cost5?: number
   cost7?: number
 }) {
-  const qc = useQueryClient()
-  const [confirm, setConfirm] = useState(false)
-  const canUse = useVmPerms().credential
-  const credits = vm.reset_credits
-  const available = Math.max(0, Number(credits?.available_count) || 0)
-  const expiry = credits?.credits?.[0]?.expires_at
-
-  const refreshAll = async () => {
-    await Promise.all([
-      qc.invalidateQueries({ queryKey: vmQueryOptions(vm.id).queryKey }),
-      qc.invalidateQueries({ queryKey: dashboardQueryOptions().queryKey }),
-    ])
-  }
-
-  const queryQuota = useMutation({
-    mutationFn: () =>
-      api<QuotaPayload>(
-        `/api/panel/vms/${encodeURIComponent(vm.id)}/openai-quota/refresh`,
-        { method: 'POST' }
-      ),
-    onSuccess: async (data) => {
-      await refreshAll()
-      const count = Number(data?.reset_credits?.available_count)
-      toast.success(
-        Number.isFinite(count)
-          ? `已查询，可用重置券 ${count} 张`
-          : '已刷新 GPT 额度'
-      )
-    },
-    onError: (error: Error) => toast.error(error.message),
-  })
-
-  const resetQuota = useMutation({
-    mutationFn: () =>
-      api<QuotaPayload>(
-        `/api/panel/vms/${encodeURIComponent(vm.id)}/openai-quota/reset`,
-        { method: 'POST', signal: AbortSignal.timeout(90_000) }
-      ),
-    onSuccess: async (data) => {
-      setConfirm(false)
-      await refreshAll()
-      if (data?.warning === 'reset_credit_cache_refresh_failed') {
-        toast.warning('重置券已消费，但回读额度失败，请再点查询')
-        return
-      }
-      toast.success('已使用一张重置券')
-    },
-    onError: (error: Error) => toast.error(error.message),
-  })
-
-  const busy = queryQuota.isPending || resetQuota.isPending
+  const {
+    available,
+    busy,
+    confirm,
+    expiry,
+    queryQuota,
+    resetCredits,
+    resetQuota,
+    setConfirm,
+  } = useOpenaiQuotaActions(vm)
+  const canUse = useVmPerms().resetCredits
+  const creditView = describeCodexCredits(vm, now)
 
   return (
     <div className='grid gap-3'>
@@ -107,6 +72,50 @@ export function OpenaiQuotaPanel({
       <div className='text-[11px] text-muted-foreground'>
         7d 重置 <ResetAt value={vm.reset_7d} now={now} />
       </div>
+
+      <div className='grid gap-1.5 rounded-md border bg-muted/20 px-3 py-2 text-xs'>
+        <div className='flex flex-wrap items-baseline justify-between gap-2'>
+          <span className='text-muted-foreground'>Codex 积分余额</span>
+          <span className='font-mono font-semibold tabular-nums'>
+            {creditView.balanceText}
+          </span>
+        </div>
+        <div className='flex flex-wrap items-baseline justify-between gap-2 text-[11px]'>
+          <span className='text-muted-foreground'>积分状态</span>
+          <span
+            className={cn(
+              'font-medium',
+              creditStatusTone(creditView.statusKey)
+            )}
+            title={
+              creditView.fetchedAtMs != null
+                ? `查询时间 ${new Date(creditView.fetchedAtMs).toLocaleString()}`
+                : undefined
+            }
+          >
+            {creditView.statusText}
+            {creditView.statusKey === 'stale' ? '（上次查询余额，待刷新）' : ''}
+            {creditView.fetchedAtMs != null ? (
+              <span className='ml-1.5 font-normal text-muted-foreground tabular-nums'>
+                · {new Date(creditView.fetchedAtMs).toLocaleString()}
+                {creditView.agoText ? `（${creditView.agoText}）` : ''}
+              </span>
+            ) : null}
+          </span>
+        </div>
+        <div className='flex flex-wrap items-baseline justify-between gap-2 border-t pt-1.5 text-[11px]'>
+          <span className='text-muted-foreground'>重置券</span>
+          <span className='font-mono tabular-nums'>
+            {resetCredits ? `${available} 张` : '未查询'}
+          </span>
+        </div>
+        {expiry ? (
+          <p className='m-0 text-[11px] text-muted-foreground'>
+            最近一张到期 <ResetAt value={expiry} now={now} />
+          </p>
+        ) : null}
+      </div>
+
       {canUse ? (
         <div className='flex flex-wrap items-center gap-2'>
           <Button
@@ -115,9 +124,7 @@ export function OpenaiQuotaPanel({
             disabled={busy}
             onClick={() => queryQuota.mutate()}
           >
-            {queryQuota.isPending
-              ? '查询中…'
-              : `查询重置券${credits ? ` ${available}` : ''}`}
+            {queryQuota.isPending ? '刷新中…' : '刷新额度和积分'}
           </Button>
           <Button
             size='sm'
@@ -128,11 +135,6 @@ export function OpenaiQuotaPanel({
             {resetQuota.isPending ? '使用中…' : '使用重置券'}
           </Button>
         </div>
-      ) : null}
-      {expiry ? (
-        <p className='m-0 text-[11px] text-muted-foreground'>
-          最近一张到期 <ResetAt value={expiry} now={now} />
-        </p>
       ) : null}
       <ConfirmDialog
         open={confirm}

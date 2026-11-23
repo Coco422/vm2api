@@ -2,6 +2,125 @@
 
 ## Unreleased
 
+## 1.4.184 — 2026-11-23 · CRAGGemini 兑换码与画布兑换预览，锁定加密 0.4.0 载荷；VM 并发/子代理限流与凭证脱敏
+
+- CRAGGemini 补齐兑换码套餐、叠加明细与画布兑换预览：`src/lib/admin/crag-shop-supplier.mjs` 透传可选 `product` / `stackable` 套餐元数据；`src/lib/gemini/subscription.mjs` 支持带路径前缀的授权源 URL（如 `/gemini`）并透出叠加后的 `quota_grants` 明细；前端商城、画布预览页（`/crag-preview`）与兑换弹窗新增 `CRAGGemini 1个月兑换码 · 10 槽（¥100，¥10/槽，可叠加）` 套餐卡片与只读兑换码输入预览区（#1651）。
+- `deploy/payload.json` 的 `geminiDefaultLinuxAmd64` 升级锁定至 [`payload-2026.11.23-gemini-0.4.0`](https://github.com/dofastted/vm2api/releases/tag/payload-2026.11.23-gemini-0.4.0)（`craggemini 0.4.0`，含多进程池、SHM Ring v2、`memfd` 通道、内置 MCP 桥接与原生工具能力），沿用既有 `crag-auth-gemini` 公钥信任锚（`f6e3ef3a50fd…`），不破坏存量主机绑定。
+- 调度池支持按 VM 限制主会话数（`n`）与单会话子代理数（`m`），并在面板池策略与槽位席位流中同步展示（#1627）。
+- VM Anthropic 凭证持久化与同步移除 `email` 字段，降低槽内元数据暴露（#1649）。
+- 部署说明：本版仅涉及控制面、前端与 `geminiDefaultLinuxAmd64`（`0.4.0`）载荷，Claude/Codex 槽位内核与 `wrap-cli` 字节未变，`remote-apply.sh` 报 `SLOT_SYNC=skip`，无需执行 `wrap-cli/sync` 或重启既有槽位。
+
+## 1.4.183 — 2026-11-23 · CRAGGemini 系列：运行时信任根、宿主崩溃与多并发池绑定；自适应 thinking 预算不再越过 max_tokens
+
+- CRAGGemini 的授权信任根不再自证。此前 `readCragGeminiPackageAuthority` 在没有独立锚点时会回落去读载荷目录自带的 `crag-license-public.pem`——等于让载荷为自己的密钥作证。现在无独立 PEM 或 64 位十六进制 SHA-256 pin 时直接 fail closed（`gemini_payload_invalid_signature`）；文件读取改用 `O_RDONLY | O_NOFOLLOW | O_NONBLOCK` 并校验是常规文件与大小上界（`O_NONBLOCK` 让 FIFO 也能非阻塞打开，随后 `isFile()` 为假而被拒）；新增 `KIN_GEMINI_PUBLIC_KEY_FILE` 供运维轮换授权密钥而无需重新构建 vm2api，未配置时回落到 `deploy/payload.json` 里 git 跟踪的 SHA-256 pin（#1628）。
+- **这条的部署前提不在代码里，值得单独记。** `deploy/payload.json` 原先不在 overlay 的打包清单内，而 `remote-apply.sh` 是逐条显式拷贝，所以线上那份冻结在初装时刻（实测 11-18），而 gemini 的 pin 是 1.4.180（11-23）才加进去的——那个键在线上根本不存在。于是 fail closed 会让每一次订阅读取都退化成 409 `gemini_subscription_package_unready`。pin 的值本来是对的（`deploy/payload.json` 与线上实装 PEM 的 sha256 逐字相同，均为 `f6e3ef3a50fd…`），坏的只是投递，所以修法落在部署侧：overlay 带上 `deploy/payload.json`，apply 时安装并备份，rollback 时恢复。**这个修法在 gitignore 的本地 skill 脚本里、不随仓库留痕**，换机器或重建 skill 目录会丢，表现为 CRAGGemini 订阅静默 409；要让它不可丢需把「overlay 必须发布 `deploy/payload.json`」写进 `docs/DEPLOY.md`，本版未做（#1628）。
+- CRAGGemini 宿主的 `/infer` 不再因未捕获异常崩掉 socket handler。`native_module()` / `invocation_module()` 每次调用都 `spec.loader.exec_module()`，于是每次都产生**新的模块对象**，`except native_module().NativeFailure` 与 `NativeSession.open_stream()` 内部抛出的实例所属的类不是同一个类对象，捕获永远不匹配——异常穿出去导致响应被丢（503 `gemini_host_unavailable`）且跳过 `EligibilityDiagnostic` 轮询。改为按文件身份 `(dev, ino, size, ctime_ns, mtime_ns)` 缓存受信模块，且 `check_root_owned()` 仍在缓存检查**之前**执行（缓存命中时照样重验 root 属主，没有把信任校验一起缓存掉），并在 `_stream_native_infer()` 里先捕获模块引用再 `except`（#1637）。
+- Google 账号的验证与不合格诊断打通到面板。原先 `EligibilityDiagnostic` 只匹配地域性不合格，丢掉 `server_oauth.go` 的 `Account ineligible: … Verify your account to continue.`，运维只看到笼统的 `gemini_inference_failed`；现在新增 `gemini_account_verification_required` 与 `gemini_account_ineligible` 的有界分类，贯穿宿主脚本、`gemini/routes.mjs`、`gemini/scheduler.mjs`（HTTP 403、不计入熔断）与前端状态投影（#1637）。
+- 支持 Google 原生 Gemini API key 凭据：`x-goog-api-key` 头与 `/v1beta/models*?key=` 查询串。`?key=` 的提取严格限定在 `/v1beta/models` 路径（取 `?` 前的 pathname 后要求精确等于或以 `/v1beta/models/` 开头），两条路都拒绝 `kin-panel-` 令牌，并在 `security.mjs` / `request-log.mjs` 补了头与查询串脱敏（#1637）。
+- 请求日志的 `path` 兜底剥掉查询串。`start()` 里取值是 `pathName || req.url || ''`，而 `_appendJsonl` 会把 summary 直接 `JSON.stringify` 写进 `data/request-logs/*.jsonl`，`redactSecrets` 在本仓库只作用于 body 与 error message、没有一处作用于 URL 字段。这条兜底当前不可达（三个调用点都传 `pathName`，它来自 `server.mjs` 的 `const p = url.pathname`，不含查询串），**但上一条让它变得有害**：将来任何新调用点漏传 `pathName`，带真 key 的原始 URL 就会原样落盘。剥整个查询串而不是脱敏 `key=` 单个参数名，对将来其他查询串凭据同样成立且热路径零正则开销（#1642）。
+- CRAGGemini 接入多并发池绑定、代理校准与可复制授权链接（#1645）。
+- `--crag-host-dir` 的默认路径对齐 `KIN_DATA_DIR`：服务模板与维护脚本原先硬编码 `@INSTALL_DIR@/src/data/crag-gemini-subscription/public`，而 Docker 与原生部署按 `KIN_DATA_DIR` 把宿主权益存在 `@INSTALL_DIR@/data/...`（#1637）。
+- 自适应 thinking 回退时生成的预算不再越过 `max_tokens`。`on_adaptive: 'convert_to_enabled'` 的模型（如 `claude-haiku-4-5`）在调用方未给 `budget_tokens` 时，上游拒掉 adaptive 后的修复会注入静态 `thinking_fallback_budget`（4096）而无视 `max_tokens`，于是 `max_tokens <= 4096` 的重试必然 400 `thinking.budget_tokens must be less than max_tokens`。现在平台生成的预算被钳到 `min(fallback, max(1024, floor(max_tokens/2)))`，在 `max_tokens > 1024` 的全区间恒满足 `1024 <= budget < max_tokens`；`max_tokens <= 1024` 时没有任何合法预算存在，改为直接返回结构化 400 `thinking_incompatible` 而不是伪造一个非法值，并且不再发出注定失败的第二跳、不冷却账号。显式的调用方 `budget_tokens` 与首跳 `cli-hop` 透传不受影响（#1631）。
+- 注意 `1025..2047` 这一段：`floor(max_tokens/2)` 落在 1024 以下被钳到 1024，所以输出余量最少只有 1 个 token。合法性没问题，但 PR 描述里「with output headroom」这半句在这一段不成立——1024 是 API 的 thinking 下限，这一段里任何合法预算都只能是 1024，能服务优于直接拒（#1631）。
+- CRAG 的拉取与安装按**槽位运行时架构**判定，不再用宿主的 `process.arch`，混合架构机器上不会再拉错架构的内核（#1634）。
+- 超大入站图片在抵达上游之前被拦下（#1643）。
+- 审计对齐一批：桌面保活、混合架构 CRAG 更新、Codex 刷新冷却与遥测文档（#1641）。
+- 部署说明：本版仅涉及控制面、前端与宿主脚本，`deploy/payload.json` 的内容、`bin/`、`share/wrap-cli` 与 `worker/` 自 `v1.4.182` 起字节未变，`remote-apply.sh` 会报 `SLOT_SYNC=skip`，无需执行 `wrap-cli/sync`，也无需重启槽位。本版新增一项：overlay 现在会把 `deploy/payload.json` 安装到 `/opt/vm2api/deploy/payload.json`（并备份到 `$BAK/deploy/`），这是上面 CRAGGemini 信任根生效的前提。
+
+## 1.4.182 — 2026-11-23 · claude→responses 不再丢工具循环，槽位桌面 Mac 键盘与剪贴板直通，账号/桌面页签状态保活
+
+- claude→responses 转换不再丢掉多轮工具循环。旧实现只读 `message.content` 的字符串形态，`tool_calls` 一次都没被引用，`role=tool` 的消息又落进 `role = 'user'` 分支把 `tool_call_id` 一并丢掉，于是上游模型永远看不到工具输出、反复重发同一个调用，形成烧上游配额的死循环。改为复用 `chatMessageToItems`：assistant 的 `tool_calls` 变成 `function_call` 项，`role=tool` 变成 `function_call_output` 项。`call_id` 链路两端已逐一核对——`tool_use.id → toolCalls[].id → function_call.call_id` 与 `tool_result.tool_use_id → tool_call_id → function_call_output.call_id` 对得上，不会落到 `call_unknown` 兜底，循环因此能真正闭合（#1626）。
+- 复用带来两处行为差异，都是改善而非回归：空内容消息现在被丢弃（旧实现会产出一条 `text: ''` 的空 item），只有 `tool_calls` 的 assistant 轮次不再附带空的 `output_text` 消息。system 的特殊映射（`role: 'developer'` + `input_text`）在新路径上保持不变。另外 `chatMessageToItems` 从内部函数变成导出，消费方从 1 个变成 2 个（`chatToCodexResponses` 与 `claudeToOpenAIResponsesRequest`），文档注释已标注这一点，避免后续为 Codex 调整 `call_id` 兜底或空内容丢弃时意外改动 anthropic→responses 这条路（#1626、#1630）。
+- 槽位桌面补齐 Mac 键盘与剪贴板直通。Cmd 键映射、复制粘贴双向同步，粘贴改用内容比较而非时间窗去重，连按两次不再出现注入错位。中文等非 Latin-1 字符原先会被截成 `?`，现在经 `hasNonLatin1` 判定后走 keysym 逐字注入；超长文本降级到剪贴板通道并给出提示（#1621）。
+- **粘贴仍有一个窄交错边界，是已知且作者明确接受的。** 触发需要 paste 事件迟于 80ms 的兜底定时器、**且**用户在这个窗口内又按了一次 Cmd+V：迟到的 paste 无法分辨自己属于哪一次 keydown，会消费下一次的定时器，同时 keydown 上的 `pasteFallbackAtRef = 0` 擦掉了「刚刚兜底注入过」的记忆，结果多注入一次。比修复前「任意两次快速粘贴必错位」窄了一个量级，且自愈于下一次正常 paste。彻底消除需要给 keydown 配序号让 paste 精确配对消费，权衡后认为不值得这份机械复杂度——将来真有人报「偶尔多贴一次」，线索在这里（#1621）。
+- 账号与桌面页签的状态跨切换保活。radix Tabs 切换即卸载 `TabsContent`，原先会造成两个断点：账号页签生成的 OAuth 授权链接在切到桌面页签完成浏览器登录后丢失（而链接重生成即失效，授权被迫一次完成），以及 noVNC 连接随页签切换断开重连。两个 `TabsContent` 加 `forceMount` + `data-[state=inactive]:hidden` 后状态保活，授权可在两个页签间来回完成。配套把「Claude Code 授权」从全局 Dialog 改为账号页签内嵌面板——Dialog 是模态的，开着时根本点不到页签切换器，所以单靠保活达不到目的（#1623）。
+- 保活带来一处副作用已同版收口：`forceMount` 让 `VmDesktopCard` 在任意详情页打开时就挂载（默认页签是 `overview`，`desktop` 仅对 admin 可见），而它的状态 query 没有闸门，`refetchInterval: open ? false : 15_000` 于是变成常开——从未打开过桌面的页面也会一直打 `/api/panel/vms/<id>/desktop`。改为由详情页传入页签是否选中，未选中时不轮询；首次取值保留，切到桌面页签时状态是现成的。noVNC 连接本身由 `open` 门控，仍需点开才建立，保活语义不变（#1630）。
+- 槽位自定义名称在列表行、机架卡片、弹窗与详情页头部一致优先展示，悬停提示保留 VM id 作为出处，不会因为改了名就查不到真实标识（#1624）。
+- 部署说明：本版仅涉及控制面与前端，`deploy/payload.json`、`bin/`、`share/wrap-cli` 与 `worker/` 自 `v1.4.181` 起字节未变，`remote-apply.sh` 会报 `SLOT_SYNC=skip`，升级后无需执行 `wrap-cli/sync`，也无需重启槽位。
+
+## 1.4.181 — 2026-11-23 · CRAG 3.1.14 修复 MCP 续接误报 410，终态后不再发迟到取消，降级订阅仍报设备标识
+
+- CRAG 内核升到 `3.1.14`（`payload-2026.11.23-crag-3.1.14`），解掉 MCP 续接误报 `410 MCP continuation is no longer available`。该版把 `tool-grants.idx` 的回调有效期与完整历史快照准入解耦，修复已认领批次过期后切支（Fork / AgentSummary / 追加文本）、256 条磁盘回执淘汰重发与工具参数规范化三类误报，并把工具发布与响应投递收敛为单锁原子临界区。面板内核目录新增 `3.1.14 MCP 续接恢复修复` 选项，旧版选择保留；授权身份（`9dbb4bc2…` / `835451e2…`）与官方 Claude Code `2.1.321` 沿用（#1613）。
+- 单跳取消栅栏：收到 `message_stop` / `responsesTerminal` / `readAll` 终态交付后立即解除取消联动，避免下游客户端一拿到 `message_stop` 就断开连接时，迟到的 `/internal/v1/cancel` 撤销刚签发的工具批次——那正是上一条 410 的触发路径之一。`cancelOnAbort` 的全部作用就是 POST 一次 `/internal/v1/cancel`，不碰 socket，所以这条链在控制面侧是自洽的；新增测试数的是 cancel 请求的到达次数而非实现细节（#1613）。
+- **这条栅栏同时解除了两样可分离的东西，值得记下来。** 描述里的缺陷只需要摘掉远端 cancel 回调，而 `hopSignal.disarm()` 还让内层 `AbortSignal` 永不 abort——而它正是传给 `workerRequest` 与 `inferenceCodec.decode` 的那个。于是终态之后的收尾（流式路径剩余 SSE 排空与 trailers、非流式路径的 `inferenceCodec.decode` 与 `restoreJsonValue`）在客户端断开时不再可取消，只能等 idle/timeout 自然结束。这一步大概是有意的：`cancelOnAbort` 上方的注释写着内核也会因 socket 掉线而感知，若如此则只摘远端回调不足以挡住撤销。但该判断依赖 CRAG 内核侧行为、不在本仓库，未经核实。另外两个 catch 的判据从 `signal?.aborted` 改为 `hopSignal.signal?.aborted`，所以终态之后再抛错不再归类成 `client_cancelled` 而走通用错误分支——按 `final_state` 统计取消率的地方会出现一个台阶（#1613）。
+- CRAG 订阅降级到本地验签状态时仍然报告本机设备标识，不再因为授权侧不可达而让设备标识一起消失（#1604）。
+- CRAG 商城记录供应商调用的失败，让结账故障可归因到具体一次上游调用而不是只看到一个笼统的失败（#1603）。
+- 部署说明：本版换的是槽位 CRAG 内核载荷（crag-v2 由 `3.1.12` 升到 `3.1.14`，落在 `share/crag/kernels/v2/amd64/`），而 `bin/kin-kernel` 与 `share/wrap-cli` 的 pin 都没变。`remote-apply.sh` 的 `SLOT_SYNC` 只比较这两者，所以它会报 `SLOT_SYNC=skip`——**不要据此认为槽位已经在用 3.1.14**。新载荷会随 overlay 覆盖到盘上，但槽位何时加载它不在该脚本的检测范围内，需要部署者自行确认（必要时重启槽位），这一步本变更未做验证。
+
+## 1.4.180 — 2026-11-23 · Gemini 多协议适配与 CRAG 加密 0.3.0 订阅，Codex 额度续航与 CRAG 激活收敛
+
+- Gemini 宿主与网关接入独立多协议转换和原生流式推理桥，不改动既有 Claude / Codex 路径。新增 `src/lib/protocol/gemini-convert.mjs`，将 OpenAI Chat/Responses、Anthropic Messages 与原生 Gemini/Antigravity 载荷统一转换，支持工具调用、思考块 / `thoughtSignature` 往返与流式 SSE 封装；控制面与宿主之间新增 `/infer`、`/infer-cancel` 流式通道，对缺少 `stream_infer` 的旧版宿主夹具返回 HTTP 404 并平滑回落到既有 `/test-chat`（#1612）。
+- `craggemini` 接入 CRAG 宿主机订阅与按环境席位绑定，并锁定签名加密 `0.3.0` 载荷。新增 `src/lib/gemini/subscription.mjs` 与面板路由 `/api/panel/gemini/crag-subscription/*`、`/api/panel/gemini/environments/:id/crag-license/*`，按规范 `crag-auth` `v3.1.13`（`--product craggemini`）协议完成宿主机订阅兑换、席位绑定与离线本地验签；`deploy/payload.json`（`geminiDefaultLinuxAmd64`）、`scripts/fetch-default-gemini.py`、`scripts/gemini-maintenance.py` 与 `deploy/install.sh` 统一指向 `payload-2026.11.23-gemini-0.3.0` 五件套（`craggemini`、`craggemini.payload.enc`、`libagy_bridge.so`、`crag-license-public.pem`、`manifest.json`），同时兼容旧版载荷夹具校验（#1612）。
+- Codex 槽位在额度闸门处自动刷新已过期 credits 并在面板展示余额，默认 Codex 版本提升至 `codex_cli_rs/0.170.0`（#1608、#1606）。
+- `x-kin-queue` 不等待队列策略对齐槽位预算与零跳计数，重复请求头处理与文档口径收紧；补齐近期协议、CRAG 与 Gemini 改动与存量行为的审计对齐（#1594、#1602、#1605）。
+- CRAG 商城在遭遇 `auth_forbidden` 时停止无限激活重试循环，并向面板透出脱敏诊断信息（#1609）。
+- CRAG 首帧前 SOCKS5/传输 502 与 `empty_response` 分类解耦，并收紧风控 `HARD_POLICY_RULES` 的词边界与上下文约束（#1610、#1611）。
+- 部署说明：本版仅涉及控制面、前端与 Gemini 宿主及加密 `0.3.0` 载荷，槽位内核与 `wrap-cli` 字节未变，已部署机器升级后无需执行 `wrap-cli/sync`。
+
+## 1.4.179 — 2026-11-22 · Arch KVM 槽不再卡在时间同步，KVM 容器 pids 跟随槽位容量，缓存断点自保 TTL 序
+
+- Arch 云镜像建出来的 KVM 槽不再卡死在时间同步上。Arch 官方云镜像默认启用 `systemd-time-wait-sync.service`（`TimeoutStartSec=infinity`），而 `pacman-init.service` 把自己排在 `After=time-sync.target`、`Before=sshd.service cloud-final.service`；KVM 槽经 SOCKS5 出口（只过 TCP），UDP 的 NTP 123 永远完不成，于是 `sshd` 与 `cloud-final`（`runcmd` → `install-guest.sh` → `kin-kernel`）一个都起不来，新槽表现为 `guest ssh unavailable` / `Connection reset by peer` 并反复触发看门狗重启。现在 `docker/kin-kvm/guest/user-data` 里加一条 `bootcmd`，在 cloud-init 的 Network 阶段（早于 `cloud-final` / `runcmd`）把这个 unit mask 掉，用 `command -v systemctl` 守卫，所以没有这个 unit 的发行版（Ubuntu / Debian / Fedora）不受影响；`bootcmd` 是 per-always 模块，不受 user-data 里「instance-id 稳定所以 datasource 只跑一次」的影响，而 `mask` 本身幂等（#1595）。
+- 这条**只解掉阻塞等待，时钟同步本身仍然不工作**：Arch 的 `systemd-timesyncd` 同样走 UDP 123，在 SOCKS5 出口下照样同步不上。mask 之后 guest 不再卡在 `time-sync.target`，时间来源退回宿主给的 kvm-clock / RTC，对 TLS 与凭据过期判断够准，但别把它理解成「修好了 Arch 槽的时间」。另外基础镜像与 `base.id` 都没动、不重建 overlay，所以存量槽的 seed ISO 里没有这条 `bootcmd`，只有新建的槽生效——线上已经卡死的 Arch 槽需要重建（#1595）。
+- KVM 槽容器的 `--pids-limit` 跟随槽位容量，不再硬编码 256。Docker 槽一直经 `dockerSlotResourceArgs` 从 `slotCreationLimits(vm, routing).pids` 取值，而本机 KVM（`buildKvmRunArgs`）与集群 KVM（`kvmSlotContainerBody`）各自写死 `256` / `PidsLimit: 256`，于是一个 `machine.pids_limit` 或 plan 目标更高的 KVM 槽（例如按 8 并发会话定容、需要 640 pids 的 4 GiB Max 20x 槽）每次重建容器都会被悄悄打回 256。两处改为读 `slotCreationLimits`——该函数在两个文件里本来就已 import，`routing` 也已是形参，不引入新依赖（#1596）。
+- 两点与这条相关但描述里没提的：**KVM 路径上 memory 还没跟上**。Docker 路径两项同源（`limits.memory` 与 `limits.pids`），KVM 的 memory 仍取 `slotMemory(vm, routing)`（recorded），所以本版之后 KVM 容器的 pids 抬到 plan 目标、memory 停在 recorded。这不会造成超售：`effectiveSlotCount` 走 `slotsForLimits` 的 `Math.min(byMemory, byPids)`，memory 那一侧仍把席位数钳住，多出来的只是用不上的 pids 余量。其次**下限不再是固定 256**：`slotCreationLimits` 的 pids 下界是 `recordedPidsLimit(vm)`，即 `vm.machine.pids_limit`，缺失时才回落 `LEGACY_PIDS_LIMIT = 256`，所以一个显式记了低于 256 的槽重建后会比本版之前更紧。这与 docker 路径一直以来的契约（「never below the recorded spec」）一致，且 KVM 容器里只有 qemu 和几个 helper（会话进程在 guest 内，不计入容器的 pid 命名空间），不改（#1596）。
+- `applyCacheBreakpoints` 自己保证不产生 `1h`-after-`5m` 的线序，不再把这个不变量交给调用方。调用方送来不带 `ttl` 的 `cache_control: { type: "ephemeral" }`（在 Anthropic API 里是隐式 `5m`）时，`bodyCacheTtl(inbound)` 因为没有显式 `ttl` 返回 `null`，`highestInboundCacheTtl(inbound, '1h')` 于是回落到 `'1h'`；`injectToolsTailBreakpoint` 保留调用方 tools 上那个隐式 5m 不动，而 `injectSystemTailBreakpoint` 与 `applyMessageBreakpoints` 按 `target = '1h'` 盖章，产出的正是上游会拒的非法线序。现在函数末尾过一遍 `enforceCacheTtlOrder`。不带 `ttl` 的 marker 不会被盖上 fallback——`enforceCacheTtlOrder` 里 `if (target != null && ...)` 这个守卫让它保持 `ttl` 缺失、同时置 `short = true`，所以 tools 上的隐式 5m 会正确地把后面的 1h 压成 5m，自己仍是 `{type:'ephemeral'}`（#1597）。
+- **这条不是在修一个正在发生的 400。** `applyCacheBreakpoints` 在 `src/` 下只有一个调用方（`anthropic-policy.mjs:532`），`prepareAnthropicRequest` 也只有一个（`outbound-attempt.mjs:495`），而紧随其后的 `outbound-attempt.mjs:505` 本来就无条件 `enforceCacheTtlOrder(cleaned, cacheTtl || DEFAULT_CACHE_TTL)`，中间没有提前 return，所以出站 body 在现有唯一生产路径上已经是序正确的。它的价值是契约自洽：该函数的文档契约里就包含这个不变量，将来新增调用方不必知道还得补一层外层 enforce。叠加调用没有代价——`enforceCacheTtlOrder` 是幂等钳位，第二遍 `changed=false` 原对象原样返回（#1597）。
+
+## 1.4.178 — 2026-11-22 · 放出跨设备迁移入口，VM 账号状态与宿主推理证据分离
+
+- 「从其他设备迁移」入口放出来了。签发侧的 `claim-by-order` 已部署到生产（crag#14，账本 schema 15→16、`voucher_orders` 建表、账本计数前后逐项一致），1.4.176 里挡着这个入口的那个理由不存在了。路由可达是用能区分两种 404 的办法验证的，而不是看它是否返回 404：格式非法的订单号返 400 `invalid_request`，说明请求走到了签发侧的 `validate_order_id`；而一条确实不存在的路由返 404 `not_found`，那是 `.fallback(not_found)`。迁移本体先在生产数据副本上演练过一次（生产机上独立 state-dir，不碰生产账本），行数逐项对齐、`integrity_check` 通过（#1589）。
+- 注意与 1.4.176 的描述有一处不同：那里写的是「等那条路由部署完翻一个常量即可」，实际做法是把 `CLAIM_BY_ORDER_AVAILABLE` 连同它那段注释一起删掉，按钮回到加开关之前的无条件渲染。翻成 `true` 会留下一个恒真的三元（死代码），而那段注释讲的是一个已经过去的状态——留着会让下一个人以为它还有切换的意图，或者以为那条路由仍然可能不存在。要再关掉的话 revert 即可，不需要那个常量存在。「迁入不要求本机已有订阅」那条注释留在原处，它在恢复后依然成立；测试相应改回被它替换掉的断言，四个状态都 `toContain`——换机的常态是新机器还是空的，按订阅状态设门会把入口从最需要它的宿主机上藏掉（#1589）。
+
+- VM 面板把授权、模型发现、候选条件和最近一次宿主推理分开展示，不再用绿色「已授权」加模型发现这类前置状态去暗示真实推理已经成功。没有回合证据的保持「待验证」而不是看着像可用；失败保留具体类别，不升级成「凭据失效」这种更重也更可能错的结论（`runtime_ready:false` 与缺少结算数据都不作为失败依据）；宿主侧成功单独分组，既不等同公共 API 端到端成功，也不混进普通槽的在池计数——Gemini 不再用通用在池比例表达实测可用性。卡片、机架、表格、汇总与筛选共享同一份状态投影，所以四处口径不会再各说一套。Claude / Codex 的原有行为未变（#1588）。
+- 这段推理证据的外投是**两端各自白名单**，不是单点过滤。宿主只在内存保留各环境最近一次已执行回合，错误码取自一个固定的 frozenset（进程输出与异常细节不进清单）；控制面的 `lastInferenceView` 逐字段**重建**对象，只产出 `state` / `model` / `started_at` / `finished_at` / `error_code` 五项，每项都过校验（状态在集合内、`modelName()`、ISO 时间戳正则加 `Date.parse`、错误码必须命中白名单）。提示词、回复、令牌、私有 profile、回合句柄都不可能漏出，因为它们从不被拷贝——这种构造在上游新增字段时也不会失守。证据的有效性绑定环境授权、profile、配置更新时间、载荷版本与实际代理配置：换代理、重新授权、更新版本或服务重启后旧证据即失效；相同 `proxy_id` 下更换端点或凭据，由控制面比对代理配置的 sha256 摘要挡住（该摘要用于比对，不外投）。普通读取是纯查找，不发起也不刷新上游调用（#1588）。
+
+## 1.4.177 — 2026-11-22 · Gemini 集中运维与故障恢复入口，费用总计行的口径区分
+
+- Gemini 宿主的诊断与修复收进面板，不必再登服务器敲命令。新增一个宿主侧维护代理（`scripts/gemini-maintenance.py`，systemd 单元 `vm2api-gemini-maintenance`，走 `/run/vm2api-gemini-maintenance/control.sock`），面板「设置 → Gemini：诊断与维护」可提交 `diagnose` / `install` / `repair` / `recover` / `update_cli` / `update_native` / `rollback`，并展示宿主状态、受信签名版本清单与回滚目标。各处宿主不可用的提示改为指向这个入口（`GeminiMaintenanceLink`），取代原先那句「请在宿主检查 `systemctl status vm2api-gemini`」——让运维点进一个能读状态、能提交修复的界面，比让他照抄一条命令更有用。管理员拿到可点的链接，普通用户拿到「请联系管理员」的说明（#1574）。
+
+- 维护入口是服务端强制的管理员专属，不只靠前端藏按钮。`authorizePanelRoute` 在 gemini 分派之前执行，而 `panel-acl.mjs` 里没有任何 gemini 条目：`isUserAllowed` 以 `return false` 收尾、`authorizePanelRoute` 以默认拒绝收尾，`super` 的放行是一张写死的 GET 清单且不含维护路由，所以 `user` 与 `super` 都命中不了放行分支。控制 socket 另有一层：它是 `root:<gid>` 且模式必须恰好 `0o660`，连接方经 `SO_PEERCRED` 校验，查组用 `SO_PEERGROUPS`（连接时捕获的凭据）而不是按用户名查——后者会放行调用方实际上并未获得的授权。锁文件要求 uid 0、模式恰好 `0o600` 且以 `O_NOFOLLOW` 打开，socket 建立前校验父目录属主、拒绝抢占已绑定的 socket、并用 dev/ino 比对检测替换（#1574）。
+
+- 控制面与维护代理互不信任对方的输入。控制面把 `release_id` 收在 `/^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/`、请求体只允许 `action` 与 `release_id` 两个键；代理侧独立复校键集合，且 `release_id` 只做精确相等比对，从不拼进路径或命令（整个代理没有 `shell=True`，只有一处 `subprocess.Popen`，`stdin`/`stderr` 为 `DEVNULL` 并带超时）。反向上，`snapshotView` 对宿主返回的每个字段做白名单校验、响应体上限 256KB、错误码收在 `/^gemini_[a-z0-9_]{1,80}$/`，宿主返回畸形数据只会变成 `protocol_error`，不会穿到前端（#1574）。
+
+- 槽位费用表的总计行重新在可见文本里区分两种口径。`账号总计` 是账号全生命周期的真实总额，`保留日志合计` 只是尚未被裁剪的日志之和、是个下界；#1578 为缩短过长的标签把两者都压成 `总计`，把区分移进 `note`（渲染为 `title` 原生提示）。但 `title` 在触屏上永远不显示，承载它的 `<td>` 与 `<span>` 本就不可聚焦、键盘用户触发不了，屏幕阅读器对非交互元素的 `title` 播报也不一致——于是「这个数完不完整」在这些场景里消失，而在一张费用表里把下界标成「总计」会让人以为那就是花掉的全部。改为 `账号总计` / `日志合计`：两个标签都是 4 个字，最长的那个比改动前的 `保留日志合计`（6 字）还短，#1578 要解决的长度问题仍然解决；完整措辞留在 `note` 里作悬停补充，不再承载唯一的区分（#1578、#1584）。
+
+- 已知未覆盖：新增的 `test/deploy/gemini-maintenance-*-smoke.py` 共 1442 行目前不在 CI 内。`test.yml` 的 discover 只用 `-p test_native_cli.py` 这一个模式，而这几个文件是连字符命名、也不是合法的 unittest 模块名，所以它们是对真实宿主手工执行的脚本，不构成门禁；`test/unit/gemini-maintenance.test.mjs` 的 204 行在 CI 内（#1574）。
+
+## 1.4.176 — 2026-11-22 · CRAG 订单找回与跨机迁移，本机内核重探与 count_tokens 开关
+
+- count_tokens 的两个入口可在面板开启。`94b6f728` 当初把公开的 `POST /v1/messages/count_tokens`（含 `/messages/count_tokens`）和面板按槽位的 `POST /api/panel/vms/:id/count-tokens` 都 stub 成 404，但实现本体一直完整保留——`handleUserCountTokens` 有 11 个测试直接驱动（oauth / setup-token / 跨平台 key / distill 拦截 / 拒答缓存 / 设备封禁），经槽位 Go worker 的 `countTokensViaWorker` 也在，所以这次只是把路由接回去，加一个 `routing.compatibility.count_tokens` 开关（面板「设置 → 协议 → 入站准入 → 开放 count_tokens 入口」）。**默认关**，关态行为与现在逐字一致：这是一个公开 API 面和一个面板路由，打开它应当是运维的明确决定，而不是某个 routing 文件因为缺字段而默认获得的能力；开关只接受 `true`，routing.json 里误写成字符串不会把端点打开。`/health` 与 `/v1/meta` 的 `features` 在开启时多一项 `count_tokens`，而启动时写出的 `config/gateway-v2.public.json` 保持静态清单——一个在 boot 产出的文件无法描述运行期可翻的开关，两种写法都会有一半时间是错的（#1394）。
+
+- 按客户端拦截的开关（`blocked_clients`）改掉三处与现状不符的地方。它的检测不再读 `messages` 里 `role: 'system'/'developer'` 的轮次：闸门只要求**模型**是 Anthropic，而本网关也服务 OpenAI 形状打 Claude 模型的请求，在那条路上这些轮次是调用方自由书写的内容，读它会让一个只在 system 消息里写了「running inside OpenClaw」的用户吃 403——而该模块注释承诺的恰恰是「只提名字不会被拦」。改后不损失真实覆盖：这类客户端跑的是官方 CLI，请求一律是 Anthropic 形状、带真的 `system`。校验对未知客户端 id 改为忽略而非拒绝，与 `blockedClientsFromRouting` 的读法一致；此前一旦某个 id 被退役或改名，存量 `routing.json` 里留下的键会让**任何**协议设置保存都失败，只能手改文件恢复。模块注释与面板文案也随之更正：`78223cdf1` 之后第三方 system 搬移已按 `system` 内容判定，这类请求会被搬移后正常服务，不再因第三方应用判定被上游拒绝，所以打开开关等于在搬移之前主动放弃一条本来能成功的请求（#1394）。
+- 去掉 GPT-6.2 Astra / Sol 凭公式推出的 Flex 档。官方价目表的 Flex 一节里没有任何 GPT-6.2 条目，并明确写着不会再给新模型加 Flex；较早的几个模型的 Flex 恰好是标准价的一半（`gpt-6-astra` 10/50/1 → 5/25/0.5，`gpt-6.1-sol` 2/10/0.1 → 1/5/0.05），所以按这个比例推出来的数看着合理，却是一份自称「官方价快照」的文件里凭空生成的价格，并且会让一条回显 flex 的 GPT-6.2 记录按标准价的一半结算。`selectBand` 本来就有正确答案——某档位没有公开价时它把该行报为未计价，而不是按猜测计费（#1560）。
+- 本机槽在一次健康探测里「既不就绪、也不忙、也没有在途请求」时不再立刻判挂。这类失败在一个部署上一周 128 次（每天 14–26 次），而证据指向内核并没有挂：报错的请求多在同槽上一个请求结束后约 3 秒进来，128 次里 99 次当时槽上没有别的请求，来宾里的 kin-kernel 从未重启（`NRestarts=0`），看门狗也没有动作，中位 15 秒后同一个槽就成功了。现在本机槽在判挂之前每 250ms 重探一次，总时长最多 `routing.inference.kernel_down_reprobe_ms`（默认 2500，`0` 关闭，上限 10000）：期间就绪则放行，变忙则走原有的等空位逻辑，仍不行照旧返回 `kernel_unavailable`，并多记一行带首末两次健康快照的日志，以后能看清当时内核到底回了什么。集群槽不变——它们有自己的启动探测（#1548 的 3 秒下限）和重连逻辑。`normalizeInferenceConfig` 同时补上该键的保留，否则面板保存推理设置会把它连同显式的 `0` 一起丢掉（#1572）。
+- 重探的每次健康探测被压进剩余窗口。循环条件只预留了 250ms 的探测间隔，而 `rustHealthTimeoutMs` 的下限是 800ms、上限是 30000ms，所以一次不受约束的探测会把总时长推出 `kernel_down_reprobe_ms`，也推出上面刚算好的槽位预算：`health_timeout_ms` 调到 8 秒时，一个被告知最多等 700ms 的请求实际等满 8.25 秒。收窄不会制造假故障——`workerHealth` 把超时报成 `{ ok: false, status: 0 }` 且不带 `healthy: false`，所以被削短的那次探测只会读成未就绪，既不命中立即返回 unhealthy 的分支，也不改变窗口耗尽后的最终判定（#1572）。
+- 免登录（设备）订单在丢掉结账 Cookie 后可凭订单号找回。设备订单的 owner 是 `sha256(host_id:cookie_token)` 且不可逆，所以换浏览器或清 Cookie 之后订单既从列表消失、也无法交付——`apply` 同样按 owner 匹配，一笔已付款的订单就此永久卡死，而设备页从不展示券码，没有任何兜底。订单号是 `randomUUID`，由买家持有，并且**从不出站**（对外一律是 `deriveOrderReceipt` 的 HMAC），前端也只让买家手动输入、不进 URL，所以它就是这笔订单的凭据。面板订单报 404，与不存在的订单逐字一致，这条路由不能用来探测哪些订单号存在（#1569）。
+- 找回不再比较 `device_host`，那道「第二因子」从来不成立。`deviceIdentity()` 取的是本安装自己的机器 id，所以该列对同一个数据库里的每笔设备订单都是同一个常量，比较它永远分不开两个匿名买家——真正区分买家的是 cookie token，而它已经在 owner 里了。比较唯一能触发的场景是网关自身身份变了，而那恰恰是最不该拒绝的时刻：身份一变，所有设备订单的 owner 摘要同时失配，找回成了唯一出路，于是带着旧 host 的那些行被永久 409，反倒是该列出现之前的 NULL 行还能救回来——闸门把「可找回」变成了「永久不可交付」，正是这条路由要防的那件事。它也不保护权益落点：`apply` 始终按当前 `hostId` 兑换。该列保留作溯源字段，找回时刷到当前机器；`shop_order_other_host` 这个错误码与相应前端文案一并移除。迁移 066 的注释仍写着更严格的规则且无法就地更正——`database.mjs` 按 SHA-256 校验已应用的迁移，改动文本会让所有跑过它的部署报校验失败，所以更正写在 `recoverDeviceOrder` 的注释里（#1569）。
+- 已登录但会话早于 buyer 绑定时，CRAG 商城报 `shop_session_stale` 而不是 `shop_login_required`。`sessionBuyerOwner` 要求 `session.buyer?.id === record.id`，而旧会话根本不带 `buyer`，于是一个已经登录的用户被告知「请登录面板」——一句他正在照做的建议。id 比较本身没有放宽：`record` 按用户名查出，删号后重建的同名账号会拿到新 id，带着旧 id 的会话不能够到新账号的订单（#1569）。
+- 订阅可凭商城订单号**跨机器**迁移，旧机器不必还活着。注意与上面那条「丢 Cookie 后找回」不同：那是同一台机器换了浏览器、把订单取回当前浏览器，这里是把订阅本体迁到新机器。此前换机要求旧机先释放券，而凭据链决定了那台机器一没就什么都不剩——明文券码是签发侧唯一能自行验证的凭据，它只存在于供应方，取回它需要只存在于某一台 vm2api 数据目录里的 receipt key，而免登录买家从来没见过券码。所以兑换时把订单号登记到签发侧（replay 路径也登记，这是存量补登记的入口），面板新增「从其他设备迁移」：输入购买时的订单号，券带着剩余时长迁来，不重新起算。入口不论本机当前状态都显示，包括完全没有订阅——换机的常态就是新机器是空的，按状态设门会把它从最需要它的宿主机上藏掉；也不要求先注销旧机。注销文案一并修正：它原本说「必须自己还留着券码」「只凭设备标识迁不走」，前半句已不成立，留着会让人去找一份他从来没有过的东西。签发侧对应 crag#14（#1580）。
+- **本版暂不放出那个迁入入口**，它由 `crag-device-identity.tsx` 的 `CLAIM_BY_ORDER_AVAILABLE` 挡着。`claim-by-order` 是签发侧 crag#14 提供的路由，而那个 PR 既没合也没部署，生产跑的是它之前的版本，那条路由不存在。放出来的后果不是功能不可用而已，而是失败的样子在怪用户：crag 的 `http.rs` 把未匹配路由接到 `.fallback(not_found)`，该处理器走 `failure(AuthError::NotFound, scope)`，产出与正常错误完全一样的信封（`{ok:false,error:{code:"not_found"}}` 加 HTTP 404），于是 `authority()` 采纳错误码的三个条件同时成立（`ok:false`、`not_found` 在 `authorityErrors` 里、状态等于表中登记的 404），用户拿到的是「没有找到这个订单号对应的兑换券」——他会以为自己订单号抄错了，去反复核对一个根本没问题的数字。兑换本身不受影响：`HostRedeemRequest` 带 `deny_unknown_fields`，旧签发侧会把带 `order_id` 的 redeem 判成 400，而 `redeemAtAuthority` 去掉该字段重试即可成功，代价只是订单号没登记。实现、文案与测试全部保留，等那条路由部署完翻一个常量即可（#1580）。
+- 登记订单号绝不阻断兑换，代价是 `invalid_request` 成为可识别的终局错误。签发侧 redeem 请求带 `deny_unknown_fields`，所以一个比签发侧新的实例会因 `order_id` 让每次兑换都失败；现在遇到「请求格式被拒」就降级重试一次、不带该字段。而这要求 `invalid_request` 不再降级成 `crag_subscription_authority_unavailable`（502）——那读起来是「结果未确认，请重试」，用户反复重试永远不会成功，正是 `host_transfer_cooldown` 当初掉进的同一个坑。只有它降级：502 保留原义，因为兑换可能真的已提交，在那里重试会把本该停在 `sync_pending` 的状态推成已完成。元数据字段叫 `shop_order_id` 而不是 `order_id`，后者已承载控制流——`recover()` 把带它的 intent 视为「只能经商城恢复」，复用会让恢复直接 return、设备订单卡在 `ready_to_apply`（#1580）。
+- 免登录（设备）页可导出迁移凭据。此前设备页从不展示券码，但那让一个签发侧没登记过其订单号的免登录买家彻底没有迁移手段，而权益是他买的。导出仍需持有该订单的结账 Cookie、同源 POST 和按设备的限流，可达性不比「应用订单」更高，应用本身也仍然不携带券码；`crag-shop.mjs` 那条「Never expose the voucher」注释随之更新为实际成立的说法——错误通道不携带券码。另有一处为避免不可逆后果而加的拒绝：`claimByOrder` 在 `deploy/payload.json` 缺失时拒绝而不是继续，因为 `standardEnrollment` 在那种情况下返回 `{}` 而不抛错，而一次不带 `payload_key_id` 的 claim 会让签发侧把这张券记成无标签基线——它与同机其他同类券共享一个合并窗口，再也不能按订单号迁移，且用户看不见（#1580）。
+
+## 1.4.175 — 2026-11-21 · CRAG 订阅：设备标识、凭据自助恢复与注销迁移
+
+- CRAG 宿主标识改以网卡为基准。`machine-id` 并不唯一——云镜像普遍不在实例化时重置 `/etc/machine-id`，同镜像开出的多台机算出同一 `host_id`，第二台注册即被授权服务以 403 拒绝且终身如此；虚拟网卡 MAC 由 hypervisor 逐实例分配。筛选只排除组播位：排除「本地管理位」会废掉几乎所有 KVM 虚拟机的网卡（QEMU 的 `52:54:00` 前缀就带该位），而地址是否永久由 `addr_assign_type` 权威判定；最小 MAC 胜出，因为枚举顺序与接口命名都会变。已保存的标识不再因维护而漂移——此前重装系统、重建容器或换网卡都会抛 `host_identity_changed`，把付过费的机器卡死；来源仍须健全，缺失或被换成符号链接照旧报不可用，只容忍值变化。`host_id` 派生用的 32 位 hex 恰好是 UUID 载荷，所以同一标识可在面板展示、也可输入，协议格式一字未动（#1561）。
+- 凭据失配（403 `auth_forbidden`）可自助恢复，不再只能由管理员登服务器敲 CLI。授权服务侧早有恢复能力但未开放通路，且其 `binding_id` 是旧凭据的派生物——正是丢掉的那个东西；现在改由客户端出示授权服务自己签过的 entitlement 作带内所有权证明。credential 文件**丢失**走的是另一条路（本地直接报不可用、请求不出网），因此两处都接了恢复。并发竞同一个 403 共享一次恢复，否则各自换凭据会轮流把对方踢掉；失败只重试一次。`host_id` 与另一台机器相同时恢复**必须**失败，否则两台会互相夺取订阅，此时面板明确给出成因而不是让订阅看着正常直到某次兑换莫名失败（#1561）。
+- 订阅页列出每张兑换券各自的额度窗口，并讲清概况里的「到期」取的是最早到期那一段（届时席位下降、授权需重签），不是订阅终止。逐券明细未经签名，只在与已签名聚合精确对账时才采信，且不参与准入。兑换入口同时接受面板展示的设备 UUID 与原有的 64 位 host id（#1561）。
+- 新增「注销本机订阅」：每张仍在有效期内的兑换券带着剩余时长被释放，在新机器上用原券码兑换即继承，换机既不损失已付时长也不白送时长。注销后本地签名权益随之清除，否则状态会继续报告一个已被删除的订阅。转移冷却期被拒时给出明确原因——此前它会退化成「结果未确认，请重试」，害运维反复重试一件没到期的事（#1561）。
+- 对话在反复静默 CLI 超时后拒绝请求而不再重播，并让后续请求避开在该尺寸上静默的 VM，而不只是避开单个对话；同时不把 VM 的尺寸上限压到低于它刚被证明能服务的水平（#1555）。
+- 槽位凭据刷新改为重试安全，依靠节点侧的尝试日志；停在旧 worker 上的槽位在其节点升级后可恢复，且只在能清除 park 的地方探测（#1539）。
+- 集群 unix-socket 传输按用途与路径分键，exec bridge 不再泄漏并耗尽 SSH 会话，补上原因码、有界队列与真实健康判定（#1385）。
+- 集群槽位的启动健康探测按部署位置放宽超时。探测与进程检查经 SSH 中继多一跳，原先按本地 docker exec 预算写死的 400ms/1500ms 在跨洋链路上经常在内核就绪前就整窗超时，随后被判定 `runtime_start_failed` 并停掉实际已经 ready 的容器；watchdog 的 stale-lift 又因容器已被停而永远探测不到健康内核，形成重建循环。现在集群槽（`node_id` 非空）的单次健康探测下限 3 秒，本地槽保持原值；`inference.health_timeout_ms` 也补进路由归一化白名单——此前该键有读取方却在保存时被剥掉，面板永远配不进去（#1548）。
+- 控制台登录后跳转回原请求页面，而不是落到欢迎引导（#1356）。
+- OpenAI Ultrafast 档位的计价与展示（#1560）；支持 Mythos 5.2，策略与计价对齐 Fable（#1558）。
+
+## 1.4.174 — 2026-11-21 · Setup Token 不再伪造一年期票，授权链接保留 helper 身份
+
+- Setup Token 换票不再请求 `31536000` 的有效期。授权链接导入走的就是 README 的普通换票流程，长效票是宿主用短效票本地派生的东西，面板没有理由铸造它；两条路现在都只申请完整 5 项 scope（身份链需要 `user:profile`）、都不发 `expires_in`，拿到的是上游给的短效票。能力名随之由 `setup-token-long-lived` 改为 `setup-token-short-lived`，profile 的 scope 仍锁定、不接受调用方覆盖（#1550、#1551）。
+- 授权链接换票保留 helper 在 token 之后采集到的身份字段，修复链接导入丢失该身份的问题（#1549）。
+- `deploy/payload.json` 指向重建后的短效 OAuth helper（#1551）。
+
 ## 1.4.173 — 2026-11-21 · 修复 Gemini OAuth 账号文件导入
 
 - 将短期 OAuth 访问令牌传入隔离的账号探测进程，修复 Gemini 账号文件导入时宿主调用参数不匹配的问题（#1544）。

@@ -11,13 +11,15 @@ export type VmPerms = {
   dashboard: boolean
   /** 开机 / 关机 / 探测。 */
   power: boolean
+  /** 查看诊断并按当前状态申请恢复服务。 */
+  recovery: boolean
   /** test-chat、定时测试。 */
   test: boolean
   /** GET /api/panel/test-models（后端目前只放行 admin）。 */
   testModels: boolean
   /** 手动刷新官方额度：管理员及槽位属主。 */
   usageQuery: boolean
-  /** oauth/*、导入凭证、额度刷新、重置券、诊断与恢复服务。租户只查看。 */
+  /** OAuth 凭证导入、授权和令牌刷新。 */
   credential: boolean
   /** 查询和使用当前 VM 的上游重置券；不授予凭证管理权限。 */
   resetCredits: boolean
@@ -37,6 +39,7 @@ const NONE: VmPerms = {
   admin: false,
   dashboard: false,
   power: false,
+  recovery: false,
   test: false,
   testModels: false,
   usageQuery: false,
@@ -58,6 +61,7 @@ export function vmPermsFor(
       admin: true,
       dashboard: true,
       power: true,
+      recovery: true,
       test: true,
       testModels: true,
       usageQuery: true,
@@ -73,6 +77,7 @@ export function vmPermsFor(
     return {
       ...NONE,
       known: true,
+      recovery: true,
       test: true,
       testModels: true,
       usageQuery: true,

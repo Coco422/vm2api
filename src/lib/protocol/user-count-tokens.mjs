@@ -33,11 +33,25 @@ import { ownerScopeFromRequest, vmMatchesOwnerScope } from '../admin/resource-ow
 import { keyAllowsVm, keyScopeFromRequest, vmPoolDenial } from '../admin/key-scope.mjs'
 import { keyModelError } from '../admin/key-models.mjs'
 import { getVm, listVms } from '../vm/vm-registry.mjs'
+import { validateImageDimensions } from './images.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { summarizeCodexSlot } from '../vm/codex-slot.mjs'
 import { pickCodexSlots } from '../pool/codex-slot-pool.mjs'
 import { detectInboundPlatform } from './platform-detect.mjs'
+import { blockedClientError, blockedClientFor } from '../identity/blocked-clients.mjs'
 import { resolveInboundIdentity } from '../identity/identity-rewrite.mjs'
+
+/** routing.compatibility.count_tokens — whether the count_tokens entries are served.
+ *
+ * Both entries (public `/v1/messages/count_tokens` and the panel's per-VM probe) were
+ * stubbed to 404 by 94b6f728 with the implementations left in place. Default off keeps
+ * that: these are a public API surface and a panel route, so turning them on is the
+ * operator's decision, not something a routing file gains by omission.
+ */
+export function countTokensEnabled(routing) {
+  return routing?.compatibility?.count_tokens === true
+}
+
 export function usageUnsupportedError() {
   return makeError({
     type: ErrorType.INVALID_REQUEST,
@@ -250,9 +264,15 @@ export async function blockCountTokensBeforeHop(req, inbound, deps = {}) {
 export async function handleUserCountTokens(req, res, deps) {
   const json = (...args) => deps.json(...args)
   if (!deps.requireAuth(req, res)) return
+  const routing =
+    typeof deps.getRoutingConfig === 'function'
+      ? deps.getRoutingConfig()
+      : typeof deps.getRouting === 'function'
+        ? deps.getRouting()
+        : null
   let inbound
   try {
-    inbound = await deps.readBody(req, inboundBodyLimit(deps.getRouting?.(), deps.cfg.limits.max_body_bytes))
+    inbound = await deps.readBody(req, inboundBodyLimit(routing, deps.cfg.limits.max_body_bytes))
   } catch (error) {
     if (error?.body?.error) return json(res, error.status || 400, error.body)
     return json(
@@ -270,7 +290,6 @@ export async function handleUserCountTokens(req, res, deps) {
   if (!parsed.ok) return json(res, parsed.error.status, parsed.error.body)
   const modelDenied = keyModelError(req, parsed.body.model, { anthropic: true })
   if (modelDenied) return json(res, modelDenied.status, modelDenied.body)
-  const routing = typeof deps.getRoutingConfig === 'function' ? deps.getRoutingConfig() : null
   if (
     claudeCodeOnlyFromRouting(routing) &&
     detectInboundPlatform(parsed.body.model).platform === 'anthropic' &&
@@ -278,6 +297,20 @@ export async function handleUserCountTokens(req, res, deps) {
   ) {
     const err = claudeCodeOnlyError()
     return json(res, err.status, err.body)
+  }
+  const blockedClient =
+    detectInboundPlatform(parsed.body.model).platform === 'anthropic' ? blockedClientFor(inbound, routing) : null
+  if (blockedClient) {
+    const err = blockedClientError(blockedClient)
+    return json(res, err.status, err.body)
+  }
+  if (detectInboundPlatform(parsed.body.model).platform === 'anthropic') {
+    try {
+      validateImageDimensions(parsed.body)
+    } catch (error) {
+      if (!error.body?.error) throw error
+      return json(res, error.status, error.body)
+    }
   }
   const gate = await blockCountTokensBeforeHop(req, parsed.body, { ...deps, rawInbound: inbound })
   if (gate?.error) return json(res, gate.error.status, gate.error.body)

@@ -13,6 +13,7 @@ import type {
   VmSeedSettings,
 } from '@/types/panel-vm'
 import { toast } from 'sonner'
+import { VmRecoveryDialog } from '@/features/vm/vm-recovery-dialog'
 import { api, isApiError } from '@/lib/api'
 import {
   canRefreshCredential,
@@ -34,6 +35,7 @@ import {
   poolStatus,
   restrictionCopy,
   vmRunning,
+  overloadCooldown,
 } from '@/lib/vm-status'
 import { cacheHitPct } from '@/lib/vm-usage'
 import { useNow } from '@/hooks/use-now'
@@ -142,6 +144,7 @@ function VmDetailBody({
 }) {
   const navigate = useNavigate()
   const [seedDebug, setSeedDebug] = useState(false)
+  const [recoveryOpen, setRecoveryOpen] = useState(false)
   const qc = useQueryClient()
   const perms = useVmPerms()
   const dash = useQuery({
@@ -156,7 +159,11 @@ function VmDetailBody({
   const proxies = useQuery({ ...proxiesQueryOptions(), enabled: perms.admin })
   const detail = useQuery({
     ...vmQueryOptions(id),
-    refetchInterval: wantedTab === 'seed' ? 2000 : false,
+    refetchInterval: (query) => {
+      if (wantedTab === 'seed') return 2000
+      const vm = query.state.data?.vm
+      return overloadCooldown(vm, Date.now()) ? 5000 : false
+    },
   })
   const seed = useQuery({
     ...vmSeedQueryOptions(id),
@@ -389,6 +396,7 @@ function VmDetailBody({
   const u7 = usedPctOf(quotaSrc, '7d')
   const tierKey = claudeTier(vm).key
   const now = useNow()
+  const overload = overloadCooldown(vm, now)
   const cost = vmCost(vm)
   const split = weeklySplitInfo(
     (acc.weekly_split ? acc : vm) as Record<string, unknown>
@@ -424,7 +432,7 @@ function VmDetailBody({
 
   return (
     <PageHeader
-      title={vm.email ? compactEmail(vm.email, 28) : vm.name || vm.id}
+      title={vm.name || (vm.email ? compactEmail(vm.email, 28) : vm.id)}
       fluid
     >
       <QueryGate
@@ -459,7 +467,7 @@ function VmDetailBody({
           <ActiveVmBadge vm={vm} className='text-[11px]' />
           <RuntimeChip vm={vm} className='text-[11px]' />
           <NodeChip nodeId={vm.node_id} className='text-[11px]' />
-          <StatusMark tone={accountStatus(vm)} variant='pill' />
+          {overload ? null : <StatusMark tone={accountStatus(vm)} variant='pill' />}
           {claudeTier(vm).key !== 'none' ? (
             <StatusMark tone={claudeTier(vm)} variant='pill' />
           ) : null}
@@ -478,6 +486,11 @@ function VmDetailBody({
             调度
             <SchedulableSwitch {...vmSchedulableProps(vm)} />
           </div>
+          {perms.recovery ? (
+            <Button size='sm' variant='outline' onClick={() => setRecoveryOpen(true)}>
+              诊断与恢复
+            </Button>
+          ) : null}
           {perms.power ? (
             <div className='ms-auto flex flex-wrap gap-2'>
               {vmRunning(vm) ? (
@@ -533,6 +546,9 @@ function VmDetailBody({
           onSave={(name) => saveName.mutate(name)}
           onSaveId={(nextId) => saveId.mutate(nextId)}
         />
+        {recoveryOpen ? (
+          <VmRecoveryDialog vm={vm} open={recoveryOpen} onOpenChange={setRecoveryOpen} />
+        ) : null}
         <Tabs value={tab} onValueChange={onTabChange}>
           <TabsList>
             <TabsTrigger value='overview'>概览</TabsTrigger>
@@ -702,8 +718,14 @@ function VmDetailBody({
                 onDelete={() => setConfirmDel(true)}
               />
               {tabs.includes('desktop') ? (
-                <TabsContent value='desktop' className='pt-4'>
-                  <VmDesktopCard vm={vm} />
+                // forceMount：桌面连接跨 tab 保活，配合账号 tab 可在授权与
+                // 桌面浏览器之间来回切换而不重连
+                <TabsContent
+                  value='desktop'
+                  forceMount
+                  className='pt-4 data-[state=inactive]:hidden'
+                >
+                  <VmDesktopCard vm={vm} active={tab === 'desktop'} />
                 </TabsContent>
               ) : null}
               <TabsContent value='seed' className='pt-4'>

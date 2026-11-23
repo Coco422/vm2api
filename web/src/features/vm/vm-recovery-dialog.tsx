@@ -173,6 +173,7 @@ export function VmRecoveryDialog({
         : 'var(--status-bad)'
   const pending = recover.isPending
   const busy = pending || diagnose.isFetching
+  const block = diagnosis?.recovery_block
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -228,7 +229,9 @@ export function VmRecoveryDialog({
             </p>
           ) : null}
           <p className='text-xs text-[color:var(--status-warn)]'>
-            恢复服务会中断该槽位正在进行的对话。
+            {block
+              ? `${block.message}${block.until ? ` · ${new Date(block.until).toLocaleString()}` : ''}`
+              : '恢复时会暂停接收新请求，等待在途请求结束后重启。'}
           </p>
         </div>
         <DialogFooter>
@@ -243,7 +246,7 @@ export function VmRecoveryDialog({
             重新检查
           </Button>
           <Button
-            disabled={!vmId || pending}
+            disabled={!vmId || busy || !diagnosis || Boolean(block)}
             loading={pending}
             onClick={() => recover.mutate(vmId)}
           >

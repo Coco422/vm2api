@@ -1,3 +1,4 @@
+import { tenantVmRecoveryBlock } from '../../company/tenant-vm-recovery.mjs'
 import { tenantTestKey } from '../../company/tenant-test.mjs'
 /**
  * /admin and /api/panel routes. Login / logout / me and { ok, data }
@@ -221,7 +222,11 @@ import {
   SESSION_SLOT_MIN,
   validateInferenceRoutingPatch,
 } from '../vm/slot-engine.mjs'
-import { telemetryDefaultEnabled, validateTelemetryRoutingPatch } from '../vm/native-telemetry.mjs'
+import {
+  telemetryDefaultEnabled,
+  telemetryDisableNonessentialTraffic,
+  validateTelemetryRoutingPatch,
+} from '../vm/native-telemetry.mjs'
 import { makeError, ErrorType, ErrorCode } from '../core/errors.mjs'
 import * as panel from './panel-api.mjs'
 import { GATEWAY_CAPABILITIES } from '../vm/execution-context.mjs'
@@ -320,6 +325,7 @@ import { assignComputerFingerprint } from '../identity/slot-computer.mjs'
 import { runFleetUpdate, fleetStatus } from '../vm/fleet-update.mjs'
 import {
   captureWrapSample,
+  cragTargetArch,
   describeWrapSample,
   makeWrapSample,
   materializeResolvedKernel,
@@ -347,6 +353,7 @@ import { restartRustKernel, syncClaudeKernelConfigs, writeKernelConfig } from '.
 
 import { countTokensViaWorker, syncClaudeClientCredentials } from '../transport/go-worker-client.mjs'
 import { apiKeyBetaHeader, setupTokenBetaHeader } from '../protocol/claude-code-betas.mjs'
+import { countTokensEnabled } from '../protocol/user-count-tokens.mjs'
 import { rustKernelHealth, toPublicKernelHealth } from '../transport/rust-kernel-client.mjs'
 import {
   activateCragLicense,
@@ -765,9 +772,25 @@ export function createPanelHandler(ctx) {
     readBody: ctx.readBody,
     proxyPool: () => ctx.proxyPool,
     terminal: ctx.geminiTerminal,
+    cragSubscription: ctx.geminiCragSubscription,
   })
   // A checkout can change under a live Node process; report its boot version.
   const runningVersion = readLocalVersion(ctx.cfg?.paths?.project)
+  const tenantRecoveryUntil = new Map()
+  const recoveryBlock = (vm) => {
+    const until = tenantRecoveryUntil.get(vm.id) || 0
+    if (until > Date.now())
+      return { code: 'recovery_cooldown', message: '该 VM 刚尝试过恢复，请稍后再试', until }
+    return tenantVmRecoveryBlock(vm, {
+      projectRoot: ctx.cfg.paths.project,
+      proxy: ctx.proxyPool?.getProxyForVm?.(vm.id),
+      availability: panel.vmRecoveryAvailability(vm, {
+        projectRoot: ctx.cfg.paths.project,
+        accountQuota: ctx.accountQuota,
+        routingConfig: ctx.routingConfig,
+      }),
+    })
+  }
   const kernelInstallJobs = new Map()
   const pruneKernelInstallJobs = () => {
     const now = Date.now()
@@ -3325,7 +3348,7 @@ export function createPanelHandler(ctx) {
           panel.ok({
             vm: normalizeVmConfig(ctx.routingConfig?.vm),
             kvm,
-            crag_supported: process.platform === 'linux' && process.arch === 'x64',
+            crag_supported: process.platform === 'linux' && cragTargetArch(cfg.paths.project) === 'amd64',
           }),
         )
       }
@@ -4287,6 +4310,8 @@ export function createPanelHandler(ctx) {
             : body.maxConcurrency
           const nextRpm = Object.prototype.hasOwnProperty.call(body || {}, 'max_rpm') ? body.max_rpm : body.maxRpm
           const hasMaxSessions = body && Object.prototype.hasOwnProperty.call(body, 'max_sessions')
+          const hasMaxPrimarySessions = body && Object.prototype.hasOwnProperty.call(body, 'max_primary_sessions')
+          const hasMaxSubagents = body && Object.prototype.hasOwnProperty.call(body, 'max_subagents_per_session')
           // Explicit null = drop the slot's pin and follow its tier / global default again.
           const inheritConc = body?.max_concurrency === null
           const inheritRpm = body?.max_rpm === null
@@ -4322,6 +4347,8 @@ export function createPanelHandler(ctx) {
             !inheritRpm &&
             !hasSessionSlots &&
             !hasMaxSessions &&
+            !hasMaxPrimarySessions &&
+            !hasMaxSubagents &&
             !hasQuotaOverride &&
             !hasModels &&
             !hasAuthScheme &&
@@ -4364,6 +4391,10 @@ export function createPanelHandler(ctx) {
             if (hasSessionSlots && body.session_slots !== null)
               strictInteger(body.session_slots, SESSION_SLOT_MIN, SESSION_SLOT_MAX, 'session_slots')
             if (hasMaxSessions && body.max_sessions !== null) strictInteger(body.max_sessions, 0, 256, 'max_sessions')
+            if (hasMaxPrimarySessions && body.max_primary_sessions !== null)
+              strictInteger(body.max_primary_sessions, 1, 20, 'max_primary_sessions')
+            if (hasMaxSubagents && body.max_subagents_per_session !== null)
+              strictInteger(body.max_subagents_per_session, 0, 20, 'max_subagents_per_session')
             // null puts the slot back on the default weight of 1
             if (hasWeight && body.weight !== null) strictInteger(body.weight, 1, 100, 'weight')
           } catch (error) {
@@ -4402,6 +4433,12 @@ export function createPanelHandler(ctx) {
             return json(res, 400, {
               ok: false,
               error: { code: 'claude_max_sessions_forbidden', message: 'Claude 槽不使用 OpenAI 会话容量上限' },
+            })
+          }
+          if ((hasMaxPrimarySessions || hasMaxSubagents) && isCodexVm(currentVm)) {
+            return json(res, 400, {
+              ok: false,
+              error: { code: 'gpt_family_limits_forbidden', message: 'GPT slots do not use Claude family limits' },
             })
           }
           if (hasAuthScheme && hostUnsupported(res, currentVm, 'auth_scheme')) return
@@ -4492,6 +4529,24 @@ export function createPanelHandler(ctx) {
               const vm = ctx.applyVmMaxSessions(id, body.max_sessions, { override: true })
               if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
             }
+          }
+          if (hasMaxPrimarySessions || hasMaxSubagents) {
+            const vm = patchVmRecord(cfg.paths.project, id, (record) => ({
+              policy: {
+                ...record.policy,
+                ...(hasMaxPrimarySessions && {
+                  maxPrimarySessions: body.max_primary_sessions,
+                  maxPrimarySessionsOverride: body.max_primary_sessions !== null,
+                }),
+                ...(hasMaxSubagents && {
+                  maxSubagentsPerSession: body.max_subagents_per_session,
+                  maxSubagentsPerSessionOverride: body.max_subagents_per_session !== null,
+                }),
+              },
+            }))
+            if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+            ctx.poolScheduler?.notifyCapacity?.()
+            ctx.poolScheduler?.signalChange?.()
           }
           if (parsedQuotaOverride) {
             const vm = applyVmQuotaOverride(id, keepTenantExactGates(currentVm.policy?.quota, parsedQuotaOverride.value))
@@ -4791,7 +4846,69 @@ export function createPanelHandler(ctx) {
         return json(res, 200, panel.ok(result))
       }
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/count-tokens$/.test(p)) {
-        return json(res, 404, { ok: false, error: { code: 'not_found', message: 'not found' } })
+        // Same switch as the public entry. `ctx.routingConfig` is a getter on the live
+        // object, so flipping it in the panel takes effect without a restart.
+        if (!countTokensEnabled(ctx.routingConfig))
+          return json(res, 404, { ok: false, error: { code: 'not_found', message: 'not found' } })
+        const id = p.split('/')[4]
+        const vm = getVm(cfg.paths.project, id)
+        if (!vm) return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'vm not found' } })
+        const mode = credentialModeOfVm(vm)
+        if (!isAnySetupTokenMode(mode) && !isApiKeyMode(mode)) {
+          return json(res, 400, {
+            ok: false,
+            error: {
+              code: 'count_tokens_unsupported',
+              message: 'count_tokens 只支持 Setup Token / Console API Key，完整 OAuth 走 Claude Code Messages usage',
+            },
+          })
+        }
+        const exec = workerExecForVm(id)
+        if (!exec) return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'vm not found' } })
+        const reqBody = await readBody(req, 256 * 1024).catch(() => ({}))
+        const model = String(reqBody.model || reqBody.model_id || '').trim()
+        const messages = Array.isArray(reqBody.messages) ? reqBody.messages : null
+        if (!model || !messages?.length) {
+          return json(res, 400, {
+            ok: false,
+            error: { code: 'invalid_request', message: 'model 与 messages 必填' },
+          })
+        }
+        const anthropicBody = { model, messages }
+        if (reqBody.system != null) anthropicBody.system = reqBody.system
+        if (Array.isArray(reqBody.tools)) anthropicBody.tools = reqBody.tools
+        const hop = await countTokensViaWorker(exec, {
+          body: anthropicBody,
+          headers: {
+            'user-agent': 'kin-inference/1.0',
+            'anthropic-version': '2023-06-01',
+            'anthropic-beta': isApiKeyMode(mode) ? apiKeyBetaHeader('') : setupTokenBetaHeader(model),
+          },
+          timeoutMs: Math.min(Math.max(Number(reqBody.timeout_ms || reqBody.timeoutMs) || 45000, 5000), 120000),
+        })
+        if (!hop.ok) {
+          const err = hop.body?.error || {}
+          return json(res, hop.status || 502, {
+            ok: false,
+            error: {
+              code: err.code || 'count_tokens_failed',
+              message: err.message || 'count_tokens 失败',
+              type: err.type || undefined,
+            },
+          })
+        }
+        return json(
+          res,
+          200,
+          panel.ok({
+            vm_id: id,
+            model,
+            credential_mode: mode,
+            input_tokens: Number(hop.body?.input_tokens) || 0,
+            usage: hop.body || null,
+            via: hop.via,
+          }),
+        )
       }
       // GET /api/panel/test-models — models available for test dropdown
       if (req.method === 'GET' && p === '/api/panel/test-models') {
@@ -5263,7 +5380,9 @@ export function createPanelHandler(ctx) {
         const payload = {
           vm_id: id,
           seed_policy,
-          ...seedTelemetryContract(seed_policy),
+          ...seedTelemetryContract(seed_policy, {
+            disableNonessentialTraffic: telemetryDisableNonessentialTraffic(ctx.routingConfig),
+          }),
           ...observed,
         }
         if (debug) {
@@ -5401,6 +5520,7 @@ export function createPanelHandler(ctx) {
                   existingSettings:
                     existing.files['settings.json'] === null ? {} : JSON.parse(existing.files['settings.json']),
                   replaceEnv: Object.hasOwn(body, 'extra_env') || Object.hasOwn(body, 'settings_json_override'),
+                  routing: ctx.routingConfig,
                 })
                 outcome.wrote = outcome.seed.wrote === true
                 const result = await host.syncSeed(fresh, path.join(cfg.paths.project, 'vms', id))
@@ -5427,7 +5547,9 @@ export function createPanelHandler(ctx) {
           const data = {
             vm_id: id,
             seed_policy: next,
-            ...seedTelemetryContract(next),
+            ...seedTelemetryContract(next, {
+              disableNonessentialTraffic: telemetryDisableNonessentialTraffic(ctx.routingConfig),
+            }),
             saved: true,
             published: service.published === true,
             applied: service.applied === true,
@@ -5736,7 +5858,7 @@ export function createPanelHandler(ctx) {
         const placementPolicy = normalizeAutoPlacement(ctx.routingConfig?.cluster?.auto_placement)
         const wanted = requestedPlacement(body, placementPolicy)
         const exitPinsHost = typeof body.proxy_id === 'string' && isLocalEgressId(body.proxy_id.trim())
-        const localCragSupported = process.platform === 'linux' && process.arch === 'x64'
+        const localCragSupported = process.platform === 'linux' && cragTargetArch(cfg.paths.project) === 'amd64'
         const cragCapableNodes = new Set()
         if (wanted.mode === 'auto' && ident.role === 'admin' && runtime !== RUNTIME_KVM && !exitPinsHost) {
           const picked = await (ctx.pickPlacement || pickPlacement)({
@@ -6183,18 +6305,40 @@ export function createPanelHandler(ctx) {
       if (req.method === 'GET' && /^\/api\/panel\/vms\/[^/]+\/diagnose$/.test(p)) {
         const vm = getVm(cfg.paths.project, p.split('/')[4])
         if (!vm) return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'vm not found' } })
-        const diagnosis = await diagnoseSlotServices(vm, {
+        const tenant = panelIdentity(req).role === 'user'
+        if (tenant && !req.panelUserId)
+          return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'vm not found' } })
+        const diagnosis = await (ctx.kernelRecoveryOps?.diagnose || diagnoseSlotServices)(vm, {
           projectRoot: cfg.paths.project,
           routing: ctx.routingConfig,
           watchdog: ctx.kernelWatchdog,
           internal: panelIdentity(req).role === 'admin',
         })
+        if (tenant) {
+          if (userMissesVmId(req, cfg.paths.project, vm.id))
+            return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'vm not found' } })
+          const current = getVm(cfg.paths.project, vm.id)
+          diagnosis.recovery_block = recoveryBlock(current)
+          diagnosis.checks = diagnosis.checks.map(({ detail, ...check }) => check)
+        }
         return json(res, 200, panel.ok(diagnosis))
       }
       // POST /api/panel/vms/:id/recover — power cycle (stop → start) plus a fresh diagnosis
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/recover$/.test(p)) {
         const id = p.split('/')[4]
+        const tenant = panelIdentity(req).role === 'user'
         const recovered = await withVmLock(path.join(cfg.paths.project, 'vms', `${id}.json`), async () => {
+          if (tenant) {
+            if (!req.panelUserId || userMissesVmId(req, cfg.paths.project, id))
+              return { ok: false, status: 404, code: 'vm_not_found', error: 'vm not found' }
+            const block = recoveryBlock(getVm(cfg.paths.project, id))
+            if (block)
+              return { ok: false, status: block.code === 'recovery_cooldown' ? 429 : 409, code: block.code, error: block.message }
+            const now = Date.now()
+            for (const [vmId, until] of tenantRecoveryUntil) if (until <= now) tenantRecoveryUntil.delete(vmId)
+            tenantRecoveryUntil.set(id, now + 10 * 60_000)
+            console.info('[tenant-recovery] requested vm=%s user=%s', id, req.panelUserId)
+          }
           const result = await recoverSlot({
             projectRoot: cfg.paths.project,
             id,
@@ -6205,11 +6349,20 @@ export function createPanelHandler(ctx) {
             poolScheduler: ctx.poolScheduler,
             internal: panelIdentity(req).role === 'admin',
             ops: ctx.kernelRecoveryOps,
+            keepProxy: tenant,
           })
           // Recovery returns outer ok even when a boot/readiness/diagnosis step failed.
           if (result.ok && result.report?.ok === true) {
             panel.resetVmCircuit({ cfg, poolScheduler: ctx.poolScheduler, id })
-            releaseKernelInstallSafetyHold(cfg.paths.project, id, ctx.kernelWatchdog)
+            if (!tenant) releaseKernelInstallSafetyHold(cfg.paths.project, id, ctx.kernelWatchdog)
+          }
+          if (tenant) {
+            console.info('[tenant-recovery] completed vm=%s user=%s ok=%s', id, req.panelUserId, result.report?.ok === true)
+          }
+          if (tenant && result.report?.diagnosis) {
+            const diagnosis = result.report.diagnosis
+            diagnosis.recovery_block = recoveryBlock(getVm(cfg.paths.project, id))
+            diagnosis.checks = diagnosis.checks.map(({ detail, ...check }) => check)
           }
           return result
         })

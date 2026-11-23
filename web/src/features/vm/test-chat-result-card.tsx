@@ -205,7 +205,7 @@ export function TestChatResultCard({
             {causeLine ? (
               <p className='text-xs text-muted-foreground'>{causeLine}</p>
             ) : null}
-            {perms.credential && vm ? (
+            {perms.recovery && vm ? (
               <Button
                 size='sm'
                 variant='outline'

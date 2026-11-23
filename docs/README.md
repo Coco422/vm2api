@@ -2,6 +2,7 @@
 
 - [PRODUCTION_STATUS.md](PRODUCTION_STATUS.md) — 当前定制生产状态、本地工作目录、主控/worker与VM规模、镜像和189备份核验快照；接手先读
 - [DISASTER_RECOVERY.md](DISASTER_RECOVERY.md) — 从189恢复主控或单台worker的操作手册、验收及分场景耗时
+- [双主控生产交接](ROLLING_GATEWAY.md#生产日常交接) · [发布验收门禁](ROLLING_GATEWAY_RELEASE_GATE.md#现网切换门禁) — 切前名单、排空、切后验收与同库回退
 - [CONTROL_MIGRATION_PLAN.md](CONTROL_MIGRATION_PLAN.md) — 旧主控到期前迁入新134节点的计划、同机worker容量与切换/回退边界；尚未执行
 - [DEPLOY.md](DEPLOY.md) — 安装与升级（含 `deploy/install.sh` 一键安装 / 更新）
 - [托管节点内核排障与验收](managed-kernel-troubleshooting.md) — CRAG 缺包、控制面连接、单槽重装、Claude 版本与账号状态的分层检查

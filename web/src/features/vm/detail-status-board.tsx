@@ -20,6 +20,7 @@ import { isCodexVm } from '@/lib/vm-kind'
 import {
   accountStatus,
   accountUsable,
+  overloadCooldown,
   poolStatus,
   proxyNamedLabel,
   restrictionCopy,
@@ -231,6 +232,8 @@ export function VmStatusBoard(props: Props) {
       : live5
   const spend7 = formatWindowSpend(cost7, vm.estimate_7d)
   const spendFable = formatWindowSpend(fableCost, vm.estimate_fable)
+  const overload = overloadCooldown(vm, now)
+  const restrictionUntil = overload?.until || restrictionUntilOf(vm)
   const telemetry = kernel?.telemetry
   const topology = kernel?.process_topology
   const route = kernelRouteLabel(
@@ -249,18 +252,24 @@ export function VmStatusBoard(props: Props) {
           <div className='flex items-start justify-between gap-3'>
             <div className='min-w-0'>
               <h2 className='text-lg leading-none font-semibold'>现状</h2>
-              <p className='mt-1.5 text-xs text-muted-foreground'>
-                {verdict.notes.length
-                  ? verdict.notes.join(' · ')
-                  : '这槽现在可以接推理'}
-              </p>
+              {overload ? null : (
+                <p className='mt-1.5 text-xs text-muted-foreground'>
+                  {verdict.notes.length
+                    ? verdict.notes.join(' · ')
+                    : '这槽现在可以接推理'}
+                </p>
+              )}
             </div>
-            <StatusMark tone={verdict.tone} variant='pill' />
+            {overload ? null : <StatusMark tone={verdict.tone} variant='pill' />}
           </div>
           <div className='mt-4 flex flex-wrap items-center gap-1.5'>
             {isCodexVm(vm) ? <OpenaiPlanBadge vm={vm} size='sm' /> : null}
-            <StatusMark tone={accountStatus(vm)} variant='pill' />
-            <StatusMark tone={poolStatus(vm)} variant='pill' />
+            {overload ? null : (
+              <>
+                <StatusMark tone={accountStatus(vm)} variant='pill' />
+                <StatusMark tone={poolStatus(vm)} variant='pill' />
+              </>
+            )}
             {revealProxy ? (
               <StatusMark tone={proxyH.tone} variant='pill' />
             ) : (
@@ -310,15 +319,17 @@ export function VmStatusBoard(props: Props) {
             <Field label='调度状态' compact>
               {scheduleStateLabel(vm)}
             </Field>
-            <Field label='限制至' compact>
-              {restrictionUntilOf(vm) ? (
-                <ResetAt value={restrictionUntilOf(vm)} now={now} />
+            <Field label={overload ? '预计恢复' : '限制至'} compact>
+              {overload && (!overload.until || overload.until <= now) ? (
+                overload.timing
+              ) : restrictionUntil ? (
+                <ResetAt value={restrictionUntil} now={now} />
               ) : (
                 '—'
               )}
             </Field>
-            <Field label='冷却' compact>
-              {restrictionCopy(vm)}
+            <Field label={overload ? '冷却原因' : '冷却'} compact>
+              {overload?.reason || restrictionCopy(vm)}
             </Field>
             <CircuitField vm={vm} now={now} />
           </div>

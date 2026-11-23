@@ -27,14 +27,29 @@ const full: ResetCredit = {
   clears: ['five_hour', 'seven_day', 'seven_day_overage_included'],
 }
 
+const now = Date.parse('2026-11-13T07:26:00Z')
+
 describe('claude reset cards', () => {
-  it('counts held cards and ignores ones upstream withholds', () => {
+  it('includes a temporarily unavailable card missing from the cached held count', () => {
     const withheld = { ...full, state: 'unavailable' as const }
-    const snapshot: ResetSnapshot = { credits: [fable, withheld] }
-    expect(shownCredits(snapshot)).toEqual([fable])
-    expect(claudeResetCount(snapshot)).toBe(1)
-    expect(claudeResetCount({ ...snapshot, held_count: 3 })).toBe(3)
-    expect(claudeResetCount(null)).toBe(0)
+    const snapshot: ResetSnapshot = {
+      credits: [fable, withheld],
+      held_count: 1,
+    }
+    expect(shownCredits(snapshot, now)).toEqual([fable, withheld])
+    expect(claudeResetCount(snapshot, now)).toBe(2)
+    expect(claudeResetCount({ held_count: 3 }, now)).toBe(3)
+    expect(claudeResetCount(null, now)).toBe(0)
+  })
+
+  it('omits expired and exhausted cards from a cached snapshot', () => {
+    const snapshot = {
+      credits: [fable, full, { ...full, ref: 'spent', resets_left: 0 }],
+      held_count: 2,
+    }
+    const expiry = Date.parse(fable.expires_at!)
+    expect(shownCredits(snapshot, expiry)).toEqual([full])
+    expect(claudeResetCount(snapshot, expiry)).toBe(1)
   })
 
   it('keeps the old count for snapshots saved before card refs', () => {
@@ -46,7 +61,7 @@ describe('claude reset cards', () => {
       ],
     }
     expect(claudeResetCount(legacy)).toBe(1)
-    expect(shownCredits(legacy)).toEqual([])
+    expect(shownCredits(legacy, now)).toEqual([])
   })
 
   it('offers a cooling card again once the cooldown has passed', () => {

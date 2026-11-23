@@ -8,6 +8,7 @@ import { attachPanelAuth, extractPanelToken, verifyPanelSession } from '../src/l
 import { applyOnboardingAction } from '../src/lib/admin/onboarding.mjs'
 import { createRoutingRuntime } from '../src/lib/admin/routing-runtime.mjs'
 import { buildVmDetail } from '../src/lib/admin/panel-api.mjs'
+import { denyIfUserMissesVm } from '../src/lib/admin/panel-tenant.mjs'
 
 export const LOCAL_ADMIN = { username: 'localadmin', password: 'local-admin-8791' }
 
@@ -37,6 +38,9 @@ export function createSandboxPanel({ db, project, accountQuota, apiKeyStore, jso
     snapshot: () => ({ proxies: [], config: {}, total: 0 }),
     panelSnapshot: () => ({ proxies: [], config: {}, totals: { total: 0 } }),
     publicProxy: (proxy) => ({ id: proxy.id }),
+    getProxyForVm: (id) => ['alice-vm', 'bob-vm', 'alice-recovery-vm'].includes(id)
+      ? { id: `fixture-proxy-${id}` }
+      : null,
   }
   const requestLog = new RequestLogStore({ db, dataDir: path.join(project, 'data') })
   const bodies = new WeakMap()
@@ -59,6 +63,35 @@ export function createSandboxPanel({ db, project, accountQuota, apiKeyStore, jso
     })
     return true
   }
+  const recovered = new Set()
+  const kernelRecoveryOps = {
+    cluster: () => null,
+    settleMs: 0,
+    stopSlot: async () => ({ ok: true }),
+    powerOn: async ({ id }) => {
+      recovered.add(id)
+      record('sandbox-recovery', { vm_id: id })
+      return { ok: true }
+    },
+    diagnose: async (vm) => {
+      const fault = vm.id === 'alice-recovery-vm' && !recovered.has(vm.id) && Boolean(vm.unschedulable)
+      return {
+        vm_id: vm.id,
+        checked_at: new Date().toISOString(),
+        ok: !fault,
+        engine: 'rust',
+        placement: 'local',
+        first_failure: fault ? 'kernel' : null,
+        checks: [{
+          id: 'kernel',
+          label: '推理内核',
+          status: fault ? 'error' : 'ok',
+          code: fault ? 'kernel_down' : null,
+          message: fault ? '合成示例：槽内运行时异常' : '合成示例：推理内核已就绪',
+        }],
+      }
+    },
+  }
   const context = {
     cfg,
     routingConfig,
@@ -71,17 +104,18 @@ export function createSandboxPanel({ db, project, accountQuota, apiKeyStore, jso
     proxyPool,
     requestLog,
     stats: {},
+    kernelRecoveryOps,
     poolScheduler: { snapshot: () => ({}) },
     stickyRouter: { stats: () => ({ active_sessions: 0 }) },
   }
   const original = createPanelHandler(context)
   const runtime = createRoutingRuntime(context)
   context.applyVmQuotaOverride = runtime.applyVmQuotaOverride
-  const detail = async (id) =>
+  const detail = async (id, role) =>
     buildVmDetail({
       ...context,
       id,
-      role: 'admin',
+      role,
       kernelHealth: async () => ({ rust: { reachable: false, error_code: 'local_fixture' } }),
       slotProcessStatus: async () => ({ telemetry: { enabled: false, running: false }, process_topology: null }),
     })
@@ -97,15 +131,18 @@ export function createSandboxPanel({ db, project, accountQuota, apiKeyStore, jso
     '/api/panel/usage',
     '/api/panel/routing',
     '/api/panel/version',
+    '/api/panel/statistics',
+    '/api/panel/statistics/leaderboard',
+    '/api/panel/usage-logs/overview',
   ])
   const originalAllowed = (method, p) =>
-    (method === 'GET' && (exactRead.has(p) || /^\/api\/panel\/api-keys\/[^/]+\/stats$/.test(p))) ||
+    (method === 'GET' && (exactRead.has(p) || /^\/api\/panel\/api-keys\/[^/]+\/stats$/.test(p) || /^\/api\/panel\/vms\/[^/]+\/diagnose$/.test(p))) ||
     (method === 'POST' &&
       (p === '/api/panel/login' ||
         p === '/api/panel/logout' ||
         p === '/api/panel/users' ||
         p === '/api/panel/api-keys' ||
-        /^\/api\/panel\/vms\/[^/]+\/schedulable$/.test(p) ||
+        /^\/api\/panel\/vms\/[^/]+\/(?:schedulable|recover)$/.test(p) ||
         /^\/api\/panel\/api-keys\/[^/]+\/(reveal|rotate|reset-quota)$/.test(p))) ||
     (method === 'PATCH' && /^\/api\/panel\/(me|users\/[^/]+|api-keys\/[^/]+|vms\/[^/]+\/(owner|quota-thresholds))$/.test(p)) ||
     (method === 'PUT' && p === '/api/panel/onboarding')
@@ -122,13 +159,23 @@ export function createSandboxPanel({ db, project, accountQuota, apiKeyStore, jso
       )
       return true
     }
+    if (p === '/api/panel/statistics/vm-batches' && req.method === 'GET')
+      return json(res, 200, {
+        ok: true,
+        data: [
+          { batch: '演示第一批', started: 3, active: 2, stopped: 1, medianSurvivalDays: 8.2 },
+          { batch: '演示第二批', started: 1, active: 1, stopped: 0, medianSurvivalDays: null },
+        ],
+      })
     if (p === '/api/panel/cluster/nodes' && req.method === 'GET')
       return json(res, 200, { ok: true, data: { items: [] } })
     if (p === '/api/panel/test-models' && req.method === 'GET')
       return json(res, 200, { ok: true, data: { models: [] } })
     const vm = p.match(/^\/api\/panel\/vms\/([^/]+)$/)
     if (vm && (req.method === 'GET' || req.method === 'PATCH')) {
+      if (denyIfUserMissesVm(req, res, { projectRoot: project, json, path: p })) return true
       if (req.method === 'PATCH') {
+        if (req.panelRole !== 'admin') return json(res, 403, { ok: false, error: { code: 'forbidden' } })
         const body = await read(req, 8192)
         const fields = ['max_concurrency', 'max_rpm', 'session_slots']
         if (!Object.keys(body).length || Object.keys(body).some((key) => !fields.includes(key)))
@@ -158,7 +205,7 @@ export function createSandboxPanel({ db, project, accountQuota, apiKeyStore, jso
         }
         record('sandbox-vm-policy', { vm_id: vm[1], fields: Object.keys(body) })
       }
-      const result = await detail(vm[1])
+      const result = await detail(vm[1], req.panelRole)
       return result.status ? json(res, result.status, result.body) : json(res, 200, result)
     }
     if (!originalAllowed(req.method, p)) {

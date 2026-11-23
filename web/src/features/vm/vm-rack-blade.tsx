@@ -8,11 +8,16 @@ import type { UsageAccountRow } from '@/types/panel-usage'
 import type { Vm } from '@/types/panel-vm'
 import { Download, LifeBuoy, Link2, RefreshCw } from 'lucide-react'
 import { fmtAgo, fmtNum, fmtUsd } from '@/lib/format'
+import {
+  geminiAccountStatus,
+  geminiInferenceErrorLabel,
+} from '@/lib/gemini-account-status'
 import { tierVisual } from '@/lib/tier-visual'
 import { cn } from '@/lib/utils'
 import {
   claudeTier,
   credentialStatus,
+  overloadCooldown,
   poolStatus,
   restrictionCopy,
   seatTitle,
@@ -125,26 +130,48 @@ export function BladeControls({
 export function GeminiSlotStatus({ vm }: { vm: Vm }) {
   const environment = vm.gemini
   if (!environment) return null
-  const labels = {
-    authorized: '已授权',
-    authorizing: '等待 Google 授权',
-    unverified: '未授权',
-    reauth_required: '需要重新授权',
-    disabled: '已停用',
-  }
-  const detail =
-    environment.auth_state === 'authorized' ? vm.unschedulable_text : null
-  const tone =
-    environment.auth_state === 'authorized'
-      ? { key: 'ok', cls: 'ok' as const, text: labels.authorized }
-      : poolStatus(vm)
+  const status = geminiAccountStatus(environment, vm.unschedulable_text)
+  const { authorization, blocker, inference, lastInference, modelsLabel } =
+    status
+  const at = lastInference?.finished_at ?? lastInference?.started_at
+  const age = at ? fmtAgo(at) : ''
   return (
-    <span className='flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground'>
-      <StatusMark
-        variant='pill'
-        tone={{ ...tone, label: labels[environment.auth_state] }}
-      />
-      {detail ? <span>{detail}</span> : null}
+    <span className='grid min-w-0 gap-1 text-xs whitespace-normal text-muted-foreground'>
+      <span className='flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1'>
+        <StatusMark variant='pill' tone={authorization} />
+        <span>{modelsLabel}</span>
+      </span>
+      {blocker ? (
+        <span className='text-[color:var(--status-caution)]'>{blocker}</span>
+      ) : environment.auth_state === 'authorized' ? (
+        <span className='flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1'>
+          <span>候选条件已满足</span>
+          {status.tone.key === 'pending' ? (
+            <StatusMark variant='pill' tone={status.tone} />
+          ) : null}
+        </span>
+      ) : null}
+      <span
+        className='flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1'
+        title='仅显示最近一次宿主推理，不代表公共 API 端到端验证'
+      >
+        {lastInference ? (
+          <>
+            <StatusMark variant='pill' tone={inference} />
+            <span className='min-w-0 break-all'>{lastInference.model}</span>
+            {at ? (
+              <time dateTime={at} title={at}>
+                {age || at}
+              </time>
+            ) : null}
+            {lastInference.state === 'failed' ? (
+              <span>{geminiInferenceErrorLabel(lastInference.error_code)}</span>
+            ) : null}
+          </>
+        ) : (
+          <span>{inference.text}</span>
+        )}
+      </span>
     </span>
   )
 }
@@ -308,7 +335,7 @@ export function BladeCallout({
         title={`${credentialStatus(vm).text || '无效凭证'}${ago ? ` · ${ago}` : ''}`}
         action={
           fixByService ? (
-            perms.power ? (
+            perms.recovery ? (
               <CalloutAction
                 icon={<LifeBuoy />}
                 onClick={() => actions.openRecovery(vm)}
@@ -431,6 +458,7 @@ export const VmBlade = memo(function VmBlade({
   const state = bladeState(vm)
   const large = size === 'l'
   const restricted = zoneOf(vm) === 'restricted'
+  const overload = overloadCooldown(vm, now)
   return (
     <article
       role='button'
@@ -461,6 +489,11 @@ export const VmBlade = memo(function VmBlade({
               label: restrictionCopy(vm) || poolStatus(vm).text,
             }}
           />
+        ) : null}
+        {overload ? (
+          <span className='col-span-2 text-xs text-muted-foreground' title={overload.reason}>
+            {overload.timing}
+          </span>
         ) : null}
       </div>
       <ProxyChip vm={vm} className='min-w-0 justify-self-start' />

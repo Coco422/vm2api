@@ -15,6 +15,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { loadConfig, reloadActiveVm, routingConfigFile } from './lib/core/config.mjs'
+import { createGeminiCragSubscription } from './lib/gemini/subscription.mjs'
 import { createGeminiScheduler } from './lib/gemini/scheduler.mjs'
 import {
   createGeminiPublicHandler,
@@ -116,11 +117,18 @@ import {
 import {
   PROACTIVE_REFRESH_SKEW_MS,
   classifyCredentialRefresh,
+  clearUpgradeRequired,
   markVmRefreshError,
+  refreshErrorCodeOf,
   mirrorWorkerCredentialsToVm,
+  stripWorkerCredentialEmail,
 } from './lib/oauth/oauth-credentials.mjs'
 import { normalizeCredentialMode } from './lib/oauth/credential-mode.mjs'
-import { ensureWorkerCredential, repairLocalCredentialLink } from './lib/transport/go-worker-client.mjs'
+import {
+  ensureWorkerCredential,
+  probeWorkerAttemptGuard,
+  repairLocalCredentialLink,
+} from './lib/transport/go-worker-client.mjs'
 import { stopAllRustKernels } from './lib/transport/rust-kernel-supervisor.mjs'
 import { createRespond, parseRequestUrl } from './lib/http/respond.mjs'
 import { corsHeadersForRequest } from './lib/http/cors.mjs'
@@ -130,7 +138,7 @@ import { createRoutingRuntime } from './lib/admin/routing-runtime.mjs'
 import { createImportCommit } from './lib/oauth/import-commit.mjs'
 import { createHandleProtocol } from './lib/protocol/handle-protocol.mjs'
 import { createResponsesWsHandler } from './lib/protocol/responses-ws.mjs'
-import { handleUserUsage } from './lib/protocol/user-count-tokens.mjs'
+import { countTokensEnabled, handleUserCountTokens, handleUserUsage } from './lib/protocol/user-count-tokens.mjs'
 import { createKeySelfHandler, KEY_SELF_PATHS } from './lib/protocol/key-self.mjs'
 import { createPanelHandler, syncInstalledKernels } from './lib/admin/panel-routes.mjs'
 import { createCragShopHandler, isCragShopPath, sessionBuyerOwner } from './lib/admin/crag-shop.mjs'
@@ -147,6 +155,13 @@ const FEATURES = [
   'api-direct-kernel',
   'account_usage',
 ]
+/** FEATURES for a request, which is the only place the count_tokens switch can be read.
+ *
+ * `pub` below is written to config/gateway-v2.public.json once at startup, so it keeps
+ * the static list: a file produced at boot cannot describe a switch the operator flips
+ * at runtime, and advertising either answer there would be wrong half the time.
+ */
+const featuresNow = () => (countTokensEnabled(routingConfig) ? [...FEATURES, 'count_tokens'] : FEATURES)
 const LIMITATIONS = {
   client_tools: 'kept in native Messages and executed by the caller',
   images: 'all native Messages image blocks are forwarded by the Go slot worker',
@@ -564,6 +579,15 @@ credentialRefreshMonitor = createCredentialRefreshMonitor({
       } catch {}
       return { ...vm, last_probe: lastProbe }
     }),
+  reviveOne: async (vm) => {
+    const vmPath = path.join(cfg.paths.project, 'vms', `${vm.id}.json`)
+    const homeDir = path.join(cfg.paths.project, 'vms', vm.id, 'cli-home')
+    const exec = { vmId: vm.id, vmPath, homeDir, vm: getVm(cfg.paths.project, vm.id) || vm }
+    if (!(await probeWorkerAttemptGuard(exec))) return { revived: false }
+    const cleared = clearUpgradeRequired(vmPath)
+    if (cleared) invalidateLiveCredentialCache()
+    return { revived: cleared }
+  },
   refreshOne: (vm) =>
     refreshWorkerCredentialForVm({
       vmId: vm.id,
@@ -735,14 +759,20 @@ function publicCredentialRefreshResult(vmId, result, { force = false } = {}) {
     },
   }
   if (!result?.ok) {
+    const derived = refreshErrorCodeOf(result)
+    const code = derived === 'worker_upgrade_required' ? derived : result?.error?.code || 'credential_refresh_failed'
     out.error = {
-      code: result?.error?.code || 'credential_refresh_failed',
+      code,
       message:
-        refreshClass === 'fatal'
-          ? 'OAuth credential was rejected'
-          : refreshClass === 'retryable'
-            ? 'OAuth credential refresh is temporarily unavailable'
-            : 'OAuth credential refresh failed',
+        code === 'refresh_outcome_unknown'
+          ? 'An earlier refresh with this credential has no recorded result; re-authorize the slot'
+          : code === 'worker_upgrade_required'
+            ? 'The slot worker cannot guard refresh retries; update kin-worker on this node'
+            : refreshClass === 'fatal'
+              ? 'OAuth credential was rejected'
+              : refreshClass === 'retryable'
+                ? 'OAuth credential refresh is temporarily unavailable'
+                : 'OAuth credential refresh failed',
     }
   }
   return out
@@ -976,6 +1006,14 @@ cliNodeGuard = createCliNodeGuard({
   listTargets: () => listVms(cfg.paths.project),
   liveTokens: () => slotShell.liveShellTokens?.() || [],
 })
+for (const vm of listVms(cfg.paths.project)) {
+  if (isCodexVm(vm)) continue
+  try {
+    stripWorkerCredentialEmail(path.join(cfg.paths.project, 'vms', vm.id, 'cli-home'))
+  } catch (error) {
+    console.warn('[credential-email-strip]', vm.id, error?.message || error)
+  }
+}
 
 const listCragTargets = () =>
   listVms(cfg.paths.project)
@@ -1031,6 +1069,15 @@ const handleCragShop = createCragShopHandler({
   activationEnabled: cragShopActivationEnabled,
 })
 
+// Runtime CRAGGemini trust root: uses KIN_GEMINI_PUBLIC_KEY_FILE when configured for
+// authority rotation, otherwise verifies against the SHA-256 pin in deploy/payload.json
+// (never self-attesting from share/gemini/current).
+const geminiCragSubscription = createGeminiCragSubscription({
+  projectRoot: cfg.paths.project,
+  dataDir: cfg.paths.data,
+  publicKeyFile: process.env.KIN_GEMINI_PUBLIC_KEY_FILE || null,
+  callHost: callGeminiHost,
+})
 const geminiTerminal = createGeminiTerminal({ proxyPool: () => proxyPool })
 const geminiScheduler = createGeminiScheduler({
   callHost: callGeminiHost,
@@ -1038,11 +1085,13 @@ const geminiScheduler = createGeminiScheduler({
   poolScheduler,
   apiKeyStore,
   groupsRepo: { rateMultiplier: (id) => groupsRepo.rateMultiplier(id) },
+  cragSubscription: geminiCragSubscription,
 })
 const handleGeminiPublic = createGeminiPublicHandler({ json, readBody, scheduler: geminiScheduler })
 const handlePanel = createPanelHandler({
   getDb,
   cragSubscription,
+  geminiCragSubscription,
   handleCragShop,
   json,
   writeSSEHeaders,
@@ -1211,7 +1260,11 @@ async function serveRequest(req, res) {
 
     if (
       backupService.isRestoring &&
-      (p.startsWith('/v1/') || p === '/messages' || p === '/chat/completions' || p === '/responses')
+      (p.startsWith('/v1/') ||
+        p.startsWith('/v1beta/') ||
+        p === '/messages' ||
+        p === '/chat/completions' ||
+        p === '/responses')
     ) {
       return json(
         res,
@@ -1256,7 +1309,7 @@ async function serveRequest(req, res) {
         rewrite: cfg.rewrite.enabled ? 'on' : 'off',
         intercept_rules: cfg.intercept.rules.length,
         active_vm: getActiveVmId(cfg.paths.project),
-        features: FEATURES,
+        features: featuresNow(),
         capabilities: GATEWAY_CAPABILITIES,
         limitations: LIMITATIONS,
         stats,
@@ -1272,7 +1325,7 @@ async function serveRequest(req, res) {
       return json(res, 200, {
         base_url: cfg.base_url,
         rewrite_default: cfg.rewrite.enabled,
-        features: FEATURES,
+        features: featuresNow(),
         capabilities: GATEWAY_CAPABILITIES,
         limitations: LIMITATIONS,
         endpoints: {
@@ -1319,7 +1372,20 @@ async function serveRequest(req, res) {
       return await handleKeySelf(req, res, url)
     }
     if (req.method === 'POST' && (p === '/v1/messages/count_tokens' || p === '/messages/count_tokens')) {
-      return json(res, 404, { error: { message: 'not found: ' + p } })
+      // Off by default: the handler and its Go-worker hop were kept when 94b6f728
+      // stubbed this entry, so the switch only decides whether to reach them.
+      if (!countTokensEnabled(routingConfig)) return json(res, 404, { error: { message: 'not found: ' + p } })
+      return await handleUserCountTokens(req, res, {
+        json,
+        readBody,
+        requireAuth,
+        apiKeyStore,
+        cfg,
+        stickyRouter,
+        accountQuota,
+        getPoolScheduler: () => poolScheduler,
+        getRoutingConfig: () => routingConfig,
+      })
     }
 
     if (isGeminiPublicPath(p)) {

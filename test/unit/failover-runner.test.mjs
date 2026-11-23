@@ -5,8 +5,10 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
+import { UnitCircuit } from '../../src/lib/pool/unit-circuit.mjs'
 import { resolveOutboundSessionId } from '../../src/lib/identity/identity-rewrite.mjs'
 import { prepareCragPrintBody } from '../../src/lib/protocol/crag-print-prompt.mjs'
+import { dispatchCallInference } from '../../src/lib/transport/kernel-router.mjs'
 
 class Scheduler {
   constructor(candidates) {
@@ -2648,6 +2650,80 @@ test('keep_session_home: a home kernel with no free slot is retried instead of s
   assert.deepEqual(seen, ['account-1', 'account-1', 'account-1'])
 })
 
+test('keep_session_home with allowQueue:false: a home kernel with no free slot answers 529 at once', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const runner = new FailoverRunner({
+    scheduler,
+    stickyRouter: pinnedStickyRouter(),
+    // A real wait would show up as a slow test; the old path slept and retried home.
+    config: { same_account_retry_delay_ms: 0, home_slot_busy_retry_ms: 60000, keep_session_home: true },
+  })
+  const seen = []
+  const startedAt = Date.now()
+  const result = await runner.run({
+    requestId: 'req-home-slot-busy-no-queue',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    model: 'claude-sonnet-test',
+    stickyKey: 'sess:home',
+    allowQueue: false,
+    callAttempt: ({ candidate: selected }) => {
+      seen.push(selected.accountId)
+      return {
+        ok: false,
+        status: 503,
+        upstreamExecutions: 0,
+        body: { error: { type: 'api_error', code: 'slot_busy', message: 'no free slot' } },
+      }
+    },
+  })
+  assert.deepEqual(seen, ['account-1'], 'neither retried home nor spilled the transcript')
+  assert.ok(Date.now() - startedAt < 5000)
+  assert.equal(result.status, 529)
+  assert.equal(result.body.error.code, 'pool_overloaded')
+  assert.equal(result.body.error.details.reason, 'session_home_slot_busy')
+  assert.equal(result.accountId, 'account-1')
+})
+
+test('keep_session_home with allowQueue:false: pre-hop kernel slot_busy stamps zero attemptCount and zero hops', async () => {
+  const previous = process.env.KIN_KERNEL_BIN
+  process.env.KIN_KERNEL_BIN = process.execPath
+  const home = { ...candidate(1), vmId: 'vm-home-01', exec: { vmId: 'vm-home-01', vm: { id: 'vm-home-01' } } }
+  const scheduler = new Scheduler([home, candidate(2)])
+  const runner = new FailoverRunner({
+    scheduler,
+    stickyRouter: pinnedStickyRouter('account-1', 'vm-home-01'),
+    config: { same_account_retry_delay_ms: 0, home_slot_busy_retry_ms: 60000, keep_session_home: true },
+  })
+  try {
+    const result = await runner.run({
+      requestId: 'req-home-prehop-slot-busy-zero-attempts',
+      canonicalBody: { model: 'claude-sonnet-test' },
+      model: 'claude-sonnet-test',
+      stickyKey: 'sess:home',
+      allowQueue: false,
+      callAttempt: ({ candidate: selected, body }) =>
+        dispatchCallInference({
+          exec: selected.exec,
+          body,
+          routing: { inference: { engine: 'rust', health_ttl_ms: 0 } },
+          ensureRust: async () => ({ ok: false, reason: 'slot_busy', error: 'rust kernel has no free slot' }),
+        }),
+    })
+    assert.equal(scheduler.selectCalls, 1)
+    assert.equal(result.ok, false)
+    assert.equal(result.status, 529)
+    assert.equal(result.body.error.code, 'pool_overloaded')
+    assert.equal(result.body.error.details.reason, 'session_home_slot_busy')
+    assert.equal(result.body.error.details.attempt_count, 0)
+    assert.equal(result.attemptCount, 0)
+    assert.equal(result.accountId, 'account-1')
+    assert.equal(result.vmId, 'vm-home-01')
+  } finally {
+    if (previous == null) delete process.env.KIN_KERNEL_BIN
+    else process.env.KIN_KERNEL_BIN = previous
+  }
+})
+
 test('keep_pin_on_model_gate: a borrowed account never takes the session, family or device pin', async () => {
   const binds = []
   const scheduler = new Scheduler([{ ...candidate(2), stickyBorrowed: true }])
@@ -2673,4 +2749,441 @@ test('keep_pin_on_model_gate: a borrowed account never takes the session, family
   assert.equal(result.ok, true)
   assert.equal(result.accountId, 'account-2')
   assert.deepEqual(binds, [])
+})
+
+// --- poison request quarantine ---------------------------------------------
+
+function silentTimeout() {
+  return {
+    ok: false,
+    status: 504,
+    committed: false,
+    terminalState: 'rejected',
+    body: {
+      error: { type: 'upstream_timeout', code: 'upstream_timeout', message: 'job idle timeout: no CLI frame for 180s' },
+    },
+  }
+}
+
+const turnBody = (...extra) => ({
+  model: 'claude-opus-test',
+  messages: [
+    { role: 'user', content: 'hi' },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: '/x' } }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] },
+    ...extra,
+  ],
+})
+
+function poisonHarness(config = {}) {
+  const scheduler = new Scheduler([candidate(1)])
+  const runner = new FailoverRunner({ scheduler, config: { max_same_account_retries: 0, ...config } })
+  runner.poisonGuard.logger = { warn() {} }
+  const calls = { n: 0 }
+  const send = (body, { stickyKey = 'sess:client-1', outcome = silentTimeout() } = {}) =>
+    runner.run({
+      requestId: `req-${calls.n + 1}`,
+      canonicalBody: body,
+      model: 'claude-opus-test',
+      stream: false,
+      stickyKey,
+      stickyKeys: [stickyKey],
+      callAttempt: () => {
+        calls.n += 1
+        return typeof outcome === 'function' ? outcome() : outcome
+      },
+    })
+  return { runner, scheduler, calls, send }
+}
+
+test('after two silent timeouts the third identical request is refused without touching a seat', async () => {
+  const { scheduler, calls, send } = poisonHarness()
+  await send(turnBody())
+  await send(turnBody())
+  assert.equal(calls.n, 2)
+  const selectBefore = scheduler.selectCalls
+  const started = Date.now()
+  const out = await send(turnBody())
+  assert.equal(calls.n, 2, 'no kernel job for the quarantined request')
+  assert.equal(scheduler.selectCalls, selectBefore, 'no seat reserved')
+  assert.ok(Date.now() - started < 500)
+  assert.equal(out.status, 400)
+  assert.equal(out.body.error.type, 'invalid_request_error')
+  assert.equal(out.body.error.code, 'request_quarantined')
+  assert.match(out.body.error.message, /rewind|new conversation|new session/i)
+  assert.equal(out.finalState, 'rejected')
+  assert.equal(out.attemptCount, 0)
+})
+
+test('a quarantined conversation that only grew is still refused, a rewound one goes through', async () => {
+  const { calls, send } = poisonHarness()
+  await send(turnBody())
+  await send(turnBody())
+  const grown = await send(turnBody({ role: 'assistant', content: 'x' }, { role: 'user', content: 'continue' }))
+  assert.equal(grown.body.error.code, 'request_quarantined')
+  const rewound = turnBody()
+  rewound.messages.pop()
+  const out = await send(rewound, { outcome: success() })
+  assert.equal(out.ok, true)
+  assert.equal(calls.n, 3)
+})
+
+test('another session on the same seat is unaffected', async () => {
+  const { send } = poisonHarness()
+  await send(turnBody())
+  await send(turnBody())
+  const other = await send(turnBody(), { stickyKey: 'sess:client-2', outcome: success() })
+  assert.equal(other.ok, true)
+})
+
+test('ordinary timeouts and other failures never quarantine', async () => {
+  const { calls, send } = poisonHarness()
+  const plain = () => ({
+    ...silentTimeout(),
+    body: { error: { type: 'upstream_timeout', message: 'upstream request timed out' } },
+  })
+  await send(turnBody(), { outcome: plain })
+  await send(turnBody(), { outcome: plain })
+  const out = await send(turnBody(), { outcome: plain })
+  assert.equal(calls.n, 3)
+  assert.notEqual(out.body?.error?.code, 'request_quarantined')
+})
+
+test('a success on the session lifts the record', async () => {
+  const { calls, send } = poisonHarness()
+  await send(turnBody())
+  await send(turnBody(), { outcome: success() })
+  const out = await send(turnBody())
+  assert.equal(calls.n, 3)
+  assert.notEqual(out.body?.error?.code, 'request_quarantined')
+})
+
+test('the guard can be turned off from config', async () => {
+  const { calls, send } = poisonHarness({ poison_request_threshold: 0 })
+  for (let i = 0; i < 4; i += 1) await send(turnBody())
+  assert.equal(calls.n, 4)
+})
+
+test('a quarantined session is not counted toward the per-VM kernel circuit', async () => {
+  const { vmTimeoutTracker } = await import('../../src/lib/pool/failover-runner.mjs')
+  vmTimeoutTracker.reset()
+  const { send } = poisonHarness()
+  for (let i = 0; i < 6; i += 1) await send(turnBody())
+  assert.ok((vmTimeoutTracker.counts.get('vm-01')?.count || 0) < 3, 'refused requests never reach the tracker')
+})
+
+// --- per-VM size ceiling in the runner --------------------------------------
+
+const bigBody = (kb) => ({ model: 'claude-opus-test', messages: [{ role: 'user', content: 'x'.repeat(kb * 1024) }] })
+
+function ceilingHarness(candidates) {
+  const scheduler = new Scheduler(candidates)
+  const runner = new FailoverRunner({ scheduler, config: { max_same_account_retries: 0 } })
+  runner.poisonGuard.logger = { warn() {} }
+  const served = []
+  const send = (kb, session, { outcome = success(), extra = {} } = {}) =>
+    runner.run({
+      requestId: `req-${served.length + 1}`,
+      canonicalBody: bigBody(kb),
+      model: 'claude-opus-test',
+      stream: false,
+      stickyKey: `sess:${session}`,
+      stickyKeys: [`sess:${session}`],
+      callAttempt: ({ candidate }) => {
+        served.push(candidate.vmId)
+        return typeof outcome === 'function' ? outcome(candidate) : outcome
+      },
+      ...extra,
+    })
+  return { send, served, scheduler, runner }
+}
+
+test('once two sessions went silent on a VM, a larger request is served by another seat', async () => {
+  const { send, served } = ceilingHarness([candidate(1), candidate(2)])
+  // Only vm-01 goes quiet; its failed requests are answered by vm-02 within the same call.
+  const onlyVm01Silent = (seat) => (seat.vmId === 'vm-01' ? silentTimeout() : success())
+  await send(60, 'a', { outcome: onlyVm01Silent })
+  await send(70, 'b', { outcome: onlyVm01Silent })
+  served.length = 0
+  const out = await send(80, 'c')
+  assert.equal(out.ok, true)
+  assert.deepEqual(served, ['vm-02'], 'the VM that went silent is skipped for requests this large')
+  served.length = 0
+  await send(10, 'd')
+  assert.deepEqual(served, ['vm-01'], 'small requests still use it')
+})
+
+test('with no other seat the oversized request is refused with a clear 400 and sends nothing', async () => {
+  const { send, served } = ceilingHarness([candidate(1)])
+  await send(60, 'a', { outcome: silentTimeout })
+  await send(70, 'b', { outcome: silentTimeout })
+  served.length = 0
+  const out = await send(80, 'c')
+  assert.deepEqual(served, [])
+  assert.equal(out.status, 400)
+  assert.equal(out.body.error.type, 'invalid_request_error')
+  assert.equal(out.body.error.code, 'request_too_large_for_slot')
+  assert.match(out.body.error.message, /rewind|new session|new conversation/i)
+  assert.match(out.body.error.message, /compact/i, 'warns that compacting sends the whole conversation')
+  assert.equal(out.attemptCount, 0)
+})
+
+test('an operator pin to the VM still reaches it, for diagnosis', async () => {
+  const { send, served } = ceilingHarness([candidate(1)])
+  await send(60, 'a', { outcome: silentTimeout })
+  await send(70, 'b', { outcome: silentTimeout })
+  served.length = 0
+  await send(80, 'c', { extra: { pinVmId: 'vm-01' } })
+  assert.deepEqual(served, ['vm-01'])
+})
+
+test('while a ceiling is active a small request is still sent and a large one is still refused', async () => {
+  const { send, served } = ceilingHarness([candidate(1)])
+  await send(60, 'a', { outcome: silentTimeout })
+  await send(70, 'b', { outcome: silentTimeout })
+  served.length = 0
+  await send(10, 'd')
+  const still = await send(80, 'c')
+  assert.equal(still.body.error.code, 'request_too_large_for_slot')
+  assert.deepEqual(served, ['vm-01'], 'only the small request was sent')
+})
+
+test('successes that pass through the runner raise the floor, so an incident cannot close the VM below them', async () => {
+  const { send, served } = ceilingHarness([candidate(1)])
+  await send(50, 'z') // the VM answers a 50 KB request
+  await send(8, 'a', { outcome: silentTimeout }) // then two sessions go quiet for an unrelated reason
+  await send(300, 'b', { outcome: silentTimeout })
+  served.length = 0
+  const small = await send(10, 'c')
+  assert.equal(small.ok, true, 'a 10 KB request is below what the VM has just served')
+  assert.deepEqual(served, ['vm-01'])
+  const big = await send(120, 'd')
+  assert.equal(big.body.error.code, 'request_too_large_for_slot', 'what was never shown to work is still kept off')
+})
+
+test('#1562: CRAG pre-first-frame SOCKS5/transport_error 502 fails over across sticky/affinity slots without ping-pong', async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-1562-socks5-'))
+  const sticky = new StickyRouter({ dataDir, config: { sticky: { enabled: true } } })
+  t.after(() => {
+    sticky.db.close()
+    fs.rmSync(dataDir, { recursive: true, force: true })
+  })
+
+  const createAffinityScheduler = () => {
+    const unitCircuit = new UnitCircuit({ failureThreshold: 3, openMs: 30_000 })
+    const cooled = new Map()
+    const cooldowns = []
+    const candidates = [
+      { vmId: 'vm-A', accountId: 'account-A', waitMs: 0 },
+      { vmId: 'vm-B', accountId: 'account-B', waitMs: 0 },
+      { vmId: 'vm-C', accountId: 'account-C', waitMs: 0 },
+    ]
+    return {
+      unitCircuit,
+      cooldowns,
+      async selectAndReserve({ stickyKey, deviceVmId, familyVmId, excluded, avoid = null, allowWait = true }) {
+        const now = Date.now()
+        const stickyBound = stickyKey ? sticky.resolve(stickyKey) : null
+        const ordered = [...candidates].sort((a, b) => {
+          const rank = (item) => {
+            if (stickyBound?.vmId === item.vmId) return 0
+            if (deviceVmId === item.vmId || familyVmId === item.vmId) return 1
+            return 2
+          }
+          return rank(a) - rank(b)
+        })
+        const open = ordered.filter((item) => {
+          if (excluded.has(item.accountId) || excluded.has(item.vmId)) return false
+          const until = cooled.get(item.accountId) || 0
+          if (until > now) return false
+          return unitCircuit.admit(item.accountId, now).ok
+        })
+        const preferred = avoid ? open.filter((item) => !avoid.has(item.accountId) && !avoid.has(item.vmId)) : open
+        const selected = preferred[0] || (allowWait ? open[0] : null)
+        if (!selected) return { ok: false, reason: 'no_eligible_accounts' }
+        return { ...selected, ok: true, release() {} }
+      },
+      markCooldown(selected, update) {
+        cooldowns.push({ candidate: selected, update })
+        if (update?.until) cooled.set(selected.accountId, update.until)
+      },
+      markSuccess() {},
+      releaseAccountSessions() {},
+    }
+  }
+
+  // Subcase 1: SOCKS5 splice_rst (vm-A) + SOCKS5 greeting i/o timeout (vm-B) -> vm-C in 3 hops
+  {
+    const callerSession = 'sess-1562-proxy'
+    const stickyKey = sticky.canonicalSessionKey(callerSession)
+    sticky.bind(stickyKey, { accountId: 'account-A', vmId: 'vm-A', sessionId: 'out-a' }, { countHit: false })
+    sticky.bindDeviceAffinity('dev2:caller-1', { accountId: 'account-B', vmId: 'vm-B' }, { countHit: false })
+
+    const scheduler = createAffinityScheduler()
+    const proxyFailures = []
+    const runner = new FailoverRunner({
+      scheduler,
+      stickyRouter: sticky,
+      config: { same_account_retry_delay_ms: 0 },
+      onProxyFailure: (vmId, reason) => proxyFailures.push({ vmId, reason }),
+    })
+
+    const visited = []
+    const result = await runner.run({
+      requestId: 'req-1562-proxy',
+      canonicalBody: { model: 'claude-opus-test' },
+      model: 'claude-opus-test',
+      stickyKey,
+      deviceKey: 'dev2:caller-1',
+      familyVmId: 'vm-B',
+      callAttempt: ({ candidate: selected }) => {
+        visited.push(selected.vmId)
+        if (selected.vmId === 'vm-A') {
+          return {
+            ok: false,
+            status: 502,
+            upstreamStatus: 200,
+            via: 'rust-kernel-stream',
+            nativeHandoff: true,
+            committed: false,
+            firstByteAt: null,
+            terminalState: 'incomplete',
+            transportError: false,
+            providerResult: {
+              type: 'kin_provider_result',
+              schema_version: 2,
+              source: 'crag',
+              provider_complete: false,
+              usage_complete: false,
+              http_status: null,
+              public_status: 502,
+              error: {
+                type: 'transport_error',
+                message: 'splice_rst dest=api.anthropic.com:443: connection reset by peer',
+              },
+            },
+            body: {
+              type: 'error',
+              error: {
+                type: 'transport_error',
+                message: 'splice_rst dest=api.anthropic.com:443: connection reset by peer',
+              },
+            },
+          }
+        }
+        if (selected.vmId === 'vm-B') {
+          return {
+            ok: false,
+            status: 502,
+            upstreamStatus: 200,
+            via: 'rust-kernel-stream',
+            nativeHandoff: true,
+            committed: false,
+            firstByteAt: null,
+            terminalState: 'incomplete',
+            transportError: false,
+            providerResult: {
+              type: 'kin_provider_result',
+              schema_version: 2,
+              source: 'crag',
+              provider_complete: false,
+              usage_complete: false,
+              http_status: null,
+              public_status: 502,
+              error: {
+                type: 'transport_error',
+                message: 'socks_dial dest=api.anthropic.com:443: read SOCKS5 greeting: i/o timeout',
+              },
+            },
+            body: {
+              type: 'error',
+              error: {
+                type: 'transport_error',
+                message: 'socks_dial dest=api.anthropic.com:443: read SOCKS5 greeting: i/o timeout',
+              },
+            },
+          }
+        }
+        return success('healthy-c')
+      },
+    })
+
+    assert.equal(result.ok, true)
+    assert.equal(result.vmId, 'vm-C')
+    assert.equal(result.attemptCount, 3)
+    assert.deepEqual(visited, ['vm-A', 'vm-B', 'vm-C'])
+    assert.deepEqual(proxyFailures, [
+      { vmId: 'vm-A', reason: 'proxy_transport_failure' },
+      { vmId: 'vm-B', reason: 'proxy_transport_failure' },
+    ])
+    assert.equal(scheduler.cooldowns.length, 2)
+    assert.deepEqual(
+      scheduler.cooldowns.map((entry) => ({ vmId: entry.candidate.vmId, reason: entry.update.reason })),
+      [
+        { vmId: 'vm-A', reason: 'proxy_transport_failure' },
+        { vmId: 'vm-B', reason: 'proxy_transport_failure' },
+      ],
+    )
+  }
+
+  // Subcase 2: generic pre-first-frame transport_error (no proxy keyword) -> vm-A -> vm-B -> vm-C + UnitCircuit failures
+  {
+    const callerSession = 'sess-1562-net'
+    const stickyKey = sticky.canonicalSessionKey(callerSession)
+    sticky.bind(stickyKey, { accountId: 'account-A', vmId: 'vm-A', sessionId: 'out-a2' }, { countHit: false })
+    sticky.bindDeviceAffinity('dev2:caller-2', { accountId: 'account-B', vmId: 'vm-B' }, { countHit: false })
+
+    const scheduler = createAffinityScheduler()
+    const runner = new FailoverRunner({
+      scheduler,
+      stickyRouter: sticky,
+      config: { same_account_retry_delay_ms: 0 },
+    })
+
+    const visited = []
+    const result = await runner.run({
+      requestId: 'req-1562-net',
+      canonicalBody: { model: 'claude-opus-test' },
+      model: 'claude-opus-test',
+      stickyKey,
+      deviceKey: 'dev2:caller-2',
+      familyVmId: 'vm-B',
+      callAttempt: ({ candidate: selected }) => {
+        visited.push(selected.vmId)
+        if (selected.vmId === 'vm-C') return success('healthy-c')
+        return {
+          ok: false,
+          status: 502,
+          upstreamStatus: 200,
+          via: 'rust-kernel-stream',
+          nativeHandoff: true,
+          committed: false,
+          firstByteAt: null,
+          terminalState: 'incomplete',
+          transportError: false,
+          providerResult: {
+            type: 'kin_provider_result',
+            schema_version: 2,
+            source: 'crag',
+            provider_complete: false,
+            usage_complete: false,
+            http_status: null,
+            public_status: 502,
+            error: { type: 'transport_error', message: 'unexpected EOF writing request body' },
+          },
+          body: {
+            type: 'error',
+            error: { type: 'transport_error', message: 'unexpected EOF writing request body' },
+          },
+        }
+      },
+    })
+
+    assert.equal(result.ok, true)
+    assert.equal(result.vmId, 'vm-C')
+    assert.equal(result.attemptCount, 3)
+    assert.deepEqual(visited, ['vm-A', 'vm-B', 'vm-C'])
+    assert.equal(scheduler.unitCircuit.snapshot('account-A').failures, 1)
+    assert.equal(scheduler.unitCircuit.snapshot('account-B').failures, 1)
+  }
 })

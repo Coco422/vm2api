@@ -176,7 +176,7 @@ export function VmActionMenu({
               </DropdownMenuItem>
             </>
           ) : null}
-          {perms.power ? (
+          {perms.recovery ? (
             <DropdownMenuItem onSelect={() => actions.openRecovery(vm)}>
               <LifeBuoy />
               恢复服务

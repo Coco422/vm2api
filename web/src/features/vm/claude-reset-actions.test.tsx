@@ -71,6 +71,8 @@ const snapshot = {
   ],
 }
 
+const now = Date.parse('2026-11-13T07:26:00Z')
+
 const vm = (over: Partial<Vm> = {}) =>
   ({ id: 'Niutopia262', claude_reset_credits: snapshot, ...over }) as Vm
 
@@ -99,8 +101,10 @@ describe('ActiveUsageAction', () => {
 
 describe('ClaudeResetActions', () => {
   it('keeps the compact buttons and shows only the total', () => {
-    const html = renderToStaticMarkup(<ClaudeResetActions vm={vm()} compact />)
-    expect(html).toContain('限额查询 2')
+    const html = renderToStaticMarkup(
+      <ClaudeResetActions vm={vm()} compact now={now} />
+    )
+    expect(html).toContain('限额查询 3')
     expect(html).toContain('限额重置')
     expect(html).not.toContain('Fable 卡')
     expect(
@@ -112,15 +116,37 @@ describe('ClaudeResetActions', () => {
 
   it('lists each held card with its own use button on the detail page', () => {
     const html = renderToStaticMarkup(
-      <ClaudeResetActions vm={vm()} now={Date.parse('2026-11-13T07:26:00Z')} />
+      <ClaudeResetActions vm={vm()} now={now} />
     )
     expect(html).toContain('Fable 卡')
     expect(html).toContain('全量卡')
-    expect(html).not.toContain('每周卡')
+    expect(html).toContain('每周卡')
     expect(html).toContain('清 5 小时、Fable 周额度（7 天不清）')
     expect(html).toContain('清 5 小时、7 天、Fable 周额度')
-    expect(html.match(/title="使用/g)?.length).toBe(2)
-    expect(html).toMatch(/重置卡 <b[^>]*>2<\/b> 张/)
+    expect(html.match(/title="使用/g)?.length).toBe(3)
+    expect(html).toMatch(/重置卡 <b[^>]*>3<\/b> 张/)
+  })
+
+  it('shows a temporarily unavailable full card even when no cards are redeemable', () => {
+    const slot = vm({
+      claude_reset_credits: {
+        held_count: 0,
+        available_count: 0,
+        credits: [{ ...snapshot.credits[1], state: 'unavailable' }],
+      },
+    })
+    const detail = renderToStaticMarkup(
+      <ClaudeResetActions vm={slot} now={now} />
+    )
+    expect(detail).toMatch(/重置卡 <b[^>]*>1<\/b> 张/)
+    expect(detail).toContain('全量卡')
+    expect(detail).toContain('暂不可兑')
+    expect(detail).toMatch(/<button[^>]*disabled=""[^>]*title="使用全量卡"/)
+    const compact = renderToStaticMarkup(
+      <ClaudeResetActions vm={slot} compact now={now} />
+    )
+    expect(compact).toContain('限额查询 1')
+    expect(compact).not.toContain(' disabled=""')
   })
 
   it('asks for a refresh when the snapshot predates card refs', () => {

@@ -11,6 +11,7 @@ import stat
 import struct
 import subprocess
 import sys
+import threading
 import time
 from http.client import HTTPResponse
 
@@ -23,12 +24,130 @@ TURN_TIMEOUT = 125
 TOKEN = re.compile(r"[!-~]{24,4096}\Z")
 MODEL = re.compile(r"[a-z0-9][a-z0-9._-]{0,99}\Z")
 REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+LAUNCHER_EXIT_FILE = "launcher-exit"
+LAUNCHER_EXIT = re.compile(rb"(craggemini|agy) (-?[0-9]{1,3})\n")
+ELIGIBILITY_LOG_FILE = "cli-diagnostic"
+
+
+class EligibilityDiagnostic:
+    """One run's bounded CLI stream, independent of the host request loop."""
+
+    def __init__(self, directory, uid):
+        path = directory / ELIGIBILITY_LOG_FILE
+        os.mkfifo(path, 0o600)
+        os.chown(path, uid, uid)
+        self.descriptor = os.open(path, os.O_RDWR | os.O_NONBLOCK | os.O_NOFOLLOW)
+        self.pending = bytearray()
+        self.discard_line = False
+        self.code = None
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._snapshot_requested = threading.Event()
+        self._snapshot_ready = threading.Event()
+        self._thread = threading.Thread(
+            target=self._drain, name="gemini-cli-diagnostic", daemon=True
+        )
+        try:
+            self._thread.start()
+        except BaseException:
+            os.close(self.descriptor)
+            self.descriptor = None
+            raise
+
+    def _consume(self, chunk):
+        for piece in chunk.splitlines(keepends=True):
+            ended = piece.endswith(b"\n")
+            if not self.discard_line:
+                if len(self.pending) + len(piece) > 4096:
+                    self.pending.clear()
+                    self.discard_line = True
+                else:
+                    self.pending.extend(piece)
+            if ended:
+                if not self.discard_line:
+                    if re.fullmatch(
+                        rb"W[0-9]{4} [0-9:. ]+ [0-9]+ server_oauth\.go:[0-9]+\] "
+                        rb"Account ineligible: [^\r\n]{0,256}not eligible for Antigravity, "
+                        rb"because it is not currently available in your location\.\r?\n",
+                        self.pending,
+                    ):
+                        with self._lock:
+                            self.code = "gemini_location_unsupported"
+                    elif re.fullmatch(
+                        rb"W[0-9]{4} [0-9:. ]+ [0-9]+ server_oauth\.go:[0-9]+\] "
+                        rb"Account ineligible: [^\r\n]{0,256}[Vv]erify your account[^\r\n]{0,256}\r?\n",
+                        self.pending,
+                    ):
+                        with self._lock:
+                            self.code = "gemini_account_verification_required"
+                    elif re.fullmatch(
+                        rb"W[0-9]{4} [0-9:. ]+ [0-9]+ server_oauth\.go:[0-9]+\] "
+                        rb"Account ineligible: [^\r\n]{1,512}\r?\n",
+                        self.pending,
+                    ):
+                        with self._lock:
+                            if self.code is None:
+                                self.code = "gemini_account_ineligible"
+                self.pending.clear()
+                self.discard_line = False
+
+    def _drain(self):
+        descriptor = self.descriptor
+        try:
+            while not self._stop.is_set():
+                readable, _, _ = select.select([descriptor], [], [], 0.1)
+                if not readable:
+                    if self._snapshot_requested.is_set():
+                        self._snapshot_requested.clear()
+                        self._snapshot_ready.set()
+                    continue
+                # Limit each batch so a continuous writer cannot starve shutdown.
+                remaining = 64 * 1024
+                while remaining and not self._stop.is_set():
+                    try:
+                        chunk = os.read(descriptor, min(4096, remaining))
+                    except BlockingIOError:
+                        break
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                    self._consume(chunk)
+                if remaining and self._snapshot_requested.is_set():
+                    self._snapshot_requested.clear()
+                    self._snapshot_ready.set()
+        finally:
+            os.close(descriptor)
+            self._snapshot_ready.set()
+
+    def poll(self, *, final=False):
+        with self._lock:
+            code = self.code
+        if final and code is None and self.descriptor is not None:
+            # Do not miss a terminal line already queued as the child exits.
+            self._snapshot_ready.clear()
+            self._snapshot_requested.set()
+            self._snapshot_ready.wait(timeout=0.25)
+        with self._lock:
+            return self.code
+
+    def close(self):
+        if self.descriptor is None:
+            return
+        self._stop.set()
+        self._thread.join(timeout=2)
+        if self._thread.is_alive():
+            raise RuntimeError("Gemini diagnostic drainer did not stop")
+        # The reader owns the descriptor until it exits; never race fd reuse.
+        self.descriptor = None
+        self.pending.clear()
 
 
 class NativeFailure(Exception):
-    def __init__(self, code):
-        super().__init__(code)
+    def __init__(self, code, status=None, message=None):
+        super().__init__(message or code)
         self.code = code
+        self.status = status
+        self.message = message
 
 
 def _object(pairs):
@@ -164,6 +283,160 @@ def worker_status(socket_path, token, timeout=0.5):
         connection.close()
 
 
+def cancel_worker_request(socket_path, token, request_id, timeout=2.0):
+    if not isinstance(request_id, str) or not REQUEST_ID.fullmatch(request_id):
+        return False
+    body = json.dumps({"request_id": request_id}, separators=(",", ":")).encode("utf-8")
+    connection = _UnixHTTPConnection(socket_path, timeout)
+    try:
+        response = connection.request(
+            "POST",
+            "/internal/v1/cancel",
+            {
+                "Content-Type": "application/json",
+                "Content-Length": str(len(body)),
+                "X-Kin-Internal-Token": token,
+            },
+            body,
+        )
+        response.begin()
+        raw = response.read(4096)
+        data = json.loads(raw) if raw else {}
+        return response.status == 200 and data.get("cancelled") is True
+    except (OSError, ValueError, RecursionError):
+        return False
+    finally:
+        connection.close()
+
+
+LICENSE_ERROR_CODES = frozenset(
+    {
+        "license_required",
+        "license_expired",
+        "license_not_yet_valid",
+        "license_invalid",
+        "license_binding_mismatch",
+        "license_unconfigured",
+    }
+)
+
+
+def _map_worker_error(http_status, payload):
+    code = payload.get("code") if isinstance(payload, dict) else None
+    upstream = payload.get("upstream_status") if isinstance(payload, dict) else None
+    message = payload.get("error") if isinstance(payload, dict) and isinstance(payload.get("error"), str) else None
+    if isinstance(code, str) and code in LICENSE_ERROR_CODES:
+        return NativeFailure(code, 403, message)
+    effective_status = upstream if isinstance(upstream, int) and 400 <= upstream <= 599 else http_status
+    if code == "unsupported_turn":
+        return NativeFailure("gemini_unsupported_turn", 400, message)
+    if code in ("invalid_envelope", "invalid_json"):
+        return NativeFailure("gemini_invalid_request", 400, message)
+    if code in ("queue_full", "native_unavailable", "kernel_stopping"):
+        return NativeFailure("gemini_operation_busy" if code == "queue_full" else "gemini_native_worker_unavailable", 503, message)
+    if code in ("first_byte_timeout", "turn_timeout", "idle_timeout", "queue_timeout"):
+        return NativeFailure("gemini_inference_timeout", 504, message)
+    if code == "cancelled":
+        return NativeFailure("gemini_inference_cancelled", 499, message)
+    if effective_status == 429:
+        return NativeFailure("gemini_quota_exhausted", 429, message)
+    if effective_status == 401:
+        return NativeFailure("gemini_oauth_required", 401, message)
+    if effective_status == 403:
+        return NativeFailure("gemini_location_unsupported", 403, message)
+    if effective_status == 404:
+        return NativeFailure("gemini_model_unavailable", 404, message)
+    return NativeFailure("gemini_inference_failed", effective_status if 400 <= effective_status <= 599 else 502, message)
+
+
+def _worker_ready(status):
+    if not isinstance(status, dict) or status.get("ready") is not True:
+        return False
+    native_pid = status.get("native_pid")
+    if type(native_pid) is int and native_pid > 0:
+        return True
+    pool = status.get("pool")
+    return isinstance(pool, dict) and pool.get("enabled") is True and pool.get("ready") is True
+
+
+def open_worker_stream(
+    socket_path,
+    token,
+    model,
+    request_id,
+    body_obj,
+    *,
+    startup_timeout=45,
+    turn_timeout=TURN_TIMEOUT,
+    gateway_policy=None,
+):
+    if (
+        not isinstance(socket_path, str)
+        or not os.path.isabs(socket_path)
+        or not isinstance(token, str)
+        or not TOKEN.fullmatch(token)
+        or not isinstance(model, str)
+        or not MODEL.fullmatch(model)
+        or not isinstance(request_id, str)
+        or not REQUEST_ID.fullmatch(request_id)
+        or not isinstance(body_obj, dict)
+    ):
+        raise NativeFailure("gemini_inference_bad_input", 400)
+    start_deadline = time.monotonic() + startup_timeout
+    while time.monotonic() < start_deadline:
+        status = worker_status(socket_path, token, timeout=0.25)
+        if status and status.get("license_valid") is False:
+            lic = status.get("license") if isinstance(status.get("license"), dict) else {}
+            lic_code = lic.get("code") if isinstance(lic.get("code"), str) and lic.get("code") in LICENSE_ERROR_CODES else "license_required"
+            raise NativeFailure(lic_code, 403, lic.get("message") if isinstance(lic.get("message"), str) else None)
+        if status and status.get("needs_recovery") is True:
+            raise NativeFailure("gemini_native_worker_unavailable", 503)
+        if _worker_ready(status):
+            break
+        time.sleep(0.05)
+    else:
+        raise NativeFailure("gemini_native_bridge_timeout", 503)
+    envelope = {
+        "request_id": request_id,
+        "stream": True,
+        "body": body_obj,
+    }
+    if isinstance(gateway_policy, dict) and gateway_policy:
+        envelope["gateway_policy"] = gateway_policy
+    payload = json.dumps(envelope, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(payload) > MAX_BODY:
+        raise NativeFailure("gemini_inference_output_limit", 413)
+    connection = _UnixHTTPConnection(socket_path, turn_timeout)
+    try:
+        response = connection.request(
+            "POST",
+            "/internal/v1/messages",
+            {
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+                "X-Kin-Internal-Token": token,
+            },
+            payload,
+        )
+        response.begin()
+        ct = (response.getheader("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if response.status != 200 or ct != "text/event-stream":
+            raw = response.read(64 * 1024)
+            err_payload = None
+            try:
+                err_payload = json.loads(raw) if raw else None
+            except ValueError:
+                err_payload = None
+            connection.close()
+            raise _map_worker_error(response.status, err_payload)
+        return connection, response
+    except NativeFailure:
+        raise
+    except (OSError, TimeoutError):
+        connection.close()
+        raise NativeFailure("gemini_inference_failed", 502) from None
+
+
 def query_free_vt(lock_path):
     descriptor = os.open(
         lock_path,
@@ -223,13 +496,11 @@ def run_request(request):
     start_deadline = time.monotonic() + startup_timeout
     while time.monotonic() < start_deadline:
         status = worker_status(socket_path, token, timeout=0.25)
-        native_pid = status.get("native_pid") if status else None
-        if (
-            status
-            and status.get("ready") is True
-            and type(native_pid) is int
-            and native_pid > 0
-        ):
+        if status and status.get("license_valid") is False:
+            lic = status.get("license") if isinstance(status.get("license"), dict) else {}
+            lic_code = lic.get("code") if isinstance(lic.get("code"), str) and lic.get("code") in LICENSE_ERROR_CODES else "license_required"
+            raise NativeFailure(lic_code, 403, lic.get("message") if isinstance(lic.get("message"), str) else None)
+        if _worker_ready(status):
             break
         time.sleep(0.1)
     else:
@@ -262,7 +533,13 @@ def run_request(request):
         )
         response.begin()
         if response.status != 200:
-            raise NativeFailure("gemini_inference_failed")
+            raw = response.read(64 * 1024)
+            err_payload = None
+            try:
+                err_payload = json.loads(raw) if raw else None
+            except ValueError:
+                err_payload = None
+            raise _map_worker_error(response.status, err_payload)
         frames = []
         pending = bytearray()
         total = 0
@@ -389,28 +666,79 @@ class NativeInvocation:
         self._process = None
 
 
+def read_launcher_exit(directory, uid):
+    try:
+        descriptor = os.open(
+            directory / LAUNCHER_EXIT_FILE,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+        with os.fdopen(descriptor, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != uid
+                or info.st_nlink != 1
+            ):
+                return None
+            match = LAUNCHER_EXIT.fullmatch(stream.read(32))
+    except OSError:
+        return None
+    if match is not None:
+        status = int(match[2])
+        if -signal.NSIG < status <= 255:
+            return match[1].decode("ascii"), status
+    return None
+
+
+def _record_launcher_exit(directory, name, returncode):
+    try:
+        with open(f"{directory}/{LAUNCHER_EXIT_FILE}", "x", encoding="ascii") as stream:
+            stream.write(f"{name} {returncode}\n")
+    except OSError:
+        # Diagnostic I/O must not replace the child's exit or bypass cleanup.
+        pass
+
+
+def _is_pool_mode_config(config_path):
+    try:
+        with open(config_path, "rb") as stream:
+            data = json.loads(stream.read(256 * 1024))
+        accounts = data.get("accounts") if isinstance(data, dict) else None
+        return isinstance(accounts, list) and len(accounts) > 0
+    except (OSError, ValueError):
+        return False
+
+
 def _launch_native(argv):
     # Both children must use the same PID namespace and procfs: the worker
     # compares SO_PEERCRED with the PID reported by the in-process adapter.
     directory = "/tmp/craggemini"
+    config_path = directory + "/kernel.json"
+    pool_mode = _is_pool_mode_config(config_path)
     worker = subprocess.Popen(
-        ["/opt/craggemini", "--gateway-worker", "--config", directory + "/kernel.json"],
+        ["/opt/craggemini", "--gateway-worker", "--config", config_path],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
     tui = None
     try:
+        required_sockets = ("kernel.sock",) if pool_mode else ("kernel.sock", "native.sock")
         deadline = time.monotonic() + 5
         while worker.poll() is None and time.monotonic() < deadline:
-            if all(
-                os.path.exists(f"{directory}/{name}")
-                for name in ("kernel.sock", "native.sock")
-            ):
+            if all(os.path.exists(f"{directory}/{name}") for name in required_sockets):
                 break
             time.sleep(0.025)
         else:
+            if worker.returncode is not None:
+                _record_launcher_exit(directory, "craggemini", worker.returncode)
             return 1
+        if pool_mode:
+            # In multi-process pool mode, craggemini spawns and guards up to
+            # max_concurrency agy processes with per-slot PTYs and memfd rings.
+            code = worker.wait()
+            _record_launcher_exit(directory, "craggemini", code)
+            return code if code >= 0 else 128 - code
         tui = subprocess.Popen(
             argv,
             env={
@@ -423,6 +751,9 @@ def _launch_native(argv):
         pid, status = os.wait()
         child = worker if pid == worker.pid else tui
         child.returncode = os.waitstatus_to_exitcode(status)
+        _record_launcher_exit(
+            directory, "craggemini" if child is worker else "agy", child.returncode
+        )
         return child.returncode if child.returncode >= 0 else 128 - child.returncode
     finally:
         for child in (tui, worker):

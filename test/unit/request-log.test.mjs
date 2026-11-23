@@ -622,6 +622,36 @@ test('finish persists web_search_requests from server_tool_use', () => {
   assert.equal(row.web_search_requests, 3)
 })
 
+test('repricing Ultrafast rows uses their request dates and preserves actual cost', () => {
+  const store = tmpStore('normal')
+  const before = '2027-03-01T07:59:59.999Z'
+  const after = '2027-03-01T08:00:00.000Z'
+  store.db
+    .prepare(`
+    INSERT INTO usage_logs (
+      id, request_id, created_at, model, status, input_tokens,
+      output_tokens, service_tier, pricing_model, actual_cost
+    ) VALUES
+      ('ultra_promo', 'rid_ultra_promo', ?, 'gpt-6.2-sol', 200, 100000, 100000, 'ultrafast', 'unpriced', NULL),
+      ('ultra_list', 'rid_ultra_list', ?, 'gpt-6.2-sol', 200, 100000, 100000, 'ultrafast', 'unpriced', 4)
+  `)
+    .run(before, after)
+
+  assert.equal(store.repo.repriceRange({ since: before, until: after }).changed, 2)
+  const rows = store.db
+    .prepare(
+      "SELECT total_cost, actual_cost FROM usage_logs WHERE id IN ('ultra_promo', 'ultra_list') ORDER BY created_at",
+    )
+    .all()
+  assert.deepEqual(
+    rows.map((row) => [row.total_cost, row.actual_cost]),
+    [
+      [3.6, null],
+      [7.2, 4],
+    ],
+  )
+})
+
 test('repriceRange rewrites total_cost and fills unpriced rows while actual_cost stays put', () => {
   const store = tmpStore('normal')
   const now = new Date().toISOString()
@@ -1376,4 +1406,40 @@ test('repriceRange re-prices image usage from the stored JSON and keeps actual_c
   assert.equal(rows.log_img_only.pricing_model, 'gpt-image-2.5-sunburst')
   assert.ok(Math.abs(rows.log_img_only.total_cost - 0.0321) < 1e-9)
   assert.equal(rows.log_img_only.actual_cost, 5)
+})
+
+// #1637 起 /v1beta/models 允许用 ?key= 携带凭据；start() 的 path 兜底必须剥掉查询串，
+// 否则漏传 pathName 的调用点会把真 key 写进 request-logs（redactSecrets 只作用于 body）。
+test('start(): path fallback strips the query string', () => {
+  const store = tmpStore('normal')
+  const ctx = store.start(
+    {
+      method: 'POST',
+      headers: {},
+      socket: {},
+      url: '/v1beta/models/gemini-2.5-pro:generateContent?key=AIzaSyTESTKEYVALUE&alt=sse',
+    },
+    { protocol: 'gemini' },
+  )
+  assert.equal(ctx.path, '/v1beta/models/gemini-2.5-pro:generateContent')
+  assert.ok(!ctx.path.includes('AIzaSyTESTKEYVALUE'))
+  assert.ok(!ctx.path.includes('?'))
+})
+
+test('start(): explicit pathName is used verbatim', () => {
+  const store = tmpStore('normal')
+  const ctx = store.start(
+    { method: 'POST', headers: {}, socket: {}, url: '/v1/messages?key=leak' },
+    {
+      protocol: 'anthropic.messages',
+      pathName: '/v1/messages',
+    },
+  )
+  assert.equal(ctx.path, '/v1/messages')
+})
+
+test('start(): missing url yields an empty path, not undefined', () => {
+  const store = tmpStore('normal')
+  const ctx = store.start({ method: 'POST', headers: {}, socket: {} }, { protocol: 'x' })
+  assert.equal(ctx.path, '')
 })

@@ -4,6 +4,7 @@ import type { Vm } from '@/types/panel-vm'
 import { resetCountdown } from '@/lib/fable-status'
 import { fmtNum, fmtUsd } from '@/lib/format'
 import { cn } from '@/lib/utils'
+import { overloadCooldown } from '@/lib/vm-status'
 import { vmCostLedger } from '@/lib/vm-usage'
 import { RISK_SOLID, riskFg, riskLevel } from '@/features/vm/usage-meter'
 import { VmAccountIdentity } from '@/features/vm/vm-account-identity'
@@ -78,6 +79,7 @@ export const VmUnit = memo(function VmUnit({
 }) {
   const open = useOpenOnKey(vm)
   const state = bladeState(vm)
+  const overload = overloadCooldown(vm, now)
   const ledger = vmCostLedger(vm, accounts)
   const total = ledger[ledger.length - 1]
   return (
@@ -96,6 +98,11 @@ export const VmUnit = memo(function VmUnit({
     >
       <div className='col-span-2 min-w-0'>
         <VmAccountIdentity vm={vm} />
+        {overload ? (
+          <p className='text-[11px] text-muted-foreground' title={overload.reason}>
+            过载冷却 · {overload.timing}
+          </p>
+        ) : null}
       </div>
       {vm.gemini ? (
         <div className='col-span-2'>

@@ -32,16 +32,20 @@ export async function startSandbox({ root, sandbox, record, port = 8791, install
   const apiKeyStore = new ApiKeyStore({ db, hashSecret: 'company-local-fixture-only' })
   const project = path.join(sandbox, 'fixture')
   fs.mkdirSync(path.join(project, 'vms'), { recursive: true })
+  const { hashPassword } = await import('../src/lib/admin/panel-users.mjs')
   const keys = { alice: 'sk-vm-local-demo-alice', bob: 'sk-vm-local-demo-bob' }
   for (const name of ['alice', 'bob']) {
-    if (!apiKeyStore.users.getById(name))
+    const user = apiKeyStore.users.getById(name)
+    if (!user)
       apiKeyStore.users.insert({
         id: name,
         username: name,
         role: 'user',
-        password_hash: 'not-a-login-hash',
+        password_hash: hashPassword(`local-${name}-8791`),
         enabled: true,
       })
+    else if (user.password_hash === 'not-a-login-hash')
+      apiKeyStore.users.update({ ...user, password_hash: hashPassword(`local-${name}-8791`) })
     if (!apiKeyStore.repo.getByHash(apiKeyStore._hash(keys[name])))
       apiKeyStore.create({
         name: `${name} 的专属 Key`,
@@ -63,11 +67,48 @@ export async function startSandbox({ root, sandbox, record, port = 8791, install
           owner_user_id: name,
           origin: 'admin_assigned',
           platform: 'anthropic',
+          status: 'running',
+          proxy: { id: `fixture-proxy-${name}-vm` },
           schedulable: true,
           claude: { mode: 'oauth', has_access: true, scope: 'user:profile user:inference', account_tier: 'pro' },
         }),
       )
   }
+  // Seed fields absent from earlier versions of the local fixture.
+  for (const id of ['alice-vm', 'bob-vm']) {
+    const file = path.join(project, 'vms', `${id}.json`)
+    const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+    if (vm.status && vm.proxy?.id) continue
+    vm.status ||= 'running'
+    vm.proxy ||= { id: `fixture-proxy-${id}` }
+    fs.writeFileSync(file, JSON.stringify(vm))
+  }
+  const demoRecovery = path.join(project, 'vms', 'alice-recovery-vm.json')
+  if (!fs.existsSync(demoRecovery))
+    fs.writeFileSync(demoRecovery, JSON.stringify({
+      id: 'alice-recovery-vm',
+      name: '内核故障可恢复示例',
+      owner_user_id: 'alice',
+      origin: 'admin_assigned',
+      platform: 'anthropic',
+      status: 'running',
+      schedulable: false,
+      unschedulable: { reason: 'runtime_start_failed' },
+      proxy: { id: 'fixture-proxy-alice-recovery-vm' },
+      claude: { mode: 'oauth', has_access: true, scope: 'user:profile user:inference', account_tier: 'pro' },
+    }))
+  const recoveredVm = path.join(project, 'vms', 'alice-recovered-vm.json')
+  if (!fs.existsSync(recoveredVm))
+    fs.writeFileSync(recoveredVm, JSON.stringify({
+      id: 'alice-recovered-vm',
+      name: '已自动恢复示例',
+      owner_user_id: 'alice',
+      origin: 'admin_assigned',
+      platform: 'anthropic',
+      status: 'running',
+      schedulable: true,
+      claude: { mode: 'oauth', has_access: true, scope: 'user:profile user:inference', account_tier: 'pro' },
+    }))
   for (const id of ['spare-vm-1', 'spare-vm-2']) {
     const file = path.join(project, 'vms', `${id}.json`)
     if (!fs.existsSync(file))
@@ -132,6 +173,7 @@ export async function startSandbox({ root, sandbox, record, port = 8791, install
   }
   const utilization = new Map([
     ['alice-vm', 0.42],
+    ['alice-recovered-vm', 0.18],
     ['bob-vm', 0.7],
   ])
   const remaining = new Map([
@@ -139,7 +181,17 @@ export async function startSandbox({ root, sandbox, record, port = 8791, install
     ['bob-vm', 1],
   ])
   const receipts = new Map()
+  const cooldowns = new Map([
+    ['account-alice-vm', Date.now() + 30 * 60_000],
+    ['account-alice-recovered-vm', Date.now() - 60_000],
+  ])
   const accountQuota = {
+    runtimeRepo: {
+      get(accountId) {
+        const overload_until = cooldowns.get(accountId)
+        return overload_until ? { overload_until } : null
+      },
+    },
     config: { safety_ratio: 0.85, weekly_safety_ratio: 0.8 },
     setMaxConcurrency() {},
     setMaxRpm() {},

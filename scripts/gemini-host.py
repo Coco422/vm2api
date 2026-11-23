@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import pty
 import pwd
+import queue
 import re
 import secrets
 import select
@@ -26,12 +27,14 @@ import struct
 import subprocess
 import sys
 import termios
+import threading
 import time
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 MAX_ENVIRONMENTS = 8
+MAX_CONCURRENCY = 64
 AUTH_TTL = 300
 TERMINAL_TTL = 300
 TERMINAL_READ = 16384
@@ -74,20 +77,97 @@ PAYLOAD_FILES = (
     "craggemini",
     "libagy_bridge.so",
 )
+CRAG_PAYLOAD_FILES = (
+    "manifest.json",
+    "agy",
+    "craggemini",
+    "craggemini.payload.enc",
+    "libagy_bridge.so",
+    "crag-license-public.pem",
+)
+LICENSE_ERROR_CODES = frozenset(
+    {
+        "license_required",
+        "license_expired",
+        "license_not_yet_valid",
+        "license_invalid",
+        "license_binding_mismatch",
+        "license_unconfigured",
+    }
+)
 AGY_SHA256 = "39816d49d5ab92229952987225c23ea3fed7580699dcb4a444e0388e0ac1ce43"
 INFERENCE_MODULE = ROOT / "scripts/gemini_host_inference.py"
 MODEL = re.compile(r"[a-z0-9][a-z0-9._-]{0,99}\Z")
+INFER_REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 RUN_TTL = 150
+NATIVE_SESSION_TTL = 180
+MAX_INFER_BODY = 4 * 1024 * 1024
+NATIVE_RUNTIME_ROOT = Path("/run/vm2api-gemini-native")
+FULL_CAPABILITIES = (
+    "streaming",
+    "multi_turn",
+    "system_instruction",
+    "tools",
+    "generation_config",
+    "thinking",
+    "multimodal",
+    "full_gemini_api",
+)
+NATIVE_CAPABILITIES = ("streaming", "native_tui")
+# Fixed categories only: process output and exception details are not inventory data.
+INFERENCE_ERROR_CODES = frozenset(
+    {
+        "gemini_account_ineligible",
+        "gemini_account_verification_required",
+        "gemini_api_key_invalid",
+        "gemini_inference_bad_input",
+        "gemini_inference_cancelled",
+        "gemini_inference_failed",
+        "gemini_inference_invalid_output",
+        "gemini_inference_output_limit",
+        "gemini_inference_start_failed",
+        "gemini_inference_timeout",
+        "gemini_inference_tool_blocked",
+        "gemini_location_unsupported",
+        "gemini_model_unavailable",
+        "gemini_models_empty",
+        "gemini_native_bridge_timeout",
+        "gemini_native_tty_unavailable",
+        "gemini_native_worker_unavailable",
+        "gemini_oauth_required",
+        "gemini_proxy_error",
+        "gemini_quota_exhausted",
+        *LICENSE_ERROR_CODES,
+    }
+)
+
+_TRUSTED_MODULES = {}
+_TRUSTED_MODULES_LOCK = threading.Lock()
+
+
+def _load_trusted_module(name, path):
+    check_root_owned(path)
+    info = path.lstat()
+    identity = (
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
+        info.st_ctime_ns,
+        info.st_mtime_ns,
+    )
+    with _TRUSTED_MODULES_LOCK:
+        cached = _TRUSTED_MODULES.get(name)
+        if cached is not None and cached[0] == identity:
+            return cached[1]
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _TRUSTED_MODULES[name] = (identity, module)
+        return module
 
 
 def invocation_module():
-    check_root_owned(INFERENCE_MODULE)
-    spec = importlib.util.spec_from_file_location(
-        "gemini_host_inference", INFERENCE_MODULE
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return _load_trusted_module("gemini_host_inference", INFERENCE_MODULE)
 
 
 class Failure(Exception):
@@ -100,15 +180,29 @@ def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def env_concurrency(env):
+    value = env.get("max_concurrency") if isinstance(env, dict) else None
+    return value if type(value) is int and 1 <= value <= MAX_CONCURRENCY else 1
+
+
+def verify_proxy_sha256(body, proxy_url):
+    if "proxy_sha256" not in body or body["proxy_sha256"] is None:
+        return
+    expected = body["proxy_sha256"]
+    actual = hashlib.sha256(proxy_url.encode()).hexdigest()
+    if (
+        not isinstance(expected, str)
+        or not SHA256.fullmatch(expected)
+        or not hmac.compare_digest(expected, actual)
+    ):
+        raise Failure(409, "gemini_proxy_calibration_mismatch")
+
+
 NATIVE_MODULE = ROOT / "scripts/gemini_host_native.py"
 
 
 def native_module():
-    check_root_owned(NATIVE_MODULE)
-    spec = importlib.util.spec_from_file_location("gemini_host_native", NATIVE_MODULE)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return _load_trusted_module("gemini_host_native", NATIVE_MODULE)
 
 
 def account_command(uid, method, profile=None):
@@ -317,6 +411,37 @@ os.execvpe(sys.argv[2],sys.argv[2:],os.environ)
 """
 
 
+class _Spawner:
+    """Single long-lived thread that forks managed child processes so Linux
+    PR_SET_PDEATHSIG fires only when gemini-host exits, never when an HTTP
+    worker thread from ThreadingUnixStreamServer terminates."""
+
+    def __init__(self):
+        self._queue = queue.Queue()
+        self._thread = threading.Thread(
+            target=self._loop, name="gemini-spawner", daemon=True
+        )
+        self._thread.start()
+
+    def _loop(self):
+        while True:
+            fn, result_q = self._queue.get()
+            try:
+                result_q.put((True, fn()))
+            except BaseException as exc:
+                result_q.put((False, exc))
+
+    def call(self, fn):
+        if threading.current_thread() is self._thread:
+            return fn()
+        result_q = queue.Queue(maxsize=1)
+        self._queue.put((fn, result_q))
+        ok, value = result_q.get()
+        if ok:
+            return value
+        raise value
+
+
 class Agy:
     def __init__(self, host, environment, proxy_url, profile=None, size=(180, 40)):
         self.host = host
@@ -378,6 +503,8 @@ class Agy:
             target.write_text(contents, encoding="ascii")
             target.chmod(0o644)
             identity += ["--ro-bind", str(target), "/etc/" + name]
+        machine_id = self.host.ensure_env_machine_id(self.environment)
+        identity += ["--ro-bind", str(machine_id), "/etc/machine-id"]
         self.network_lock = self.host.start_network(self.directory, self.network)
         subprocess.run(
             self.launch_args(self.host.egress_uid)
@@ -395,22 +522,25 @@ class Agy:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        self.egress = subprocess.Popen(
-            self.launch_args(self.host.egress_uid)
-            + [
-                sys.executable,
-                "-I",
-                "-c",
-                EGRESS_EXEC,
-                str(os.getpid()),
-                str(self.host.egress),
-                "--config",
-                str(config),
-            ],
-            env=SYSTEM_ENV,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+        spawn = getattr(self.host, "spawn", lambda fn: fn())
+        self.egress = spawn(
+            lambda: subprocess.Popen(
+                self.launch_args(self.host.egress_uid)
+                + [
+                    sys.executable,
+                    "-I",
+                    "-c",
+                    EGRESS_EXEC,
+                    str(os.getpid()),
+                    str(self.host.egress),
+                    "--config",
+                    str(config),
+                ],
+                env=SYSTEM_ENV,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
         )
         self.wait_egress()
         sandbox = [
@@ -512,19 +642,24 @@ class Agy:
         if self.profile is not None:
             argv += ["/usr/bin/python3", "-I", "-c", TERMINAL_EXEC]
         argv += ["/opt/agy", "--mode", "plan"]
-        self.pid, self.terminal = pty.fork()
-        if self.pid == 0:
-            try:
-                os.umask(0o077)
-                fcntl.ioctl(
-                    0, termios.TIOCSWINSZ, struct.pack("HHHH", size[1], size[0], 0, 0)
-                )
-                if self.profile is not None:
-                    with open(os.devnull, "wb") as quiet:
-                        os.dup2(quiet.fileno(), 2)
-                os.execvpe(argv[0], argv, SYSTEM_ENV)
-            finally:
-                os._exit(125)
+        def _fork_pty():
+            pid, terminal = pty.fork()
+            if pid == 0:
+                try:
+                    os.umask(0o077)
+                    fcntl.ioctl(
+                        0, termios.TIOCSWINSZ, struct.pack("HHHH", size[1], size[0], 0, 0)
+                    )
+                    if self.profile is not None:
+                        with open(os.devnull, "wb") as quiet:
+                            os.dup2(quiet.fileno(), 2)
+                    os.execvpe(argv[0], argv, SYSTEM_ENV)
+                finally:
+                    os._exit(125)
+            return pid, terminal
+
+        spawn = getattr(self.host, "spawn", lambda fn: fn())
+        self.pid, self.terminal = spawn(_fork_pty)
         os.set_blocking(self.terminal, False)
 
     def wait_egress(self):
@@ -655,11 +790,14 @@ class Headless(Agy):
         self.token_bytes = None
 
     def launch_cli(self, argv, size):
-        self.invocation = invocation_module().Invocation(
-            argv + ["--", "/opt/agy", *self.args],
-            SYSTEM_ENV,
-            self.prompt,
-            secrets=self.credentials,
+        spawn = getattr(self.host, "spawn", lambda fn: fn())
+        self.invocation = spawn(
+            lambda: invocation_module().Invocation(
+                argv + ["--", "/opt/agy", *self.args],
+                SYSTEM_ENV,
+                self.prompt,
+                secrets=self.credentials,
+            )
         )
 
     def poll(self):
@@ -714,50 +852,143 @@ def read_native_tui_pid(path):
 
 class NativeAgy(Agy):
     def __init__(self, host, environment, proxy_url, auth, model, prompt):
-        self.credentials, self.token_bytes = auth
+        self.credentials, _ = auth
         self.model, self.prompt = model, prompt
+        self.max_concurrency = env_concurrency(environment)
+        self.pool_mode = self.max_concurrency > 1 and prompt is None
         self.native_dir = None
+        self._owns_native_dir = False
         self.native_token = None
         self.native_tui = None
         self.native_tui_pid = None
         self.native_tui_pgid = None
         self.native_tui_start = None
         self.native_invocation = None
-        super().__init__(host, environment, proxy_url)
-
-    def initialize_home(self, home):
-        super().initialize_home(home)
-        settings = home / ".gemini" / "antigravity-cli"
-        token = settings / TOKEN_NAME
-        token.write_bytes(self.token_bytes)
-        os.chown(token, self.uid, self.uid)
-        self.token_bytes = None
+        self.native_diagnostic = None
+        # CLI onboarding and project state belong to the authorized profile, not the token alone.
+        profile = host.directory / environment["id"] / environment["profile"]
+        super().__init__(host, environment, proxy_url, profile=profile)
 
     def launch_cli(self, argv, size):
-        self.native_dir = self.directory / "native"
+        candidate = self.directory / "native"
+        if len(str(candidate / "kernel.sock").encode("utf-8")) > 96:
+            NATIVE_RUNTIME_ROOT.mkdir(mode=0o711, exist_ok=True)
+            os.chmod(NATIVE_RUNTIME_ROOT, 0o711)
+            check_root_owned(NATIVE_RUNTIME_ROOT)
+            self.native_dir = (
+                NATIVE_RUNTIME_ROOT / f"s{getattr(self, 'slot', 0)}-{self.attempt[:12]}"
+            )
+            self._owns_native_dir = True
+        else:
+            self.native_dir = candidate
+            self._owns_native_dir = False
         self.native_dir.mkdir(mode=0o700)
         os.chown(self.native_dir, self.uid, self.uid)
         self.native_token = secrets.token_hex(32)
+        license_dir = self.host.ensure_env_license_dir(self.environment)
+        native_module_impl = native_module()
+        agy_args = [
+            "--mode",
+            "plan",
+            "--model",
+            self.model,
+            "--settings",
+            json.dumps(CLI_SETTINGS, separators=(",", ":")),
+            "--log-file",
+            "/tmp/craggemini/" + native_module_impl.ELIGIBILITY_LOG_FILE,
+        ]
+        kernel_cfg = {
+            "run_dir": "/tmp/craggemini",
+            "internal_token": self.native_token,
+            "session_id": self.attempt,
+            "model": self.model,
+            "agy_sha256": AGY_SHA256,
+            "timeout_ms": 120000,
+            "first_byte_timeout_ms": 90000,
+            "idle_timeout_ms": 15000,
+            "queue_timeout_ms": 1000,
+            "max_queue": max(4, self.max_concurrency * 2) if self.pool_mode else 1,
+            "vm_id": self.environment["id"],
+            "license_dir": "/run/kin/crag-license",
+            "host_license_dir": "/run/kin/crag-host",
+        }
+        if self.pool_mode:
+            # Inside vm2agy<slot>, kin-egress enforces kernel-level fail-closed SOCKS5 routing
+            # under a separate UID; pass only the proxy_sha256 digest (never raw credentials).
+            kernel_cfg.update(
+                {
+                    "agy_bin": "/opt/agy",
+                    "bridge_so": "/opt/libagy_bridge.so",
+                    "verify_agy_sha256": True,
+                    "require_proxy_calibration": False,
+                    "accounts": [
+                        {
+                            "account_id": self.environment["id"],
+                            "env_id": self.environment["id"],
+                            "agy_home": "/home/agy",
+                            "work_dir": "/work",
+                            "run_dir": "/tmp/craggemini/acc",
+                            "proxy_id": self.environment["proxy_id"],
+                            "proxy_sha256": hashlib.sha256(
+                                self.proxy_url.encode()
+                            ).hexdigest(),
+                            "netns_transparent_egress": True,
+                            "max_concurrency": self.max_concurrency,
+                            "session_idle_ttl_secs": NATIVE_SESSION_TTL,
+                            "model": self.model,
+                            "agy_args": agy_args,
+                            "oauth_proxy_required": True,
+                            "enabled": True,
+                        }
+                    ],
+                }
+            )
         config = self.native_dir / "kernel.json"
-        private_json(
-            config,
-            {
-                "run_dir": "/tmp/craggemini",
-                "internal_token": self.native_token,
-                "session_id": self.attempt,
-                "model": self.model,
-                "agy_sha256": AGY_SHA256,
-                "timeout_ms": 120000,
-                "first_byte_timeout_ms": 90000,
-                "idle_timeout_ms": 15000,
-                "queue_timeout_ms": 1000,
-                "max_queue": 1,
-            },
-        )
+        private_json(config, kernel_cfg)
         os.chown(config, self.uid, self.uid)
+        self.native_diagnostic = native_module_impl.EligibilityDiagnostic(
+            self.native_dir, self.uid
+        )
+
+        crag_mounts = [
+            "--dir",
+            "/run",
+            "--dir",
+            "/run/kin",
+            "--dir",
+            "/run/kin/crag-license",
+            "--bind",
+            str(license_dir),
+            "/run/kin/crag-license",
+        ]
+        if self.host.crag_host_dir is not None and self.host.crag_host_dir.is_dir():
+            crag_mounts.extend(
+                [
+                    "--dir",
+                    "/run/kin/crag-host",
+                    "--ro-bind",
+                    str(self.host.crag_host_dir),
+                    "/run/kin/crag-host",
+                ]
+            )
+        if self.host.payload_mode == "crag_subscription":
+            crag_mounts.extend(
+                [
+                    "--ro-bind",
+                    str(self.host.payload / "craggemini.payload.enc"),
+                    "/opt/craggemini.payload.enc",
+                    "--ro-bind",
+                    str(self.host.payload / "manifest.json"),
+                    "/opt/manifest.json",
+                    "--ro-bind",
+                    str(self.host.payload / "crag-license-public.pem"),
+                    "/opt/crag-license-public.pem",
+                ]
+            )
 
         argv.extend(
             [
+                *crag_mounts,
                 "--ro-bind",
                 str(self.host.payload / "craggemini"),
                 "/opt/craggemini",
@@ -784,13 +1015,29 @@ class NativeAgy(Agy):
                 "/opt/gemini_host_native.py",
                 "--launch-native",
                 "/opt/agy",
-                "--mode",
-                "plan",
-                "--model",
-                self.model,
+                *agy_args,
             ]
         )
-        native_module_impl = native_module()
+        self.native_exit_reader = native_module_impl.read_launcher_exit
+        spawn = getattr(self.host, "spawn", lambda fn: fn())
+        if self.pool_mode:
+            # Multi-process CRAGGemini pool allocates per-slot PTYs and pidfd execution guards
+            # inside the sandbox, so no host Linux virtual console is needed.
+            try:
+                self.native_tui = spawn(
+                    lambda: subprocess.Popen(
+                        argv,
+                        env=SYSTEM_ENV,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+                )
+            except OSError:
+                raise Failure(503, "gemini_native_worker_unavailable") from None
+            self.pid = self.native_tui.pid
+            return
         try:
             lock, vt = native_module_impl.query_free_vt(
                 self.host.directory / "native-vt.lock"
@@ -799,25 +1046,27 @@ class NativeAgy(Agy):
             code = getattr(error, "code", "gemini_native_tty_unavailable")
             raise Failure(503, code) from None
         try:
-            self.native_tui = subprocess.Popen(
-                [
-                    "openvt",
-                    "-c",
-                    str(vt),
-                    "-w",
-                    "--",
-                    sys.executable,
-                    "-I",
-                    "-c",
-                    VT_EXEC,
-                    str(self.directory / "tui.pid"),
-                    *argv,
-                ],
-                env=SYSTEM_ENV,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
+            self.native_tui = spawn(
+                lambda: subprocess.Popen(
+                    [
+                        "openvt",
+                        "-c",
+                        str(vt),
+                        "-w",
+                        "--",
+                        sys.executable,
+                        "-I",
+                        "-c",
+                        VT_EXEC,
+                        str(self.directory / "tui.pid"),
+                        *argv,
+                    ],
+                    env=SYSTEM_ENV,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
             )
             pid_path = self.directory / "tui.pid"
             pid_deadline = time.monotonic() + 5
@@ -836,20 +1085,23 @@ class NativeAgy(Agy):
         finally:
             os.close(lock)
         self.pid = self.native_tui_pid
-        self.native_invocation = native_module_impl.NativeInvocation(
-            {
-                "socket": str(self.native_dir / "kernel.sock"),
-                "token": self.native_token,
-                "model": self.model,
-                "request_id": self.attempt,
-                "prompt": self.prompt,
-                "startup_timeout": 45,
-            },
-            secrets=self.credentials,
-        )
-        self.token_bytes = None
-        self.prompt = None
-        self.credentials = ()
+        if self.prompt is not None:
+            try:
+                self.native_invocation = native_module_impl.NativeInvocation(
+                    {
+                        "socket": str(self.native_dir / "kernel.sock"),
+                        "token": self.native_token,
+                        "model": self.model,
+                        "request_id": self.attempt,
+                        "prompt": self.prompt,
+                        "startup_timeout": 45,
+                    },
+                    secrets=self.credentials,
+                )
+            except native_module_impl.NativeFailure as error:
+                raise Failure(503, error.code) from None
+            self.prompt = None
+            self.credentials = ()
 
     def poll(self):
         if self.egress.poll() is not None:
@@ -861,15 +1113,31 @@ class NativeAgy(Agy):
                     "message": "Gemini egress stopped",
                 },
             }
-        if self.native_tui is None or self.native_tui.poll() is not None:
+        result = self.native_invocation.poll()
+        if result["state"] == "completed":
+            return result
+        wrapper_exited = self.native_tui is None or self.native_tui.poll() is not None
+        diagnostic = self.native_diagnostic.poll(
+            final=wrapper_exited or result["state"] != "running"
+        )
+        if diagnostic is not None:
+            return {
+                "state": "failed",
+                "text": "",
+                "error": {"code": diagnostic},
+            }
+        if result["state"] != "running":
+            return result
+        if wrapper_exited:
             return {
                 "state": "failed",
                 "text": "",
                 "error": {"code": "gemini_native_worker_unavailable"},
             }
-        return self.native_invocation.poll()
+        return result
 
     def close(self, preserve=False):
+        wrapper_status = self.native_tui.poll() if self.native_tui is not None else None
         try:
             if self.native_invocation is not None:
                 self.native_invocation.close()
@@ -885,13 +1153,43 @@ class NativeAgy(Agy):
                 if self.native_tui is not None:
                     self._stop_process_group(self.native_tui)
                     self.native_tui = None
+                    outcome = self.native_exit_reader(self.native_dir, self.uid)
+                    if outcome is not None:
+                        child, status = outcome
+                        kind = "exit_code" if status >= 0 else "signal"
+                        print(
+                            f"Gemini native child={child} {kind}={abs(status)}",
+                            file=sys.stderr,
+                        )
+                    elif wrapper_status is not None:
+                        kind = "exit_code" if wrapper_status >= 0 else "signal"
+                        print(
+                            f"Gemini native wrapper=openvt {kind}={abs(wrapper_status)} child_record=missing",
+                            file=sys.stderr,
+                        )
+                    else:
+                        print(
+                            "Gemini native wrapper=openvt status=running_before_cleanup child_record=missing",
+                            file=sys.stderr,
+                        )
             finally:
                 self.pid = None
                 self.native_tui_pid = None
-                self.token_bytes = None
                 self.credentials = ()
                 self.prompt = None
-                super().close(preserve)
+                try:
+                    if self.native_diagnostic is not None:
+                        self.native_diagnostic.close()
+                finally:
+                    try:
+                        if (
+                            getattr(self, "_owns_native_dir", False)
+                            and self.native_dir is not None
+                        ):
+                            shutil.rmtree(self.native_dir, ignore_errors=True)
+                            self._owns_native_dir = False
+                    finally:
+                        super().close(preserve)
 
     @staticmethod
     def _stop_process_group(process):
@@ -905,6 +1203,62 @@ class NativeAgy(Agy):
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=5)
+
+
+class NativeSession(NativeAgy):
+    """Warm, reusable CRAGGemini native-worker session (CRAG-aligned)."""
+
+    def __init__(self, host, environment, proxy_url, auth, model):
+        super().__init__(host, environment, proxy_url, auth, model, None)
+        self.last_used = time.monotonic()
+
+    @property
+    def socket_path(self):
+        return str(self.native_dir / "kernel.sock")
+
+    def is_alive(self):
+        return (
+            self.egress is not None
+            and self.egress.poll() is None
+            and self.native_tui is not None
+            and self.native_tui.poll() is None
+        )
+
+    def health(self, timeout=0.3):
+        if not self.is_alive():
+            return None
+        return native_module().worker_status(
+            self.socket_path, self.native_token, timeout=timeout
+        )
+
+    def is_ready(self):
+        status = self.health(timeout=0.25)
+        return bool(
+            status
+            and status.get("ready") is True
+            and status.get("needs_recovery") is not True
+        )
+
+    def open_stream(self, request_id, body_obj, *, gateway_policy=None):
+        if not self.is_alive():
+            raise native_module().NativeFailure("gemini_native_worker_unavailable", 503)
+        return native_module().open_worker_stream(
+            self.socket_path,
+            self.native_token,
+            self.model,
+            request_id,
+            body_obj,
+            startup_timeout=45,
+            gateway_policy=gateway_policy,
+        )
+
+    def cancel_turn(self, request_id):
+        try:
+            return native_module().cancel_worker_request(
+                self.socket_path, self.native_token, request_id
+            )
+        except OSError:
+            return False
 
 
 class Login(Agy):
@@ -1187,14 +1541,22 @@ class Host:
         self.verified_payload = None
         self.payload_version = None
         self.payload_state = "not_configured"
+        self.payload_mode = "legacy_release"
         self.payload_issue = None
+        self.crag_host_dir = getattr(args, "crag_host_dir", None)
         self.egress = args.egress
         self.uid_base = args.uid_base
         self.egress_uid = args.uid_base + MAX_ENVIRONMENTS
         self.state_file = self.directory / "environments.json"
+        self.lock = threading.RLock()
+        self._spawner = _Spawner()
         self.pending = {}
         self.terminals = {}
         self.runs = {}
+        self.native_sessions = {}
+        self._session_locks = {}
+        self.active_infers = {}
+        self.last_inference = {}
         self.network_scope = os.stat("/proc/self/ns/net").st_ino
         self.environments = (
             json.loads(self.state_file.read_bytes()) if self.state_file.exists() else {}
@@ -1242,12 +1604,45 @@ class Host:
                             shutil.rmtree(stale)
         if changed:
             self.save()
+        if NATIVE_RUNTIME_ROOT.exists():
+            try:
+                check_root_owned(NATIVE_RUNTIME_ROOT)
+                os.chmod(NATIVE_RUNTIME_ROOT, 0o711)
+                for stale in NATIVE_RUNTIME_ROOT.iterdir():
+                    if stale.is_dir() and re.fullmatch(r"s[0-9]+-[a-f0-9]{8,16}", stale.name):
+                        shutil.rmtree(stale, ignore_errors=True)
+            except (OSError, RuntimeError):
+                pass
         self.inspect_payload()
+
+    def spawn(self, fn):
+        return self._spawner.call(fn)
+
+    @staticmethod
+    def is_crag_encrypted_payload(source):
+        try:
+            raw = read_root_file(source / "manifest.json", 65536)
+            manifest = json.loads(raw)
+        except (OSError, RuntimeError, ValueError):
+            return False
+        auth = manifest.get("authorization") if isinstance(manifest, dict) else None
+        return (
+            isinstance(manifest, dict)
+            and manifest.get("family") == "crag"
+            and manifest.get("encrypted") is True
+            and isinstance(auth, dict)
+            and auth.get("product") == "craggemini"
+        )
 
     def verify_payload(self, source, public_key, install=False):
         check_root_owned(source)
         check_root_owned(public_key)
-        for name in PAYLOAD_FILES:
+        members = (
+            CRAG_PAYLOAD_FILES
+            if self.is_crag_encrypted_payload(source)
+            else PAYLOAD_FILES
+        )
+        for name in members:
             check_root_owned(source / name)
         output = subprocess.run(
             [
@@ -1287,15 +1682,28 @@ class Host:
         source = self.payload if installed else self.payload_source
         if source is None or not source.is_dir():
             raise Failure(503, "gemini_payload_source_missing")
-        if any(not (source / name).is_file() for name in PAYLOAD_FILES):
+        encrypted = self.is_crag_encrypted_payload(source)
+        members = CRAG_PAYLOAD_FILES if encrypted else PAYLOAD_FILES
+        if any(not (source / name).is_file() for name in members):
             raise Failure(503, "gemini_payload_incomplete")
         if installed and any(
             not os.access(source / name, os.X_OK) for name in ("agy", "craggemini")
         ):
             raise Failure(503, "gemini_payload_incomplete")
         digest = hashlib.sha256(
-            read_root_file(source / "manifest.json", 8192)
+            read_root_file(source / "manifest.json", 65536 if encrypted else 8192)
         ).hexdigest()
+        if encrypted:
+            public_key = (
+                self.public_key
+                if self.public_key.is_file()
+                else source / "crag-license-public.pem"
+            )
+            if not public_key.is_file():
+                raise Failure(503, "gemini_public_key_missing")
+            check_root_owned(public_key)
+            self._payload_mode = "crag_subscription"
+            return source, installed, public_key, None, digest
         default = (
             self.release_verifier(self.default_release)
             if self.default_release
@@ -1318,11 +1726,17 @@ class Host:
         if not public_key.is_file():
             raise Failure(503, "gemini_public_key_missing")
         check_root_owned(public_key)
+        self._payload_mode = "legacy_release"
         return source, installed, public_key, verifier, digest
 
     def payload_identity(self, source, public_key, digest):
+        members = (
+            CRAG_PAYLOAD_FILES
+            if self.is_crag_encrypted_payload(source)
+            else PAYLOAD_FILES
+        )
         # Hash large binaries only on first use or when a trusted input changes.
-        files = (public_key, source, *(source / name for name in PAYLOAD_FILES))
+        files = (public_key, source, *(source / name for name in members))
         stats = (entry.lstat() for entry in files)
         identities = tuple(
             (
@@ -1348,7 +1762,9 @@ class Host:
         self, *, materialize=False, verify_again=False, legacy_install=False
     ):
         try:
+            self._payload_mode = "legacy_release"
             source, installed, public_key, verifier, digest = self.payload_config()
+            mode = self._payload_mode
             install = not installed and (
                 materialize or (legacy_install and verifier is None)
             )
@@ -1364,7 +1780,10 @@ class Host:
                     version = self.verify_payload(source, public_key, install=install)
                     if install:
                         target_digest = hashlib.sha256(
-                            read_root_file(self.payload / "manifest.json", 8192)
+                            read_root_file(
+                                self.payload / "manifest.json",
+                                65536 if mode == "crag_subscription" else 8192,
+                            )
                         ).hexdigest()
                         if target_digest != digest:
                             raise RuntimeError(
@@ -1373,7 +1792,9 @@ class Host:
                         identity = self.payload_identity(
                             self.payload, public_key, digest
                         )
-                    elif self.payload_identity(source, public_key, digest) != identity:
+                    elif (
+                        self.payload_identity(source, public_key, digest) != identity
+                    ):
                         raise RuntimeError("Gemini payload changed during verification")
                     self.verified_payload = (identity, version)
                 self.payload_state = (
@@ -1385,7 +1806,8 @@ class Host:
                 self.payload_state = "install_on_create"
             else:
                 raise Failure(503, "gemini_payload_not_installed")
-            self.payload_version = version
+            self.payload_mode = mode
+            self.set_payload_version(version)
             self.payload_issue = None
             return verifier
         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
@@ -1413,8 +1835,13 @@ class Host:
             )
             else "invalid"
         )
-        self.payload_version = None
+        self.set_payload_version(None)
         self.verified_payload = None
+
+    def set_payload_version(self, version):
+        if version != self.payload_version:
+            self.last_inference.clear()
+            self.payload_version = version
 
     def inspect_payload(self):
         try:
@@ -1615,12 +2042,94 @@ class Host:
         if terminal:
             terminal.close()
 
+    def inference_binding(self, env):
+        return (
+            env["proxy_id"],
+            env.get("profile"),
+            env.get("auth_method", "oauth"),
+            env.get("oauth_imported", False),
+            env["auth_state"],
+            env.get("updated_at"),
+            self.payload_version,
+        )
+
+    def last_inference_view(self, env):
+        entry = self.last_inference.get(env["id"])
+        if entry and entry[0] == self.inference_binding(env):
+            return {
+                "last_inference": entry[1].copy(),
+                "last_inference_proxy_sha256": entry[2],
+            }
+        return {"last_inference": None}
+
+    @staticmethod
+    def finish_inference(evidence, state, code=None):
+        if state == "failed" and code == "gemini_inference_cancelled":
+            state = "cancelled"
+        evidence.update(
+            state=state,
+            finished_at=now(),
+            error_code=(
+                code
+                if isinstance(code, str) and code in INFERENCE_ERROR_CODES
+                else None
+            ),
+        )
+
+    def touch_environment(self, env):
+        # Explicit invalidation also handles multiple mutations in one second.
+        self.last_inference.pop(env["id"], None)
+        env["updated_at"] = now()
+
+    def _session_lock(self, identifier):
+        with self.lock:
+            locks = getattr(self, "_session_locks", None)
+            if locks is None:
+                locks = {}
+                self._session_locks = locks
+            lock = locks.get(identifier)
+            if lock is None:
+                lock = threading.Lock()
+                locks[identifier] = lock
+            return lock
+
+    def stop_native_session(self, identifier):
+        session = self.native_sessions.pop(identifier, None)
+        if session is not None:
+            session.close()
+
+    def cancel_infer(self, identifier, request_id=None):
+        slots = self.active_infers.get(identifier)
+        if not slots:
+            return False
+        if request_id is not None:
+            entry = slots.get(request_id)
+            if not entry:
+                return False
+            targets = [entry]
+        else:
+            targets = list(slots.values())
+        for entry in targets:
+            entry["cancel_event"].set()
+            cancel_fn = entry.get("cancel_fn")
+            if callable(cancel_fn):
+                try:
+                    cancel_fn()
+                except Exception:
+                    pass
+        return bool(targets)
+
     def stop_run(self, identifier):
         entry = self.runs.pop(identifier, None)
         if entry and entry["process"] is not None:
+            self.finish_inference(
+                entry["evidence"], "cancelled", "gemini_inference_cancelled"
+            )
             entry["process"].close()
 
     def running(self, identifier):
+        if self.active_infers.get(identifier):
+            return True
         entry = self.runs.get(identifier)
         return bool(entry and entry["process"] is not None)
 
@@ -1629,9 +2138,7 @@ class Host:
             return entry["result"]
         result = entry["process"].poll()
         if result["state"] != "running" or time.monotonic() >= entry["deadline"]:
-            entry["process"].close()
-            entry["process"] = None
-            entry["result"] = (
+            result = (
                 result
                 if result["state"] != "running"
                 else {
@@ -1643,11 +2150,20 @@ class Host:
                     },
                 }
             )
+            error = result.get("error") if result["state"] == "failed" else None
+            self.finish_inference(
+                entry["evidence"],
+                result["state"],
+                error.get("code") if isinstance(error, dict) else None,
+            )
+            entry["process"].close()
+            entry["process"] = None
+            entry["result"] = result
             entry["deadline"] = time.monotonic() + RUN_TTL
             return entry["result"]
         return result
 
-    def operation_account(self, env):
+    def operation_account(self, env, *, allow_concurrent_infer=False):
         self.ensure_payload(legacy_install=False)
         if env["auth_state"] != "authorized":
             code = (
@@ -1657,8 +2173,17 @@ class Host:
             )
             raise Failure(409, code)
         identifier = env["id"]
+        run_entry = self.runs.get(identifier)
+        run_active = bool(run_entry and run_entry["process"] is not None)
+        active_slots = len(self.active_infers.get(identifier, {}))
+        infer_busy = (
+            active_slots >= env_concurrency(env)
+            if allow_concurrent_infer
+            else active_slots > 0
+        )
         if (
-            self.running(identifier)
+            run_active
+            or infer_busy
             or identifier in self.terminals
             or identifier in self.pending
         ):
@@ -1728,27 +2253,54 @@ class Host:
             raise Failure(409, "gemini_model_unavailable")
         identifier = env["id"]
         self.stop_run(identifier)
-        if key:
-            process = invocation_module().Invocation(
-                account_command(uid, "api-key-chat"),
-                SYSTEM_ENV,
-                prompt,
-                input_bytes=json.dumps(
-                    {
-                        "api_key": key,
-                        "proxy_url": proxy_url,
-                        "prompt": prompt,
-                        "model": model,
-                    }
-                ).encode(),
-                secrets=(key,),
+        self.stop_native_session(identifier)
+        evidence = {
+            "state": "running",
+            "model": model,
+            "started_at": now(),
+            "finished_at": None,
+            "error_code": None,
+        }
+        # Runs may outlive a binding change. Updating their own evidence object
+        # must not put an invalidated record back into inventory.
+        # Keep the proxy identity on the trusted control socket only. A proxy
+        # pool edit can change the endpoint or credentials without a new ID.
+        self.last_inference[identifier] = (
+            self.inference_binding(env),
+            evidence,
+            hashlib.sha256(proxy_url.encode()).hexdigest(),
+        )
+        try:
+            if key:
+                process = invocation_module().Invocation(
+                    account_command(uid, "api-key-chat"),
+                    SYSTEM_ENV,
+                    prompt,
+                    input_bytes=json.dumps(
+                        {
+                            "api_key": key,
+                            "proxy_url": proxy_url,
+                            "prompt": prompt,
+                            "model": model,
+                        }
+                    ).encode(),
+                    secrets=(key,),
+                )
+            else:
+                process = NativeAgy(self, env, proxy_url, auth, model, prompt)
+        except Failure as error:
+            self.finish_inference(
+                evidence, "failed", error.code or "gemini_inference_start_failed"
             )
-        else:
-            process = NativeAgy(self, env, proxy_url, auth, model, prompt)
+            raise
+        except (OSError, subprocess.SubprocessError, ValueError, RuntimeError):
+            self.finish_inference(evidence, "failed", "gemini_inference_start_failed")
+            raise
         run_id = secrets.token_hex(16)
         self.runs[identifier] = {
             "id": run_id,
             "process": process,
+            "evidence": evidence,
             "deadline": time.monotonic() + RUN_TTL,
         }
         return {"run_id": run_id}
@@ -1777,6 +2329,7 @@ class Host:
 
     def save_environment(self, env, updated):
         private_json(self.state_file, {**self.environments, env["id"]: updated})
+        self.last_inference.pop(env["id"], None)
         env.clear()
         env.update(updated)
 
@@ -1795,6 +2348,7 @@ class Host:
             raise Failure(409, "gemini_operation_busy")
         if new_id != env["proxy_id"]:
             self.stop_run(identifier)
+            self.stop_native_session(identifier)
             updated = {**env, "proxy_id": new_id, "updated_at": now()}
             updated.pop("call_models", None)
             updated.pop("account", None)
@@ -1862,6 +2416,7 @@ class Host:
         proxy_config(proxy_url)
         size = terminal_size(body, required=True)
         self.ensure_payload()
+        self.stop_native_session(identifier)
         try:
             issue = self.oauth_runtime_issue()
             if issue:
@@ -1871,7 +2426,8 @@ class Host:
             )
         except Failure as error:
             if error.code == TERMINAL_OAUTH:
-                env.update(auth_state="reauth_required", updated_at=now())
+                env["auth_state"] = "reauth_required"
+                self.touch_environment(env)
                 self.save()
                 raise
             raise Failure(503, "gemini_terminal_unavailable") from error
@@ -1881,38 +2437,59 @@ class Host:
 
     def close(self):
         failed = False
-        for stop, active in (
-            (self.stop_run, self.runs),
-            (self.stop_terminal, self.terminals),
-            (self.cancel, self.pending),
-        ):
-            for identifier in list(active):
-                try:
-                    stop(identifier)
-                except (OSError, subprocess.SubprocessError):
-                    failed = True
+        with self.lock:
+            for identifier in list(self.active_infers):
+                self.cancel_infer(identifier)
+            for stop, active in (
+                (self.stop_run, self.runs),
+                (self.stop_native_session, self.native_sessions),
+                (self.stop_terminal, self.terminals),
+                (self.cancel, self.pending),
+            ):
+                for identifier in list(active):
+                    try:
+                        stop(identifier)
+                    except (OSError, subprocess.SubprocessError):
+                        failed = True
         if failed:
             raise RuntimeError("Gemini child cleanup failed")
 
     def cleanup(self):
+        with self.lock:
+            self._cleanup_locked()
+
+    def _cleanup_locked(self):
+        now_mono = time.monotonic()
+        for identifier, session in list(self.native_sessions.items()):
+            if self.active_infers.get(identifier):
+                continue
+            if (
+                not session.is_alive()
+                or now_mono - session.last_used >= NATIVE_SESSION_TTL
+            ):
+                self.stop_native_session(identifier)
         for identifier, entry in list(self.runs.items()):
             if entry["process"] is None and time.monotonic() >= entry["deadline"]:
                 self.stop_run(identifier)
             else:
                 self.update_run(entry)
-        if self.terminals or self.pending or self.runs:
+        if self.terminals or self.pending or self.runs or self.native_sessions:
             try:
                 self.ensure_payload(legacy_install=False)
             except Failure:
+                for identifier in list(self.active_infers):
+                    self.cancel_infer(identifier)
                 for identifier in list(self.runs):
                     self.stop_run(identifier)
+                for identifier in list(self.native_sessions):
+                    self.stop_native_session(identifier)
                 for identifier in list(self.terminals):
                     self.stop_terminal(identifier)
                 for identifier in list(self.pending):
                     self.cancel(identifier)
-                    self.environments[identifier].update(
-                        auth_state="reauth_required", updated_at=now()
-                    )
+                    env = self.environments[identifier]
+                    env["auth_state"] = "reauth_required"
+                    self.touch_environment(env)
                     self.save()
                 return
         for identifier, terminal in list(self.terminals.items()):
@@ -1937,9 +2514,8 @@ class Host:
                 old_profile = env.get("profile")
                 imported = env.pop("oauth_imported", False)
                 login.close(preserve=True)
-                env.update(
-                    auth_state="authorized", profile=login.attempt, updated_at=now()
-                )
+                env.update(auth_state="authorized", profile=login.attempt)
+                self.touch_environment(env)
                 env.pop("account", None)
                 env.pop("call_models", None)
                 self.save()
@@ -1954,25 +2530,270 @@ class Host:
             except Failure:
                 self.cancel(identifier)
                 env["auth_state"] = "reauth_required"
-                env["updated_at"] = now()
+                self.touch_environment(env)
                 self.save()
+
+    def ensure_env_machine_id(self, env):
+        env_dir = self.directory / env["id"]
+        env_dir.mkdir(mode=0o711, exist_ok=True)
+        env_dir.chmod(0o711)
+        target = env_dir / "machine-id"
+        if target.exists():
+            info = target.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+                raise Failure(503, "license_invalid")
+            return target
+        staging = env_dir / f".machine-id.{secrets.token_hex(8)}"
+        try:
+            with os.fdopen(
+                os.open(staging, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644), "w"
+            ) as out:
+                out.write(secrets.token_hex(16) + "\n")
+                out.flush()
+                os.fsync(out.fileno())
+            os.chmod(staging, 0o644)
+            staging.replace(target)
+        finally:
+            staging.unlink(missing_ok=True)
+        return target
+
+    def ensure_env_license_dir(self, env):
+        env_dir = self.directory / env["id"]
+        env_dir.mkdir(mode=0o711, exist_ok=True)
+        env_dir.chmod(0o711)
+        uid = self.uid_base + env["slot"]
+        target = env_dir / "crag-license"
+        if target.exists() or target.is_symlink():
+            info = target.lstat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != uid or (info.st_mode & 0o7777) != 0o700:
+                raise Failure(503, "license_invalid")
+            return target
+        target.mkdir(mode=0o700)
+        os.chown(target, uid, uid)
+        os.chmod(target, 0o700)
+        return target
+
+    def run_craggemini_license_cli(self, env, extra_args, input_code=None):
+        if env.get("auth_method", "oauth") != "oauth":
+            raise Failure(409, "gemini_subscription_oauth_only")
+        self.ensure_payload(legacy_install=False)
+        uid = self.uid_base + env["slot"]
+        machine_id = self.ensure_env_machine_id(env)
+        license_dir = self.ensure_env_license_dir(env)
+        staging_dir = None
+        try:
+            bwrap_args = [
+                "setpriv",
+                "--reuid",
+                str(uid),
+                "--regid",
+                str(uid),
+                "--clear-groups",
+                "--no-new-privs",
+                "--inh-caps=-all",
+                "--ambient-caps=-all",
+                "--bounding-set=-all",
+                "bwrap",
+                "--unshare-pid",
+                "--unshare-ipc",
+                "--unshare-uts",
+                "--unshare-net",
+                "--die-with-parent",
+                "--clearenv",
+                "--ro-bind",
+                "/usr",
+                "/usr",
+                "--ro-bind-try",
+                "/lib",
+                "/lib",
+                "--ro-bind-try",
+                "/lib64",
+                "/lib64",
+                "--ro-bind-try",
+                "/bin",
+                "/bin",
+                "--ro-bind",
+                str(machine_id),
+                "/etc/machine-id",
+                "--dir",
+                "/run",
+                "--dir",
+                "/run/kin",
+                "--dir",
+                "/run/kin/crag-license",
+                "--bind",
+                str(license_dir),
+                "/run/kin/crag-license",
+                "--ro-bind",
+                str(self.payload / "craggemini"),
+                "/opt/craggemini",
+                "--proc",
+                "/proc",
+                "--tmpfs",
+                "/tmp",
+            ]
+            if self.crag_host_dir is not None and self.crag_host_dir.is_dir():
+                bwrap_args.extend(
+                    [
+                        "--dir",
+                        "/run/kin/crag-host",
+                        "--ro-bind",
+                        str(self.crag_host_dir),
+                        "/run/kin/crag-host",
+                    ]
+                )
+            if self.payload_mode == "crag_subscription":
+                bwrap_args.extend(
+                    [
+                        "--ro-bind",
+                        str(self.payload / "craggemini.payload.enc"),
+                        "/opt/craggemini.payload.enc",
+                        "--ro-bind",
+                        str(self.payload / "manifest.json"),
+                        "/opt/manifest.json",
+                        "--ro-bind",
+                        str(self.payload / "crag-license-public.pem"),
+                        "/opt/crag-license-public.pem",
+                    ]
+                )
+            cli_args = [
+                "/opt/craggemini",
+                "--vm-id",
+                env["id"],
+                "--license-dir",
+                "/run/kin/crag-license",
+                "--host-license-dir",
+                "/run/kin/crag-host",
+                *extra_args,
+            ]
+            if input_code is not None:
+                staging_dir = self.directory / env["id"] / f".activate-{secrets.token_hex(8)}"
+                staging_dir.mkdir(mode=0o700)
+                os.chown(staging_dir, uid, uid)
+                code_file = staging_dir / "code.txt"
+                with os.fdopen(
+                    os.open(code_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600),
+                    "w",
+                    encoding="utf-8",
+                ) as out:
+                    out.write(input_code.strip() + "\n")
+                    out.flush()
+                    os.fsync(out.fileno())
+                os.chown(code_file, uid, uid)
+                os.chmod(code_file, 0o600)
+                bwrap_args.extend(["--dir", "/tmp/activate", "--ro-bind", str(staging_dir), "/tmp/activate"])
+                cli_args.extend(["--license-activate-file", "/tmp/activate/code.txt"])
+            result = subprocess.run(
+                bwrap_args + ["--"] + cli_args,
+                timeout=10,
+                capture_output=True,
+                text=True,
+                env=SYSTEM_ENV,
+            )
+            if result.returncode != 0:
+                raise Failure(403, "license_invalid")
+            data = json.loads(result.stdout)
+            if not isinstance(data, dict):
+                raise Failure(503, "license_invalid")
+            return data
+        except Failure:
+            raise
+        except (OSError, subprocess.SubprocessError, ValueError):
+            raise Failure(503, "license_unconfigured") from None
+        finally:
+            if staging_dir is not None:
+                shutil.rmtree(staging_dir, ignore_errors=True)
+
+    def license_status(self, env):
+        if env.get("auth_method", "oauth") == "api_key":
+            return {
+                "product": "craggemini",
+                "status": "not_required",
+                "valid": True,
+                "seat_required": False,
+                "vm_id": env["id"],
+            }
+        try:
+            status = self.run_craggemini_license_cli(env, ["--license-status"])
+            status.setdefault("product", "craggemini")
+            status["seat_required"] = True
+            return status
+        except Failure as error:
+            code = error.code if error.code in LICENSE_ERROR_CODES else "license_unconfigured"
+            return {
+                "product": "craggemini",
+                "status": "unlicensed" if code == "license_required" else "unconfigured",
+                "valid": False,
+                "seat_required": True,
+                "vm_id": env["id"],
+                "code": code,
+            }
+
+    def license_release_candidate(self, env):
+        if env.get("auth_method", "oauth") != "oauth":
+            return {"permit_sha256": None, "seat_required": False}
+        reg_file = self.directory / env["id"] / "crag-license" / "registration.code"
+        try:
+            fd = os.open(reg_file, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as stream:
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_size > 65536:
+                    return {"permit_sha256": None, "seat_required": True}
+                text = stream.read(65537).decode("utf-8", errors="strict").strip()
+            if text.startswith("CRAGS1."):
+                return {
+                    "permit_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                    "seat_required": True,
+                }
+            return {"permit_sha256": None, "seat_required": True}
+        except (OSError, UnicodeDecodeError):
+            return {"permit_sha256": None, "seat_required": True}
+
+    def license_clear(self, env):
+        identifier = env["id"]
+        self.cancel_infer(identifier)
+        self.stop_run(identifier)
+        self.stop_native_session(identifier)
+        reg_file = self.directory / identifier / "crag-license" / "registration.code"
+        try:
+            if reg_file.exists() and not reg_file.is_symlink():
+                reg_file.unlink()
+        except OSError:
+            pass
+        return {"cleared": True}
 
     def view(self, env):
         account = env.get("account", {})
+        method = env.get("auth_method", "oauth")
+        session = self.native_sessions.get(env["id"])
+        runtime_ready = (
+            (method == "api_key" and env["auth_state"] == "authorized" and bool(env.get("call_models")))
+            or (session is not None and session.is_alive())
+        )
+        crag_license = (
+            self.license_status(env)
+            if self.payload_mode == "crag_subscription"
+            else None
+        )
         return {
             "id": env["id"],
             "name": env["name"],
             "proxy_id": env["proxy_id"],
             "auth_state": env["auth_state"],
-            "auth_method": env.get("auth_method", "oauth"),
+            "auth_method": method,
             **({"oauth_imported": True} if env.get("oauth_imported") else {}),
-            "runtime_ready": False,
+            "runtime_ready": runtime_ready,
+            "max_concurrency": env_concurrency(env),
+            "active_slots": len(self.active_infers.get(env["id"], {})),
+            "capabilities": list(FULL_CAPABILITIES if method == "api_key" else NATIVE_CAPABILITIES),
             "kernel_version": self.payload_version,
             "models": env.get("call_models", account.get("models", [])),
             "models_discovered": bool(env.get("call_models")),
             "account": account,
+            **({"crag_license": crag_license} if crag_license is not None else {}),
             "created_at": env.get("created_at"),
             "updated_at": env.get("updated_at"),
+            **self.last_inference_view(env),
         }
 
     def probe_imported_account(self, slot, proxy_url, credential):
@@ -2012,16 +2833,67 @@ class Host:
             env["account"] = account
         if account.get("state") == "reauth_required":
             self.stop_run(env["id"])
+            self.stop_native_session(env["id"])
             env.pop("call_models", None)
             self.stop_terminal(env["id"])
             env["auth_state"] = "reauth_required"
         elif account.get("state") in ("ok", "partial"):
             env["auth_state"] = "authorized"
-        env["updated_at"] = now()
+        self.touch_environment(env)
         self.save()
         return self.view(env)
 
     def request(self, operation, body):
+        with self.lock:
+            return self._locked_request(operation, body)
+
+    def _locked_request(self, operation, body):
+        if operation in {
+            "list",
+            "get",
+            "maintenance-status",
+            "test-chat-status",
+            "test-chat-cancel",
+            "infer-cancel",
+            "terminal-io",
+            "terminal-stop",
+        }:
+            return self._request(operation, body)
+        descriptor = os.open(
+            self.directory / "maintenance.lock",
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+            0o600,
+        )
+        try:
+            info = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != 0
+                or info.st_nlink != 1
+                or info.st_mode & 0o077
+            ):
+                raise Failure(503, "gemini_maintenance_lock_invalid")
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise Failure(409, "gemini_operation_busy") from None
+            pending = self.directory / "maintenance.pending"
+            if pending.exists() or pending.is_symlink():
+                raise Failure(409, "gemini_operation_busy")
+            return self._request(operation, body)
+        finally:
+            os.close(descriptor)
+
+    def _request(self, operation, body):
+        if operation == "maintenance-status":
+            return {
+                "busy": bool(
+                    self.pending
+                    or self.terminals
+                    or any(self.active_infers.values())
+                    or any(self.running(key) for key in self.runs)
+                )
+            }
         if operation == "install-payload":
             self.load_payload(materialize=True, verify_again=True)
             return {
@@ -2034,6 +2906,7 @@ class Host:
             self.inspect_payload()
             return {
                 "payload_state": self.payload_state,
+                "payload_mode": self.payload_mode,
                 "payload_issue": self.payload_issue,
                 "release_activated": self.payload_state == "installed",
                 "oauth_runtime_issue": self.oauth_runtime_issue(),
@@ -2058,6 +2931,13 @@ class Host:
                 or (method == "oauth" and api_key is not None)
             ):
                 raise Failure(400)
+            raw_concurrency = body.get("max_concurrency")
+            if raw_concurrency is None:
+                max_concurrency = 1
+            elif type(raw_concurrency) is int and 1 <= raw_concurrency <= MAX_CONCURRENCY:
+                max_concurrency = raw_concurrency
+            else:
+                raise Failure(400, "gemini_invalid_concurrency")
             imported = body.get("oauth_account")
             credential = None
             if imported is not None:
@@ -2104,6 +2984,7 @@ class Host:
                 "name": name.strip(),
                 "proxy_id": proxy_id,
                 "slot": slot,
+                "max_concurrency": max_concurrency,
                 "auth_method": method,
                 "auth_state": (
                     "authorized" if method == "api_key" or credential else "unverified"
@@ -2134,18 +3015,60 @@ class Host:
             return {
                 **self.view(env),
                 "payload_state": self.payload_state,
+                "payload_mode": self.payload_mode,
                 "payload_issue": self.payload_issue,
             }
+        if operation == "license-machine-code":
+            return self.run_craggemini_license_cli(env, ["--license-machine-code"])
+        if operation == "license-activate":
+            code = body.get("code")
+            if not isinstance(code, str) or not 16 <= len(code.strip()) <= 16384:
+                raise Failure(400, "gemini_subscription_invalid_code")
+            status = self.run_craggemini_license_cli(env, [], input_code=code)
+            self.stop_native_session(identifier)
+            return status
+        if operation == "license-status":
+            return {"license": self.license_status(env)}
+        if operation == "license-release-candidate":
+            return self.license_release_candidate(env)
+        if operation == "license-clear":
+            return self.license_clear(env)
         if operation == "proxy-bind":
             return self.bind_proxy(env, body)
+        if operation == "concurrency-set":
+            raw_concurrency = body.get("max_concurrency")
+            if type(raw_concurrency) is not int or not 1 <= raw_concurrency <= MAX_CONCURRENCY:
+                raise Failure(400, "gemini_invalid_concurrency")
+            if (
+                self.running(identifier)
+                or identifier in self.terminals
+                or identifier in self.pending
+            ):
+                raise Failure(409, "gemini_operation_busy")
+            if env_concurrency(env) != raw_concurrency:
+                self.stop_native_session(identifier)
+                self.save_environment(
+                    env,
+                    {**env, "max_concurrency": raw_concurrency, "updated_at": now()},
+                )
+            return self.view(env)
         if operation in ("test-chat-status", "test-chat-cancel"):
             return self.run_request(operation, identifier, body)
+        if operation == "infer-cancel":
+            req_id = body.get("request_id")
+            if req_id is not None and (
+                not isinstance(req_id, str) or not INFER_REQUEST_ID.fullmatch(req_id)
+            ):
+                raise Failure(400)
+            return {"cancelled": self.cancel_infer(identifier, req_id)}
         if operation in ("terminal-start", "terminal-io", "terminal-stop"):
             return self.terminal_request(operation, env, body)
         if operation == "logout":
             if env.get("auth_method", "oauth") != "oauth":
                 raise Failure(409)
+            self.cancel_infer(identifier)
             self.stop_run(identifier)
+            self.stop_native_session(identifier)
             self.stop_terminal(identifier)
             self.cancel(identifier)
             self.recover_network(self.directory / identifier, env["slot"])
@@ -2159,16 +3082,18 @@ class Host:
             env.pop("call_models", None)
             if env["auth_state"] != "disabled":
                 env["auth_state"] = "reauth_required"
-            env["updated_at"] = now()
+            self.touch_environment(env)
             self.save()
             return {}
         if operation in ("delete", "disable"):
+            self.cancel_infer(identifier)
             self.stop_run(identifier)
+            self.stop_native_session(identifier)
             self.stop_terminal(identifier)
             self.cancel(identifier)
             self.recover_network(self.directory / identifier, env["slot"])
             env["auth_state"] = "disabled"
-            env["updated_at"] = now()
+            self.touch_environment(env)
             self.save()
             if operation == "delete":
                 shutil.rmtree(self.directory / identifier)
@@ -2179,6 +3104,7 @@ class Host:
             raise Failure(409)
         proxy_url = body.get("proxy_url")
         proxy_config(proxy_url)
+        verify_proxy_sha256(body, proxy_url)
         if operation == "proxy-probe":
             return self.probe_proxy(env, proxy_url)
         if operation == "models":
@@ -2201,8 +3127,9 @@ class Host:
             self.ensure_oauth_runtime()
             self.cancel(identifier)
             self.stop_run(identifier)
+            self.stop_native_session(identifier)
             env["auth_state"] = "authorizing"
-            env["updated_at"] = now()
+            self.touch_environment(env)
             self.save()
             try:
                 login = Login(self, env, proxy_url)
@@ -2211,7 +3138,7 @@ class Host:
             except (Failure, OSError, subprocess.SubprocessError) as error:
                 self.cancel(identifier)
                 env["auth_state"] = "reauth_required"
-                env["updated_at"] = now()
+                self.touch_environment(env)
                 self.save()
                 print("Gemini CLI authorization did not start", file=sys.stderr)
                 raise Failure(503, "gemini_authorization_unavailable") from error
@@ -2237,18 +3164,412 @@ class Host:
             return self.view(env)
         raise Failure(404)
 
+    @staticmethod
+    def _extract_native_turn_body(model, body_obj):
+        if not isinstance(body_obj, dict):
+            return None
+        allowed_top = {"model", "contents", "stream"}
+        if any(k not in allowed_top for k in body_obj):
+            return None
+        contents = body_obj.get("contents")
+        if not isinstance(contents, list) or len(contents) != 1:
+            return None
+        entry = contents[0]
+        if not isinstance(entry, dict) or any(k not in ("role", "parts") for k in entry):
+            return None
+        if entry.get("role") not in (None, "user"):
+            return None
+        parts = entry.get("parts")
+        if not isinstance(parts, list) or not parts:
+            return None
+        pieces = []
+        for part in parts:
+            if not isinstance(part, dict) or list(part.keys()) != ["text"] or not isinstance(part.get("text"), str):
+                return None
+            pieces.append(part["text"])
+        text = "".join(pieces)
+        if (
+            not text.strip()
+            or any(word.startswith("/") for word in text.split())
+            or any(ord(ch) < 32 and ch not in ("\n", "\r", "\t") for ch in text)
+        ):
+            return None
+        return {
+            "model": model,
+            "contents": [{"role": "user", "parts": [{"text": text}]}],
+        }
+
+    @staticmethod
+    def _redact_bytes(chunk, secret_values):
+        for secret in secret_values:
+            if secret and secret in chunk:
+                chunk = chunk.replace(secret, b"[redacted]")
+        return chunk
+
+    def _begin_infer(self, body):
+        identifier = body.get("id")
+        if not isinstance(identifier, str) or identifier not in self.environments:
+            raise Failure(404)
+        env = self.environments[identifier]
+        if body.get("proxy_id") != env["proxy_id"]:
+            raise Failure(409)
+        proxy_url = body.get("proxy_url")
+        proxy_config(proxy_url)
+        verify_proxy_sha256(body, proxy_url)
+        model = body.get("model")
+        request_id = body.get("request_id")
+        infer_body = body.get("body")
+        if (
+            not isinstance(model, str)
+            or not MODEL.fullmatch(model)
+            or not isinstance(request_id, str)
+            or not INFER_REQUEST_ID.fullmatch(request_id)
+            or not isinstance(infer_body, dict)
+        ):
+            raise Failure(400, "gemini_invalid_request")
+        descriptor = os.open(
+            self.directory / "maintenance.lock",
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+            0o600,
+        )
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            pending = self.directory / "maintenance.pending"
+            if pending.exists() or pending.is_symlink():
+                raise Failure(409, "gemini_operation_busy")
+        except BlockingIOError:
+            raise Failure(409, "gemini_operation_busy") from None
+        finally:
+            os.close(descriptor)
+
+        uid, key, auth = self.operation_account(env, allow_concurrent_infer=True)
+        if request_id in self.active_infers.get(identifier, {}):
+            raise Failure(409, "gemini_operation_busy")
+        if model not in env.get("call_models", []):
+            raise Failure(409, "gemini_model_unavailable")
+        native_body = None
+        if not key:
+            native_body = self._extract_native_turn_body(model, infer_body)
+            if native_body is None:
+                raise Failure(400, "gemini_unsupported_turn")
+        evidence = {
+            "state": "running",
+            "model": model,
+            "started_at": now(),
+            "finished_at": None,
+            "error_code": None,
+        }
+        self.last_inference[identifier] = (
+            self.inference_binding(env),
+            evidence,
+            hashlib.sha256(proxy_url.encode()).hexdigest(),
+        )
+        cancel_event = threading.Event()
+        infer_entry = {
+            "request_id": request_id,
+            "cancel_event": cancel_event,
+            "cancel_fn": None,
+        }
+        self.active_infers.setdefault(identifier, {})[request_id] = infer_entry
+        return {
+            "identifier": identifier,
+            "env": dict(env),
+            "uid": uid,
+            "key": key,
+            "auth": auth,
+            "proxy_url": proxy_url,
+            "model": model,
+            "request_id": request_id,
+            "infer_body": infer_body,
+            "native_body": native_body,
+            "evidence": evidence,
+            "entry": infer_entry,
+        }
+
+    def stream_infer(self, body, handler):
+        with self.lock:
+            ctx = self._begin_infer(body)
+        identifier = ctx["identifier"]
+        evidence = ctx["evidence"]
+        cancel_event = ctx["entry"]["cancel_event"]
+        final_state = "failed"
+        final_code = "gemini_inference_failed"
+        try:
+            if ctx["key"]:
+                final_state, final_code = self._stream_api_key_infer(ctx, handler)
+            else:
+                final_state, final_code = self._stream_native_infer(ctx, handler)
+        except Failure as error:
+            final_state = "cancelled" if cancel_event.is_set() else "failed"
+            final_code = error.code or "gemini_inference_failed"
+            handler.send_json_error(error.status, final_code)
+        except (BrokenPipeError, ConnectionResetError):
+            final_state = "cancelled"
+            final_code = "gemini_inference_cancelled"
+        except (OSError, subprocess.SubprocessError, ValueError):
+            final_state = "failed"
+            final_code = "gemini_inference_failed"
+            handler.send_json_error(502, final_code)
+        finally:
+            with self.lock:
+                slot_map = self.active_infers.get(identifier)
+                if slot_map is not None:
+                    slot_map.pop(ctx["request_id"], None)
+                    if not slot_map:
+                        self.active_infers.pop(identifier, None)
+                self.finish_inference(
+                    evidence,
+                    final_state,
+                    None if final_state == "completed" else final_code,
+                )
+
+    def _stream_api_key_infer(self, ctx, handler):
+        key = ctx["key"]
+        cancel_event = ctx["entry"]["cancel_event"]
+        secret_bytes = (key.encode("utf-8"),)
+        proc = subprocess.Popen(
+            account_command(ctx["uid"], "api-key-stream"),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            bufsize=0,
+            env=SYSTEM_ENV,
+        )
+
+        def stop_proc():
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+        ctx["entry"]["cancel_fn"] = stop_proc
+        try:
+            payload = json.dumps(
+                {
+                    "api_key": key,
+                    "proxy_url": ctx["proxy_url"],
+                    "model": ctx["model"],
+                    "body": ctx["infer_body"],
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            proc.stdin.write(payload)
+            proc.stdin.close()
+            header_line = proc.stdout.readline(1024)
+            parts = header_line.decode("ascii", errors="replace").strip().split(" ", 2)
+            status = int(parts[1]) if len(parts) >= 2 and parts[0] == "STATUS" and parts[1].isdigit() else 0
+            ct = (parts[2] if len(parts) >= 3 else "").split(";", 1)[0].strip().lower()
+            if status != 200 or ct != "text/event-stream":
+                raw_err = proc.stdout.read(65536) if proc.stdout else b""
+                err_msg = None
+                try:
+                    parsed_err = json.loads(raw_err) if raw_err else {}
+                    err_obj = parsed_err.get("error") if isinstance(parsed_err, dict) else None
+                    if isinstance(err_obj, dict) and isinstance(err_obj.get("message"), str):
+                        err_msg = err_obj["message"][:512]
+                except ValueError:
+                    pass
+                code = {
+                    0: "gemini_proxy_error",
+                    400: "gemini_invalid_request",
+                    401: "gemini_api_key_invalid",
+                    403: "gemini_api_key_invalid",
+                    404: "gemini_model_unavailable",
+                    429: "gemini_quota_exhausted",
+                }.get(status, "gemini_inference_failed")
+                http_status = status if 400 <= status <= 599 else 502
+                handler.send_json_error(http_status, code, err_msg)
+                return "failed", code
+            handler.begin_sse()
+            while not cancel_event.is_set():
+                chunk = proc.stdout.read1(16384) if hasattr(proc.stdout, "read1") else proc.stdout.read(16384)
+                if not chunk:
+                    break
+                handler.write_sse_chunk(self._redact_bytes(chunk, secret_bytes))
+            if cancel_event.is_set():
+                return "cancelled", "gemini_inference_cancelled"
+            return "completed", None
+        finally:
+            stop_proc()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)
+
+    def _acquire_native_session(self, ctx):
+        identifier = ctx["identifier"]
+        proxy_hash = hashlib.sha256(ctx["proxy_url"].encode()).digest()
+        desired_concurrency = env_concurrency(ctx["env"])
+        with self._session_lock(identifier):
+            with self.lock:
+                existing = self.native_sessions.get(identifier)
+                if (
+                    existing is not None
+                    and existing.model == ctx["model"]
+                    and getattr(existing, "max_concurrency", 1) == desired_concurrency
+                    and secrets.compare_digest(existing.proxy_hash, proxy_hash)
+                    and existing.is_ready()
+                ):
+                    existing.last_used = time.monotonic()
+                    return existing
+                if existing is not None:
+                    self.stop_native_session(identifier)
+            session = NativeSession(
+                self, ctx["env"], ctx["proxy_url"], ctx["auth"], ctx["model"]
+            )
+            with self.lock:
+                self.native_sessions[identifier] = session
+            return session
+
+    def _stream_native_infer(self, ctx, handler):
+        identifier = ctx["identifier"]
+        multi_slot = env_concurrency(ctx.get("env", {})) > 1
+        cancel_event = ctx["entry"]["cancel_event"]
+        creds = tuple(
+            v.encode("utf-8")
+            for v in (ctx["auth"][0] if ctx["auth"] else ())
+            if isinstance(v, str) and v
+        )
+        native_mod = native_module()
+        session = self._acquire_native_session(ctx)
+        conn = None
+        recycle = False
+
+        def stop_native():
+            session.cancel_turn(ctx["request_id"])
+            if conn is not None:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+        ctx["entry"]["cancel_fn"] = stop_native
+        try:
+            conn, response = session.open_stream(
+                ctx["request_id"], ctx["native_body"]
+            )
+            handler.begin_sse()
+            while not cancel_event.is_set():
+                chunk = response.read1(16384)
+                if not chunk:
+                    break
+                handler.write_sse_chunk(self._redact_bytes(chunk, creds))
+            if cancel_event.is_set():
+                recycle = not multi_slot
+                return "cancelled", "gemini_inference_cancelled"
+            session.last_used = time.monotonic()
+            return "completed", None
+        except native_mod.NativeFailure as error:
+            recycle = (not multi_slot) and error.code != "gemini_unsupported_turn"
+            diagnostic = (
+                session.native_diagnostic.poll(final=True)
+                if session.native_diagnostic is not None
+                else None
+            )
+            code = diagnostic or error.code
+            if code in (
+                "gemini_location_unsupported",
+                "gemini_account_verification_required",
+                "gemini_account_ineligible",
+            ):
+                status = 403
+                message = None
+            else:
+                status = error.status or 502
+                message = error.message
+            handler.send_json_error(status, code, message)
+            return "failed", code
+        except (BrokenPipeError, ConnectionResetError):
+            recycle = not multi_slot
+            stop_native()
+            raise
+        except (OSError, TimeoutError):
+            recycle = not multi_slot
+            handler.send_json_error(502, "gemini_inference_failed")
+            return "failed", "gemini_inference_failed"
+        finally:
+            if conn is not None:
+                conn.close()
+            if recycle or not session.is_ready():
+                with self.lock:
+                    if self.native_sessions.get(identifier) is session:
+                        self.stop_native_session(identifier)
+
+
+class ThreadingUnixStreamServer(
+    socketserver.ThreadingMixIn, socketserver.UnixStreamServer
+):
+    daemon_threads = True
+    allow_reuse_address = True
+
 
 class ControlHandler(BaseHTTPRequestHandler):
     def setup(self):
         self.request.settimeout(2)
+        self._headers_sent = False
         super().setup()
 
+    def send_json_error(self, status, code=None, message=None):
+        if self._headers_sent:
+            return
+        payload = {}
+        if code:
+            payload["code"] = code
+        if message:
+            payload["message"] = message
+        data = json.dumps(payload).encode()
+        self._headers_sent = True
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            return
+
+    def begin_sse(self):
+        if self._headers_sent:
+            return
+        self._headers_sent = True
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def write_sse_chunk(self, chunk):
+        if not chunk:
+            return
+        self.wfile.write(chunk)
+        self.wfile.flush()
+
     def do_POST(self):
+        operation = self.path[1:] if self.path.startswith("/") else self.path
         try:
             length = int(self.headers.get("Content-Length", 0))
-            operation = self.path[1:] if self.path.startswith("/") else self.path
+            if operation == "infer":
+                if not hasattr(self.server.host, "stream_infer"):
+                    raise Failure(404)
+                self.request.settimeout(300)
+                if length < 1 or length > MAX_INFER_BODY:
+                    raise Failure(413 if length > MAX_INFER_BODY else 400)
+                body = json.loads(self.rfile.read(length))
+                if not isinstance(body, dict):
+                    raise Failure(400)
+                self.server.host.stream_infer(body, self)
+                return
             if length < 1 or length > (
-                32768 if operation in ("create", "test-chat") else 8192
+                32768
+                if operation in ("create", "test-chat")
+                else 16384
+                if operation == "license-activate"
+                else 8192
             ):
                 raise Failure(400)
             if operation not in {
@@ -2266,18 +3587,26 @@ class ControlHandler(BaseHTTPRequestHandler):
                 "terminal-io",
                 "terminal-stop",
                 "install-payload",
+                "maintenance-status",
                 "proxy-probe",
                 "proxy-bind",
+                "concurrency-set",
                 "models",
                 "test-chat",
                 "test-chat-status",
                 "test-chat-cancel",
+                "infer-cancel",
+                "license-machine-code",
+                "license-activate",
+                "license-status",
+                "license-release-candidate",
+                "license-clear",
             }:
                 raise Failure(404)
             body = json.loads(self.rfile.read(length))
             if not isinstance(body, dict):
                 raise Failure(400)
-            if operation == "install-payload":
+            if operation in ("install-payload", "maintenance-status"):
                 _, uid, _ = struct.unpack(
                     "3i",
                     self.request.getsockopt(
@@ -2296,7 +3625,10 @@ class ControlHandler(BaseHTTPRequestHandler):
         except (OSError, subprocess.SubprocessError):
             print("Gemini host operation failed", file=sys.stderr)
             status, payload = 503, {}
+        if self._headers_sent:
+            return
         data = json.dumps(payload).encode()
+        self._headers_sent = True
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
@@ -2344,6 +3676,7 @@ def main():
     parser.add_argument("--default-public-key", type=Path)
     parser.add_argument("--default-release-verifier", type=Path)
     parser.add_argument("--release-verifier", type=Path)
+    parser.add_argument("--crag-host-dir", type=Path)
     parser.add_argument("--gateway-group", required=True)
     parser.add_argument("--uid-base", type=int, required=True)
     args = parser.parse_args()
@@ -2393,6 +3726,7 @@ def main():
         args.default_public_key,
         args.default_release_verifier,
         args.release_verifier,
+        args.crag_host_dir,
     ):
         if entry is not None and not entry.is_absolute():
             raise SystemExit("Gemini host paths must be absolute")
@@ -2412,7 +3746,7 @@ def main():
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
     try:
-        with socketserver.UnixStreamServer(str(args.socket), ControlHandler) as server:
+        with ThreadingUnixStreamServer(str(args.socket), ControlHandler) as server:
             bound = socket_identity(args.socket)
             os.chown(args.socket, 0, grp.getgrnam(args.gateway_group).gr_gid)
             args.socket.chmod(0o660)

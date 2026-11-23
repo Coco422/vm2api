@@ -6,6 +6,7 @@
  *   { ok: false, error: { type, code, message, ... } }
  */
 
+import { isBlockableClientId } from '../identity/blocked-clients.mjs'
 import { hostMemoryPressureOf, LOCAL_HOST_KEY } from '../cluster/host-memory-pressure.mjs'
 import { THINKING_DISPLAY_MODES } from '../protocol/thinking.mjs'
 import { normalizeRedaction } from '../redaction/policy.mjs'
@@ -59,7 +60,7 @@ import { lastClosedWindow } from '../pool/window-history.mjs'
 import { hardBlockOf } from '../pool/rate-limit-service.mjs'
 import { kernelFaults } from '../transport/rust-kernel-client.mjs'
 import { unitCircuit } from '../pool/unit-circuit.mjs'
-import { accountIdOf, normalizePoolRouting } from '../pool/pool-scheduler.mjs'
+import { accountIdOf, familyLimitsOf, normalizePoolRouting } from '../pool/pool-scheduler.mjs'
 import { codexMaxSessions, codexScheduleLevel } from '../pool/codex-slot-pool.mjs'
 import { resolveCredentialScheduleLevel } from '../pool/credential-weight.mjs'
 import { activeHoursZoneOf, evaluateActiveHours } from '../pool/active-hours.mjs'
@@ -108,7 +109,11 @@ import { effectiveOpenAIPolicy, normalizeOpenAIQuotaPolicy } from '../pool/opena
 import { openAIRuntimeSignals } from '../pool/openai-account-runtime.mjs'
 import { normalizeVmConfig, memoryMiB } from '../vm/machine-spec.mjs'
 import { runtimeKind } from '../vm/runtime-kind.mjs'
-import { telemetryDefaultEnabled, telemetryUploadInterval } from '../vm/native-telemetry.mjs'
+import {
+  telemetryDefaultEnabled,
+  telemetryDisableNonessentialTraffic,
+  telemetryUploadInterval,
+} from '../vm/native-telemetry.mjs'
 
 export function ok(data, meta) {
   const out = { ok: true, data }
@@ -533,6 +538,24 @@ export function validatePersonaRoutingPatch(body = {}) {
   if (compat.claude_code_only != null && typeof compat.claude_code_only !== 'boolean') {
     problems.push('claude_code_only 必须是布尔')
   }
+  if (compat.count_tokens != null && typeof compat.count_tokens !== 'boolean') {
+    problems.push('count_tokens 必须是布尔')
+  }
+  if (compat.blocked_clients != null) {
+    const map = compat.blocked_clients
+    if (typeof map !== 'object' || Array.isArray(map)) problems.push('blocked_clients 必须是对象')
+    else {
+      for (const [id, on] of Object.entries(map)) {
+        // An unknown id is ignored rather than rejected, matching how
+        // blockedClientsFromRouting reads the same map. Rejecting it would mean that
+        // retiring or renaming an entry in BLOCKABLE_CLIENTS leaves a key in the
+        // stored routing.json that makes *every* later protocol-settings save fail,
+        // recoverable only by hand-editing that file.
+        if (!isBlockableClientId(id)) continue
+        if (typeof on !== 'boolean') problems.push(`blocked_clients.${id} 必须是布尔`)
+      }
+    }
+  }
   if (compat.official_cc_passthrough != null && typeof compat.official_cc_passthrough !== 'boolean') {
     problems.push('official_cc_passthrough 必须是布尔')
   }
@@ -841,6 +864,13 @@ export async function buildVmList({
       queue_max: pool.pool_queue?.queue_max ?? normalizePoolRouting(routingConfig?.pool).queue_max,
     },
   })
+}
+
+export function vmRecoveryAvailability(vm, { projectRoot, accountQuota, routingConfig }) {
+  const summary = summarizeVm(vm, projectRoot, routingConfig)
+  // Check underlying quota even when a recoverable runtime fault masks admission.
+  const accountSnap = readAccountSnapshot(accountQuota)
+  return enrichVm({ ...summary, schedulable: true }, accountQuota, null, { routingConfig, accountSnap }).availability
 }
 
 export async function buildVmDetail({
@@ -1603,6 +1633,7 @@ export function buildRouting({ routingConfig, stickyRouter }) {
     telemetry: {
       upload_interval_seconds: telemetryUploadInterval(routingConfig),
       default_enabled: telemetryDefaultEnabled(routingConfig),
+      disable_nonessential_traffic: telemetryDisableNonessentialTraffic(routingConfig),
     },
     redaction: normalizeRedaction(routingConfig?.redaction),
     redaction_runtime: redactionStatus(),
@@ -2064,7 +2095,17 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     availability.reason ||
     null
   const circuit = isCodex ? null : circuitViewFor(v, extras.projectRoot)
-  const seatsMax = isCodex ? null : resolveSessionSlots(v, extras.routingConfig || {})
+  const limits = isCodex
+    ? null
+    : familyLimitsOf(v, {
+        ...extras.routingConfig?.pool,
+        default_session_slots: extras.routingConfig?.inference?.session_slots,
+      })
+  const seatsMax = isCodex
+    ? null
+    : limits.subagents == null
+      ? resolveSessionSlots(v, extras.routingConfig || {})
+      : limits.seats
   const triad = resolveScheduleState({
     vm: v,
     availability,
@@ -2137,12 +2178,18 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     max_sessions_override: isCodex ? openAIEffective.sessions_override : false,
     session_slots: isCodex ? null : resolveSessionSlots(v, extras.routingConfig || {}),
     session_slots_override: isCodex ? false : v.session_slots_override === true,
+    max_primary_sessions: limits?.primary ?? null,
+    max_primary_sessions_override: !isCodex && v.max_primary_sessions_override === true,
+    max_subagents_per_session: limits?.subagents ?? null,
+    max_subagents_per_session_override: !isCodex && v.max_subagents_per_session_override === true,
     // What each knob falls back to when the slot drops its pin (PATCH field = null).
     scheduling_inherited: {
       max_concurrency: Number(inheritedPolicy.max_concurrency ?? 2),
       max_rpm: Number(inheritedPolicy.max_rpm ?? 0),
       max_sessions: isCodex ? Number(inheritedPolicy.max_sessions ?? 0) : null,
       session_slots: isCodex ? null : normalizeSessionSlots(extras.routingConfig?.inference?.session_slots),
+      max_primary_sessions: limits?.inheritedPrimary ?? null,
+      max_subagents_per_session: limits?.inheritedSubagents ?? null,
     },
     quota_override: quotaOverride,
     quota_policy: isCodex ? null : vmQuotaView(policy, vmQuotaConfig),
@@ -2232,6 +2279,7 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     unschedulable_reason: triad.unschedulable_reason,
     unschedulable_text: triad.unschedulable_text,
     unschedulable_detail: triad.unschedulable_detail,
+    unschedulable_at: v.unschedulable?.at || null,
     // Claude unit circuit (Codex has its own failover set and never trips it).
     circuit,
     refresh_error: v.refresh_error || v.claude?.refresh_error || runtime?.refresh_error || null,

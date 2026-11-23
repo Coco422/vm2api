@@ -2,6 +2,7 @@ import { useRef } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
 import type { UsageAccountRow } from '@/types/panel-usage'
+import { useNow } from '@/hooks/use-now'
 import type { Vm } from '@/types/panel-vm'
 import {
   BarChart3,
@@ -25,6 +26,7 @@ import {
   accountStatus,
   claudeTier,
   credExpiry,
+  overloadCooldown,
   poolStatus,
   restrictionCopy,
   seatTitle,
@@ -105,6 +107,7 @@ function CardBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
   const tier = claudeTier(vm)
   const blocked = refreshBlockedReason(vm)
   const restricted = restrictionTitle(vm)
+  const overload = overloadCooldown(vm, useNow())
   const requesting = vmRequestingCount(vm)
   const queued = Number(vm.queue_depth) || 0
   return (
@@ -138,7 +141,9 @@ function CardBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
           <SchedulableSwitch {...vmSchedulableProps(vm)} />
         </div>
       </div>
-      <p className='text-xs text-muted-foreground'>{restrictionCopy(vm)}</p>
+      <p className='text-xs text-muted-foreground'>
+        {overload ? `${overload.reason} ${overload.timing}` : restrictionCopy(vm)}
+      </p>
 
       <section className='min-w-0 rounded-lg border px-3 py-2.5'>
         <VmUsagePanel vm={vm} accounts={accounts} />
@@ -265,6 +270,11 @@ function CardBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
         >
           <BarChart3 /> 查看统计
         </Button>
+        {perms.recovery ? (
+          <Button size='sm' variant='outline' onClick={() => actions.openRecovery(vm)}>
+            诊断与恢复
+          </Button>
+        ) : null}
         {perms.credential ? (
           <>
             <Button

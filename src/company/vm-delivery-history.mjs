@@ -3,6 +3,9 @@ export const VM_DELIVERY_BATCHES = [
   {
     name: '第一批',
     members: [
+      { vmId: 'ray-vm', firstSuccessAt: '2026-10-22T16:25:24.850Z', confirmedStoppedBy: '2026-11-18T13:57:11.000Z' },
+      { vmId: 'vm-gpt-ray', firstSuccessAt: '2026-11-04T06:10:45.875Z' },
+      { vmId: 'vm-rn188-hy2-01', firstSuccessAt: '2026-10-26T07:48:48.398Z' },
       { vmId: 'vm-03', firstSuccessAt: '2026-10-31T08:16:14.894Z' },
       { vmId: 'vm-04', firstSuccessAt: '2026-10-31T10:16:25.409Z' },
       { vmId: 'vm-05', firstSuccessAt: '2026-10-31T15:34:26.191Z' },
@@ -45,6 +48,7 @@ export const VM_DELIVERY_BATCHES = [
       { vmId: 'vm-2-08', firstSuccessAt: '2026-11-19T05:39:42.276Z' },
       { vmId: 'vm-2-09', firstSuccessAt: '2026-11-19T05:39:46.334Z' },
       { vmId: 'vm-2-01', firstSuccessAt: '2026-11-19T07:30:06.235Z' },
+      { vmId: 'vm-2-24', firstSuccessAt: '2026-11-19T07:30:18.102Z' },
       { vmId: 'vm-2-23', firstSuccessAt: '2026-11-19T07:43:31.315Z', shutdownAt: '2026-11-19T16:25:40.741Z' },
     ],
   },

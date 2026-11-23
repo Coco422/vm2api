@@ -12,6 +12,7 @@ import {
   isRestrictedSchedule,
   localProxyOptsFromProxy,
   localProxyText,
+  overloadCooldown,
   poolStatus,
   proxyHostLabel,
   proxyNamedLabel,
@@ -20,6 +21,7 @@ import {
   vmRequestingCount,
   vmCircuit,
   vmCircuitTitle,
+  vmFailedAt,
 } from './vm-status'
 
 function liveVm(over: Partial<Vm> = {}): Vm {
@@ -920,5 +922,44 @@ describe('vmRequestingCount', () => {
   it('falls back to VM inflight when the row has no per-session book', () => {
     expect(vmRequestingCount({ inflight: 2 })).toBe(2)
     expect(vmRequestingCount({ inflight: 0, seat_sessions: null })).toBe(0)
+  })
+})
+
+describe('vmFailedAt', () => {
+  it('uses the recorded unschedulable time, not the latest probe', () => {
+    const revokedAt = '2026-11-21T16:17:18.882Z'
+    const vm = liveVm({
+      unschedulable_at: revokedAt,
+      last_probe: { at: '2026-11-22T05:10:00.000Z' },
+      refreshed_at: '2026-11-21T14:52:07.253Z',
+    } as Partial<Vm>)
+    expect(vmFailedAt(vm)).toBe(Date.parse(revokedAt))
+  })
+
+  it('falls back to the latest probe/refresh stamp when none is recorded', () => {
+    const vm = liveVm({
+      last_probe: { at: '2026-11-22T05:10:00.000Z' },
+      refreshed_at: '2026-11-21T14:52:07.253Z',
+    } as Partial<Vm>)
+    expect(vmFailedAt(vm)).toBe(Date.parse('2026-11-22T05:10:00.000Z'))
+  })
+})
+
+describe('overload cooldown', () => {
+  it('shows the active deadline and keeps an expired snapshot restricted until refreshed', () => {
+    const until = Date.UTC(2026, 10, 23, 9, 57)
+    const vm = liveVm({
+      schedule_state: 'restricted',
+      restriction_reason: 'overloaded',
+      availability: { key: 'cool', usable: true, reason: 'overloaded', until },
+    })
+
+    expect(overloadCooldown(vm, until - 1000)).toMatchObject({
+      until,
+      timing: expect.stringMatching(/^预计 .+ 恢复$/),
+    })
+    expect(overloadCooldown(vm, until)?.timing).toBe('已到预计恢复时间，请刷新状态')
+    expect(overloadCooldown({ ...vm, schedule_state: 'off' }, until)).toBeNull()
+    expect(overloadCooldown({ ...vm, restriction_reason: 'quota_5h_header' }, until)).toBeNull()
   })
 })

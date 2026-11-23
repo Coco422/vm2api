@@ -62,11 +62,11 @@ function useResetMutations(vm: Vm) {
 }
 
 /** 列表 / 卡片 / 统计弹窗：只显示总张数，点「限额重置」去详情页选卡。 */
-function CompactResetActions({ vm }: { vm: Vm }) {
+function CompactResetActions({ vm, now }: { vm: Vm; now: number }) {
   const navigate = useNavigate()
   const { queryCredits } = useResetMutations(vm)
   const credits = vm.claude_reset_credits
-  const count = claudeResetCount(credits)
+  const count = claudeResetCount(credits, now)
   return (
     <div
       className='flex flex-wrap items-center gap-1'
@@ -120,9 +120,9 @@ function FullResetActions({
   const [picked, setPicked] = useState<ResetCredit | null>(null)
   const keyRef = useRef<{ card: string; key: string } | null>(null)
   const snapshot = vm.claude_reset_credits as ResetSnapshot | null | undefined
-  const cards = shownCredits(snapshot)
+  const cards = shownCredits(snapshot, now)
   const legacy = isLegacy(snapshot)
-  const count = claudeResetCount(snapshot)
+  const count = claudeResetCount(snapshot, now)
 
   const redeem = useMutation({
     mutationFn: (card: ResetCredit) =>
@@ -163,7 +163,13 @@ function FullResetActions({
   }
   const fetchedAt = Date.parse(snapshot?.fetched_at || '')
   const pickedName = picked ? kindName(picked.kind) : ''
-  const warnings = picked ? claudeResetWarnings(picked, usage, cards) : []
+  const warnings = picked
+    ? claudeResetWarnings(
+        picked,
+        usage,
+        cards.filter((card) => liveState(card, snapshot || {}, now) === 'ready')
+      )
+    : []
   const keepsWeekly = picked ? !windows(picked).includes('seven_day') : false
   const five = pct(usage?.fiveHour)
   const seven = pct(usage?.sevenDay)
@@ -265,6 +271,10 @@ function FullResetActions({
                     <ResetAt value={snapshot?.cooldown_until} now={now} />{' '}
                     后可用
                   </div>
+                ) : state === 'unavailable' ? (
+                  <div className='text-[11px] text-muted-foreground'>
+                    暂不可兑
+                  </div>
                 ) : null}
               </div>
             )
@@ -349,7 +359,7 @@ export function ClaudeResetActions({
   const canUse = useVmPerms().resetCredits
   if (!canUse) return null
   return compact ? (
-    <CompactResetActions vm={vm} />
+    <CompactResetActions vm={vm} now={now} />
   ) : (
     <FullResetActions vm={vm} now={now} usage={usage} />
   )

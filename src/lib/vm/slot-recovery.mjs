@@ -418,6 +418,7 @@ export async function powerOnSlot({
   ops = {},
   by = null,
   runtimeOptions = {},
+  keepProxy = false,
 }) {
   let vm = getVm(projectRoot, id)
   if (!vm) return { ok: false, status: 404, code: 'vm_not_found', error: 'vm not found' }
@@ -426,12 +427,14 @@ export async function powerOnSlot({
   } catch (error) {
     return { ok: false, status: 400, code: error.code, error: error.message }
   }
-  const bound = proxyPool.ensureBoundToVm(id, vm.proxy?.id || null)
-  if (!bound) {
+  const bound = keepProxy ? proxyPool.getProxyForVm(id) : proxyPool.ensureBoundToVm(id, vm.proxy?.id || null)
+  if (!bound || (keepProxy && bound.id !== vm.proxy?.id)) {
     return { ok: false, status: 409, code: 'proxy_required', error: 'No SOCKS5 is bound or free for this VM' }
   }
-  bindVmProxy(projectRoot, id, bound)
-  await (fillTimezone || ((vmId) => fillVmTimezoneFromExit(projectRoot, proxyPool, vmId)))(id)
+  if (!keepProxy) {
+    bindVmProxy(projectRoot, id, bound)
+    await (fillTimezone || ((vmId) => fillVmTimezoneFromExit(projectRoot, proxyPool, vmId)))(id)
+  }
   vm = getVm(projectRoot, id) || vm
   const runtimeBeforeBoot = structuredClone(vm.runtime || {})
   const boot = await (ops.startSlotReady || startSlotReady)(vm, projectRoot, { ...runtimeOptions, routing })
@@ -517,6 +520,7 @@ export async function recoverSlot({
   poolScheduler = null,
   internal = false,
   ops = {},
+  keepProxy = false,
   now = () => Date.now(),
 }) {
   const vm = getVm(projectRoot, id)
@@ -590,7 +594,7 @@ export async function recoverSlot({
           }
           if (proceed) {
             proceed = await step('start', async () =>
-              startStepResult(await powerOn({ projectRoot, id, proxyPool, routing, fillTimezone })),
+              startStepResult(await powerOn({ projectRoot, id, proxyPool, routing, fillTimezone, keepProxy })),
             )
           }
           if (steps.some((s) => s.id === 'start' && !s.ok)) {

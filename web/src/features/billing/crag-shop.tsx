@@ -25,6 +25,12 @@ import {
   cragSlotsInUse,
 } from '@/features/vm/crag-runtime-counts'
 import {
+  cragCredentialRecoveryFaults,
+  cragSubscriptionErrors,
+  describeCragOrderActivationFailure,
+  type CragOrderActivationRecovery,
+} from '@/features/vm/crag-subscription-errors'
+import {
   cragHostStatusQueryOptions,
   type CragHostStatus,
 } from '@/features/vm/queries'
@@ -89,6 +95,9 @@ type Order = {
       | 'needs_attention'
       | 'ready_to_apply'
     vm_id?: string
+    error_code?: string
+    recovery?: CragOrderActivationRecovery
+    authority_request_id?: string
   }
 }
 type Checkout = Order & { url?: string; data?: Record<string, string> }
@@ -183,12 +192,19 @@ function hostRedemptionError(error: unknown) {
       const details = isApiError(error) ? error.details : undefined
       const id = (details as { authority_request_id?: unknown } | undefined)
         ?.authority_request_id
+      const recovery = (details as { recovery?: unknown } | undefined)?.recovery
       const validId =
         typeof id === 'string' &&
         /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(
           id
         )
-      return `授权服务拒绝了这台宿主机的兑换请求。请联系管理员核对，不要重置宿主凭据。${validId ? `请求 ID：${id}` : ''}`
+      const reason =
+        recovery === 'host_id_collision'
+          ? '授权服务拒绝了这台宿主机的兑换请求（检测到宿主设备标识冲突，常见于克隆镜像未重置 /etc/machine-id）。'
+          : recovery === 'not_activated'
+            ? '授权服务拒绝了这台宿主机的身份与凭据（本机尚无已签名的宿主授权记录）。'
+            : '授权服务拒绝了这台宿主机的兑换请求。'
+      return `${reason}请联系管理员核对原订单，不要重置宿主凭据。${validId ? `请求 ID：${id}` : ''}`
     }
     case 'crag_subscription_sync_pending':
       return '上一笔兑换待同步。请点「继续同步」核对原码，不要提交新码。'
@@ -235,11 +251,15 @@ function applicationError(
   ) {
     text = hostRedemptionError(error)
   } else if (
-    /^shop_(device_(unavailable|checkout_required)|host_identity_changed|private_storage_unavailable)$/.test(
+    /^shop_(device_(unavailable|checkout_required)|host_identity_changed|private_storage_unavailable|order_recover_conflict)$/.test(
       code
     )
   ) {
     text = quoteProblem(error)
+  } else if (code === 'shop_session_stale') {
+    // Not the same as being signed out: the session is valid but predates the buyer
+    // binding, so "please sign in" would be advice the user is already following.
+    text = '登录状态需要刷新才能读取订单。请重新登录一次，不要重复购买。'
   } else if (isApiError(error) && error.status === 401) {
     text = '登录已过期，请重新登录后核对原订单。'
   } else {
@@ -257,6 +277,14 @@ function applicationError(
   )
     text += ` 请求 ID：${requestId}`
   return text
+}
+
+// Order ids are randomUUID v4, which is also what makes one usable as the buyer's own
+// proof when recovering an order: it cannot be guessed or enumerated.
+function isOrderId(value: string) {
+  return /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(
+    value
+  )
 }
 
 function quotaLabel(value: number | 'unlimited' | null | undefined) {
@@ -493,6 +521,12 @@ function HostOverview({
           刷新本机订阅
         </Button>
       </div>
+      {status?.credential_recovery ? (
+        <p role='alert' className='text-sm text-destructive'>
+          {cragCredentialRecoveryFaults[status.credential_recovery] ??
+            cragSubscriptionErrors.auth_forbidden}
+        </p>
+      ) : null}
       {status ? (
         <>
           <dl className='grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-x-4 gap-y-2 text-sm tabular-nums [&_dd]:wrap-anywhere [&_dt]:text-muted-foreground'>
@@ -656,12 +690,21 @@ function HostOverview({
             className='text-sm text-muted-foreground'
           >
             每张码从兑换时独立计时，未到期额度相加；不绑定、不启动 VM。 Claude
-            订阅码增加本机槽位；以 CGG1- 开头的码兑换 CRAGGemini，不占用 Claude
+            订阅码增加本机槽位；CRAGGemini 订阅码（CRAGR1.…）请点击右上角「兑换
+            CRAGGemini」兑换，旧版 CGG1- 码也可直接在此兑换，不占用 Claude
             槽位。
           </p>
           <Button type='submit' size='sm' disabled={!code.trim() || !!action}>
             {action === 'redeem' ? '正在兑换…' : '兑换到本机'}
           </Button>
+          <div className='rounded-md border border-sky-500/20 bg-sky-500/5 px-3 py-2 text-xs leading-5 text-muted-foreground'>
+            <strong className='font-medium text-foreground'>
+              CRAGGemini 兑换码说明：
+            </strong>
+            1 个月 / 10 槽兑换码（¥100，¥10/槽，支持多码叠加）；首批测试支持 7
+            天 / 10 槽测试兑换码（单码可用 100 次，不同宿主机各 1
+            次、同机幂等）。请点右上角「兑换 CRAGGemini」完成兑换。
+          </div>
         </form>
       ) : null}
       {notice ? (
@@ -797,6 +840,10 @@ function ShopOrders({
     Record<string, ApplicationFeedback>
   >({})
   const [ordersProblem, setOrdersProblem] = useState('')
+  // Keep these last: the unit tests inject state by useState call order, so inserting a
+  // hook above shifts every index after it and silently rewires unrelated assertions.
+  const [recoverOpen, setRecoverOpen] = useState(false)
+  const [recoverId, setRecoverId] = useState('')
   // A cancelled or expired checkout is history, not work. It stays reachable, but the
   // order the buyer came for should not have to be found among closed ones.
   const activeOrders = orders?.filter((order) => order.status !== 'cancelled')
@@ -984,7 +1031,7 @@ function ShopOrders({
           : isApiError(error) && error.code === 'shop_device_package_unready'
             ? '本机缺少可用的 CRAG 发行包。请让管理员从内核页拉取后，重试应用原订单。'
             : isApiError(error) &&
-                /^shop_(device_(unavailable|checkout_required)|host_identity_changed|private_storage_unavailable)$/.test(
+                /^shop_(device_(unavailable|checkout_required)|host_identity_changed|private_storage_unavailable|order_recover_conflict)$/.test(
                   error.code
                 )
               ? quoteProblem(error)
@@ -994,11 +1041,14 @@ function ShopOrders({
                     error.code === 'shop_activation_target_unavailable'
                   ? '所选槽位暂不可用。请先核对历史订单，再刷新激活目标或选择仅领取兑换码。'
                   : isApiError(error) &&
-                      /coupon|stock|sold_out|inventory|renew|price|amount|cap/.test(
-                        error.code ?? ''
-                      )
-                    ? quoteProblem(error)
-                    : fallback
+                      error.code === 'shop_activation_disabled'
+                    ? '当前实例已暂停自动激活（VM2API_CRAG_SHOP_AUTO_ACTIVATION=0）。请先恢复自动激活配置后再重试原订单。'
+                    : isApiError(error) &&
+                        /coupon|stock|sold_out|inventory|renew|price|amount|cap/.test(
+                          error.code ?? ''
+                        )
+                      ? quoteProblem(error)
+                      : fallback
       )
     } finally {
       operating.current = false
@@ -1431,6 +1481,42 @@ function ShopOrders({
             if (cancelTarget) cancelOrder(cancelTarget)
           }}
         />
+        <ConfirmDialog
+          open={recoverOpen}
+          onOpenChange={(open) => {
+            if (!open && !busy) setRecoverOpen(false)
+          }}
+          title='用订单号找回订单'
+          desc='免登录订单按浏览器保存，换浏览器或清除 Cookie 后就看不到了。输入下单时的订单号即可把它取回到这个浏览器，付款和已到账的权益都不受影响。订单号就是这笔订单的凭据——持有它的人就能把订单取到自己的浏览器，请妥善保存、不要外传。'
+          confirmText='找回'
+          cancelBtnText='返回'
+          disabled={!isOrderId(recoverId.trim())}
+          isLoading={busy}
+          handleConfirm={() => {
+            const id = recoverId.trim()
+            if (!isOrderId(id)) return
+            void run(async () => {
+              const recovered = await request<Order>(
+                `${root}/orders/${encodeURIComponent(id)}/recover`,
+                { method: 'POST', body: '{}' }
+              )
+              if (recovered.order_id !== id) throw new Error('order mismatch')
+              setRecoverOpen(false)
+              setRecoverId('')
+              refresh((n) => n + 1)
+              setNotice('已找回该订单，请在历史订单中核对支付与激活状态。')
+            }, '未能找回该订单，请核对订单号后重试。')
+          }}
+        >
+          <Input
+            value={recoverId}
+            onChange={(event) => setRecoverId(event.target.value)}
+            placeholder='订单号，例如 3f8a1c2e-...'
+            autoComplete='off'
+            spellCheck={false}
+            aria-label='订单号'
+          />
+        </ConfirmDialog>
         <div className='grid min-w-0 gap-6'>
           <section
             aria-label={presentation?.plans_title ?? '订阅套餐'}
@@ -1472,6 +1558,8 @@ function ShopOrders({
                   description: plan.description,
                   remaining: plan.remaining,
                   renewable: plan.renewable,
+                  product: plan.product,
+                  stackable: plan.stackable,
                   monthly: monthlyPrice(
                     plan.amount_minor,
                     planMonths(plan.term, plan.months)
@@ -1539,14 +1627,29 @@ function ShopOrders({
                 <h2 className='font-medium'>
                   {presentation?.orders_title ?? '历史订单'}
                 </h2>
-                <Button
-                  size='sm'
-                  variant='ghost'
-                  disabled={loading || busy}
-                  onClick={() => refresh((n) => n + 1)}
-                >
-                  刷新订单
-                </Button>
+                <div className='flex items-center gap-1'>
+                  {device ? (
+                    <Button
+                      size='sm'
+                      variant='ghost'
+                      disabled={busy}
+                      onClick={() => {
+                        setRecoverId('')
+                        setRecoverOpen(true)
+                      }}
+                    >
+                      找回订单
+                    </Button>
+                  ) : null}
+                  <Button
+                    size='sm'
+                    variant='ghost'
+                    disabled={loading || busy}
+                    onClick={() => refresh((n) => n + 1)}
+                  >
+                    刷新订单
+                  </Button>
+                </div>
               </div>
               {loading && !orders && !ordersFailed ? (
                 <Skeleton className='h-12 w-full' />
@@ -1565,8 +1668,10 @@ function ShopOrders({
                 <p className='text-sm text-muted-foreground'>
                   {closedOrders?.length
                     ? '没有进行中的订单。已关闭的订单在下方。'
-                    : (presentation?.empty_orders_text ??
-                      '还没有订阅订单。下单后可以在这里查看支付和激活状态。')}
+                    : device
+                      ? '这个浏览器没有订单记录。免登录订单按浏览器保存，换浏览器或清过 Cookie 后这里就是空的——用下单时的订单号点「找回订单」即可取回，已付款的订单不会丢。'
+                      : (presentation?.empty_orders_text ??
+                        '还没有订阅订单。下单后可以在这里查看支付和激活状态。')}
                 </p>
               ) : null}
               {activeOrders?.length ? (
@@ -1607,7 +1712,6 @@ function ShopOrders({
                           </Button>
                         ) : null}
                         {order.status === 'fulfilled' &&
-                        !device &&
                         order.sku !== 'renewal' &&
                         !automaticOrder(order) ? (
                           <Button
@@ -1617,7 +1721,10 @@ function ShopOrders({
                             onClick={() =>
                               void run(async () => {
                                 setClaim(undefined)
-                                const code = await api<{
+                                // `request`, not `api`: on the device page there is no
+                                // panel session, so `api` would reject this locally with
+                                // a 401 before it was ever sent.
+                                const code = await request<{
                                   order_id: string
                                   redemption_code: string
                                 }>(
@@ -1630,7 +1737,7 @@ function ShopOrders({
                               }, '暂时无法领取，请刷新订单后重试。')
                             }
                           >
-                            领取兑换码
+                            {device ? '导出迁移凭据' : '领取兑换码'}
                           </Button>
                         ) : null}
                         {device &&
@@ -1748,44 +1855,97 @@ function ShopOrders({
                               CRAG。
                             </p>
                           ) : order.activation.state === 'needs_attention' ? (
-                            <div className='space-y-2'>
-                              <p className='text-muted-foreground'>
-                                {isAdmin
-                                  ? '自动激活已暂停。确认原目标可用后，可重试原订单；无需重新购买或兑换。'
-                                  : '自动激活尚未完成，请联系管理员核查原订单；不要重复购买或另行兑换。'}
-                              </p>
-                              {isAdmin ? (
-                                <Button
-                                  type='button'
-                                  variant='outline'
-                                  size='sm'
-                                  disabled={busy || loading}
-                                  onClick={() =>
-                                    void run(async () => {
-                                      const updated = await api<Order>(
-                                        `${root}/orders/${encodeURIComponent(order.order_id)}/retry-activation`,
-                                        { method: 'POST', body: '{}' }
-                                      )
-                                      if (updated.order_id !== order.order_id)
-                                        throw new Error('order mismatch')
-                                      setOrders((prior) =>
-                                        prior?.map((item) =>
-                                          item.order_id === updated.order_id
-                                            ? updated
-                                            : item
-                                        )
-                                      )
-                                      refresh((n) => n + 1)
-                                      setNotice(
-                                        '已刷新原订单的激活状态，请在历史订单查看。'
-                                      )
-                                    }, '无法重试自动激活，请刷新历史订单后重试。')
-                                  }
-                                >
-                                  重试自动激活
-                                </Button>
-                              ) : null}
-                            </div>
+                            (() => {
+                              const validErrorCode =
+                                typeof order.activation.error_code ===
+                                  'string' &&
+                                /^[a-z][a-z0-9_]{1,63}$/.test(
+                                  order.activation.error_code
+                                )
+                                  ? order.activation.error_code
+                                  : undefined
+                              const validRecovery =
+                                validErrorCode &&
+                                (order.activation.recovery ===
+                                  'not_activated' ||
+                                  order.activation.recovery ===
+                                    'host_id_collision' ||
+                                  order.activation.recovery === 'failed')
+                                  ? order.activation.recovery
+                                  : undefined
+                              const validRequestId =
+                                typeof order.activation.authority_request_id ===
+                                  'string' &&
+                                isOrderId(order.activation.authority_request_id)
+                                  ? order.activation.authority_request_id
+                                  : undefined
+                              return (
+                                <div className='space-y-2'>
+                                  <p
+                                    role={validErrorCode ? 'alert' : undefined}
+                                    className={
+                                      validErrorCode
+                                        ? 'break-words text-destructive'
+                                        : 'text-muted-foreground'
+                                    }
+                                  >
+                                    {describeCragOrderActivationFailure({
+                                      errorCode: validErrorCode,
+                                      recovery: validRecovery,
+                                      isAdmin,
+                                    })}
+                                  </p>
+                                  {validErrorCode || validRequestId ? (
+                                    <p className='flex flex-wrap gap-x-3 gap-y-1 font-mono text-xs text-muted-foreground'>
+                                      {validErrorCode ? (
+                                        <span>
+                                          错误码：{validErrorCode}
+                                          {validRecovery
+                                            ? ` (${validRecovery})`
+                                            : ''}
+                                        </span>
+                                      ) : null}
+                                      {validRequestId ? (
+                                        <span>请求 ID：{validRequestId}</span>
+                                      ) : null}
+                                    </p>
+                                  ) : null}
+                                  {isAdmin ? (
+                                    <Button
+                                      type='button'
+                                      variant='outline'
+                                      size='sm'
+                                      disabled={busy || loading}
+                                      onClick={() =>
+                                        void run(async () => {
+                                          const updated = await api<Order>(
+                                            `${root}/orders/${encodeURIComponent(order.order_id)}/retry-activation`,
+                                            { method: 'POST', body: '{}' }
+                                          )
+                                          if (
+                                            updated.order_id !== order.order_id
+                                          )
+                                            throw new Error('order mismatch')
+                                          setOrders((prior) =>
+                                            prior?.map((item) =>
+                                              item.order_id === updated.order_id
+                                                ? updated
+                                                : item
+                                            )
+                                          )
+                                          refresh((n) => n + 1)
+                                          setNotice(
+                                            '已刷新原订单的激活状态，请在历史订单查看。'
+                                          )
+                                        }, '无法重试自动激活，请刷新历史订单后重试。')
+                                      }
+                                    >
+                                      重试自动激活
+                                    </Button>
+                                  ) : null}
+                                </div>
+                              )
+                            })()
                           ) : order.activation.state === 'active' ? (
                             <div className='space-y-2'>
                               <p className='text-muted-foreground'>
@@ -1810,7 +1970,9 @@ function ShopOrders({
                       !automaticOrder(order) ? (
                         <div className='space-y-2'>
                           <p className='text-muted-foreground'>
-                            请勿公开分享，下方是本订单的完整兑换码。
+                            {device
+                              ? '请勿公开分享。保存这串凭据即可在新机器上迁移本订单的额度，剩余时长照旧带走。'
+                              : '请勿公开分享，下方是本订单的完整兑换码。'}
                           </p>
                           <code className='block rounded bg-muted px-2 py-1 break-all'>
                             {claim.redemption_code}

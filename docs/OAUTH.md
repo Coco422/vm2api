@@ -11,7 +11,7 @@ sessionKey（默认 Setup Token）或授权码
    │ 换票后两条路同一后续：profile → eval（bearer 分区）→ roles → first-token date → eval（套餐字段）→ bootstrap（entrypoint=sdk-cli&model=claude-opus-5-5）
    │ 控制面接收完整凭证，不在 helper 返回后再次 bootstrap 或套一层代理
    ▼
-槽 ~/.claude/credentials.json   ← 活票只在这里（含 email / account_uuid / org_uuid）
+槽 ~/.claude/credentials.json   ← 活票只在这里（含 account_uuid / org_uuid，不含 email）
    │ host RefreshIfNeeded（推理临期 或 面板显式 refresh）
    │ 无后台定时器；401 不强制换票
    ▼
@@ -28,13 +28,13 @@ commitImportedOauth → 仅完整 OAuth 运行模式排队官方 Claude Code 初
 
 | 入口 | 路径 | 说明 |
 |------|------|------|
-| Setup Token + Cookie | `POST /api/panel/vms/import` `{ type: "setup-token", sessionKey }` | `sk-ant-sid*` 经槽位出口取 code，采集身份；落盘后以 Setup Token 运行模式执行，不跑官方初装。浏览器段（organizations + authorize）由 `kin-worker oauth session-code` 发出，走 Chrome TLS 指纹。**scope 与有效期由 `runtime_mode` 决定**：两条路都申请完整 5 项（身份链要 `user:profile`），setup-token 只把有效期拉成一年（payload 里的 scope 不生效）。 |
+| Setup Token + Cookie | `POST /api/panel/vms/import` `{ type: "setup-token", sessionKey }` | `sk-ant-sid*` 经槽位出口取 code，采集身份；落盘后以 Setup Token 运行模式执行，不跑官方初装。浏览器段（organizations + authorize）由 `kin-worker oauth session-code` 发出，走 Chrome TLS 指纹。**scope 由 `runtime_mode` 决定，有效期不由我们伪造**：两条路都申请完整 5 项（身份链要 `user:profile`），也都不发 `expires_in`，换回来的是上游的短效票；一年期 mint 不在这里铸造（需要时由本地用短效票换）。 |
 | 已有 OAuth → Setup Token | `POST /api/panel/vms/:id/oauth/to-setup-token` | 读 worker 活票，仅切换运行模式；保留 access、refresh、真实过期时间和全部实际 scope。不会凭空增加权限，也不会删 scope。官方一年期 token（`official-setup-token`）不能转。 |
 | 官方 `claude setup-token` | 槽内 PTY / 粘贴一年期 oat | 只有 `user:inference`、无 refresh。落盘 `credential_mode=official-setup-token`，与面板转换的完整 Setup Token 区分。 |
 | Claude Code OAuth（默认） | 账号面板 → OAuth → Claude Code 授权 | 打开专用终端，VM 内原生 `claude auth login` 生成链接并处理回调；面板保存并同步结果。登录本身不再设 wall-clock 上限（用户节奏），凭证落盘由 180 秒 commit deadline 兜底（`KIN_LOGIN_COMMIT_DEADLINE_MS`）。 |
-| 通用授权链接 | `POST /api/panel/vms/:id/oauth/generate-auth-url` | CAI 与 Setup Token 都走面板 PKCE 的 CAI 授权链接（`claude.com/cai/oauth/authorize`）；两个 flavor 都用完整 OAuth scope（身份信息需要 `user:profile`），Setup Token 只是换票时请求一年期。要求绑定可用出口。 |
+| 通用授权链接 | `POST /api/panel/vms/:id/oauth/generate-auth-url` | CAI 与 Setup Token 都走面板 PKCE 的 CAI 授权链接（`claude.com/cai/oauth/authorize`）；两个 flavor 都用完整 OAuth scope（身份信息需要 `user:profile`），换票都不请求 `expires_in`，拿到的是上游短效票。要求绑定可用出口。 |
 
-正式凭证的 access/refresh 写入 `credentials.json`；导入时文档顶层和 `claudeAiOauth` 都写 `kinGeneration`，文件仍是 `0444`。`vm.json` / DB 只留 `has_access` / `has_refresh` / email / expiry / generation。
+正式凭证的 access/refresh 写入 `credentials.json`（不含 email，同步时也排除 email）；导入时文档顶层和 `claudeAiOauth` 都写 `kinGeneration`，文件仍是 `0444`。`vm.json` / DB 只留 `has_access` / `has_refresh` / email / expiry / generation。
 
 远端 Claude 槽以节点上的 `credentials.json` 为准。官方 CLI 的 `.credentials.json` 使用同目录相对软链接；即使轮换通过原子替换更新文件，下次打开也会读到最新版。节点凭据回拉（包括启动、重载）会修正丢失或指向旧副本的链接，不会把旧副本写回凭据。对已运行的槽，启用的 `credential_refresh` 巡检也会检查链接（默认每 300 秒），不等令牌到期，不读取令牌内容、不额外换票、不重启槽。巡检快照的 `link_failures` 单列未修复的槽，与换票结果分开。
 

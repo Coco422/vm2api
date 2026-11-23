@@ -43,6 +43,7 @@ const ROLE_CAPS = {
     'account.manage',
     'vm.read',
     'vm.schedule.self',
+    'vm.recover.self',
     'vm.reset_credits',
     'vm.quota_thresholds',
     'keys.read',
@@ -142,6 +143,7 @@ function isUserAllowed(method, path) {
   const p = String(path || '')
   if (m === 'GET') {
     if (USER_EXACT_GET.has(p) || LOG_STATS_GET.has(p)) return true
+    if (/^\/api\/panel\/vms\/[^/]+\/diagnose$/.test(p)) return true
     if (/^\/api\/panel\/request-logs\/[^/]+(?:\/attempts)?$/.test(p)) return p !== '/api/panel/request-logs/export'
     if (/^\/api\/panel\/vms\/[^/]+$/.test(p))
       return ![
@@ -161,7 +163,7 @@ function isUserAllowed(method, path) {
   if ((m === 'PATCH' || m === 'DELETE') && /^\/api\/panel\/api-keys\/[^/]+$/.test(p)) return true
   if (m !== 'POST') return false
   if (p === '/api/panel/api-keys') return true
-  if (/^\/api\/panel\/vms\/[^/]+\/(?:test-chat|count-tokens|schedulable)$/.test(p)) return true
+  if (/^\/api\/panel\/vms\/[^/]+\/(?:test-chat|count-tokens|schedulable|recover)$/.test(p)) return true
   // Client keys are needed by the tenant's API client; VM/upstream secrets are never exposed.
   if (/^\/api\/panel\/api-keys\/[^/]+\/(?:reveal|rotate|reset-quota)$/.test(p)) return true
   return /^\/api\/panel\/vms\/[^/]+\/(?:usage\/query|openai-quota\/(?:refresh|reset)|claude-reset\/(?:query|redeem))$/.test(
