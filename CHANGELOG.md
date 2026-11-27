@@ -1,6 +1,508 @@
 # Changelog
 
-## Unreleased
+## 1.4.238 — 2026-11-27 · 统一调度中心基建（M0–M2 与 `/pools` 工作台）、`agy` CLI 自动补丁与系统巡检、钉选 CRAG 3.1.25 与 CRAGGemini 0.5.2 载荷及 Gemini 代理/OAuth 优化
+
+- **统一调度中心 M0–M2 与独立 `/pools` 号池工作台（#1979、#1980、#1981、#1982、#1986）**：
+  - **M0 增量数据模型与身份链（#1979）**：新增纯增量迁移 `src/lib/db/migrations/071_scheduler_center.sql`（SQLite）与 `src/lib/db/pg/pg-migrations/008_scheduler_center.sql`（PostgreSQL 对等），创建 `scheduler_pools`、`scheduler_pool_members`、`api_key_pool_bindings`、`scheduler_sticky_bindings`、`scheduler_node_penalties` 并为 `api_keys` 补充池绑定列；`src/lib/db/repos/scheduler-pools-repo.mjs` 提供启动期幂等回填；完善 `src/lib/identity/identity-rewrite.mjs` 官方身份链处理。
+  - **M1a 调度前统一 JEV 预检门禁（#1980）**：新增 `src/lib/protocol/unified-pre-dispatch.mjs`，统一收口 Messages / Codex / Responses WS / Gemini / `count_tokens` 全部公网入口的调度前审查，净化阻断响应并对齐 Gemini 文本提取。
+  - **M1b 号池 API、Key 绑定与池级提示词路由（#1986）**：新增 `src/lib/admin/scheduler-pools-routes.mjs` 与 `src/lib/protocol/pool-prompt-policy.mjs`，补齐号池 CRUD、成员/粘性/解释接口、API Key 池绑定范围校验（`src/lib/admin/key-scope.mjs`）及 `/v1/models` 池访问过滤。
+  - **M1c 前端 `/pools` 工作台（#1981）**：新增 `web/src/features/pools/*` 与路由 `/pools`、`/pools/$poolId`（列表、成员、粘性、提示词、Key 绑定、调度解释），并同步对齐 `/keys`、`/system`、`/settings`、`/vm` 及面板 ACL。
+  - **M2 Rust `kin-scheduler` 核心与 UDS 桥接（#1982）**：新增 `scheduler/` Rust 工作区（`scheduler-proto`、`scheduler-core`、`scheduler-daemon`）、Node UDS 客户端 `src/lib/transport/scheduler-client.mjs`、Docker/CI 构建集成及 SIGTERM 优雅退出连接清理。
+- **钉选 CRAG `3.1.25` 延续载荷（#1983）**：
+  - `deploy/payload.json` 的 `crag_release` 升级至 `payload-2026.11.27-crag-3.1.25`（支持 `prompt_replace_empty`），并在 `src/lib/admin/kernel-catalog.mjs` 注册 `3.1.25`。
+- **Gemini 代理与 OAuth 默认项优化（#1984）**：
+  - 更新 `scripts/gemini-host.py`、`scripts/gemini-maintenance.py`、`scripts/gemini_host_account.py`、`scripts/gemini-host-egress.sh` 及控制面/前端 Gemini 路由与操作逻辑，支持从已安装 `agy` 提取默认 OAuth 凭据回退与 `/etc/vm2api/gemini-oauth.env` 注入，并修复代理连通与 ACP 环境变量传递（`dofastted/antigravity-cli-proxy#21`）。
+- **`agy` CLI 资格门禁自动补丁、系统自动巡检并钉选 CRAGGemini `0.5.2` 载荷（#1990，`dofastted/antigravity-cli-proxy#22`）**：
+  - 新增纯标准库 PE/ELF 补丁工具 `scripts/gemini_agy_patch.py`，针对官方 Linux `agy 1.5.9`（`39816d49…` → `bca88dab…`）执行 `O_NOFOLLOW` 4 字节门禁补丁与补丁后 SHA-256 校验（失败自动回滚）。
+  - 在 `scripts/fetch-default-gemini.py`、`scripts/gemini-maintenance.py`（原子 `renameat2` 事务，回滚不重打补丁）与 `deploy/install.sh` 的安装/修复/恢复/更新流程中自动为 `agy` 打补丁并执行 `status --require-patched` 复核。
+  - `scripts/gemini-maintenance.py` 启动自动巡检并新增 `agy_patch` 检查项；`scripts/gemini-host.py` 动态上报已验证 `installed_agy_sha256()` / `agy_patch_status()`；`src/lib/gemini/payload.mjs` 仅放行单向精确升级；前端 CRAGGemini 内核行新增未打补丁告警与一键「修复补丁」操作。
+  - `deploy/payload.json` 的 `geminiDefaultLinuxAmd64.tag` 升级至 `payload-2026.11.27-gemini-0.5.2`（`dofastted/antigravity-cli-proxy@v0.5.2`，`adapter/lib.rs` 同时兼容官方未补丁与资格补丁 `agy 1.5.9` 摘要，`manifest.json` 锁定补丁后摘要 `bca88dab…`，零密钥轮换）。
+- 部署说明：本次改动涉及控制面（`src/`）、前端（`web/src/`）、数据库纯增量迁移（SQLite `071` / PostgreSQL `008`，在线无重写）、`deploy/install.sh`、`deploy/payload.json`（CRAG `3.1.25`、CRAGGemini `0.5.2`）与 Gemini 宿主/维护脚本（新增 `scripts/gemini_agy_patch.py`）；`release`（`payload-2026.11.26-kernel-advisor-iterations`）与 `bin/` / `share/wrap-cli` 相对 `1.4.237` 未变，预期 **`SLOT_SYNC=skip`**，无需执行 `wrap-cli/sync` 或重启既有 Claude/Codex 槽位，重启 `vm2api` 一次即可自动完成迁移并生效；Gemini 宿主机需同步宿主/维护脚本（含 `gemini_agy_patch.py`）并切换 `0.5.2` 载荷（自动为 `agy` 打补丁并校验）后重启 `vm2api-gemini-maintenance` 与 `vm2api-gemini`。
+
+## 1.4.237 — 2026-11-27 · craggemini---性能优化
+
+- craggemini---性能优化
+
+## 1.4.236 — 2026-11-27 · 过期且刷新失败的 Claude 槽自动移出调度、CRAG v2 槽位未回收子进程可选自动维护守卫
+
+- **过期且刷新失败的 Claude 槽移出调度与实时凭证核验（#1947）**：
+  - `src/lib/pool/availability.mjs` 新增 `isAccessExpiredEverywhere()` 与 `EXPIRED_CREDENTIAL_REFRESH_FAIL`：当所有可见过期时间（调用方传入、`workerCredential.expires_at`、`vm.claude.expires_at`、`vm.expires_at`，取最晚值）均已过期且记录了真正的 OAuth 刷新失败（`refresh_failed`、`oauth_refresh_failed`、`refresh_outcome_unknown`、`invalid_refresh_token`、`credential_required`）时，`isCredentialRefreshFailed()` 判为 `无效凭证`（`credential_refresh_failed`）并经 `vmHasSchedulableCredential()` 移出调度，避免无有效令牌的槽位持续启动 CLI 静默超时并误触发「内核故障」。
+  - 明确排除未触达 OAuth 的前置配置与传输类错误（`proxy_required`、`config_failed`、`worker_upgrade_required`、`upstream_transport_error`），确保代理或配置修复后槽位仍可自动恢复调度。
+  - `src/lib/pool/pool-scheduler.mjs` 的 `checkEligibility()` 与 `syncQuotaSchedule()` 合并传入 `knownHealth` / `state?.worker_status` / `account.worker_status` 实时凭证快照，防止 VM 记录残留过期时间戳与 `refresh_failed` 时误拒已刷出新票的健康槽。
+- **CRAG v2 槽位未回收子进程可选自动维护守卫（#1950）**：
+  - 新增默认关闭的 `routing.crag_zombie_guard`（`src/lib/vm/crag-zombie-guard.mjs`、`docs/crag-gateway-zombies.md`）：按间隔通过正常槽内执行路径只读扫描 `/proc`，统计父进程为 `--gateway-worker` 的僵尸子进程（防扫描脚本自身 argv 误计）；当计数达到阈值或内核故障且槽位空闲时，每轮至多通过 `withVmLock` + `recoverSlot` 重启一个槽位。
+  - `nativeKernelBusy()` 计入 CRAG v2 `idle` 热复用进程（仅 `pids.length > idle` 或 `active_requests`/`continuations`/`queued`/`active`/`waiting`/`cleaning`/`recovering` 非空时判忙）；`recoverSlot()` 新增可选 `beforeStop`、`verifyAfter` 与 `clearUnschedulable: false`，在 `HOLD_MAINTENANCE` 与 `waitForSlotDrain` 之后复检目标、调度态与原生空闲，禁止后台守卫清除既有 `unschedulable`，并在释放维护持锁前完成出口指纹校验与僵尸复扫（单次瞬态 `null` 扫描自动重试一次）。
+  - 校验失败时标记 `unschedulable`（新增 `maintenance_failed`「自动维护失败」原因码）并在 `routing.notify.enabled` 开启时发送告警通知；同步补齐 `src/lib/admin/routing-runtime.mjs` 与 `src/lib/admin/panel-routes.mjs` 的 `crag_zombie_guard` 配置热更新与回滚同步。
+- 部署说明：本次改动仅涉及控制面（`src/lib/`、`src/server.mjs`）与文档（`docs/crag-gateway-zombies.md`），零前端改动、零数据库迁移；`deploy/payload.json`（`kin-kernel` `b2dbec57…`、`CRAG 3.1.24`、`CRAGGemini 0.4.14`）、Gemini 宿主/维护脚本与 `bin/` / `share/wrap-cli` 相对 `1.4.235` 均未变。预期 **`SLOT_SYNC=skip`**，无需执行 `wrap-cli/sync`、无需重启 `vm2api-gemini` 或任何既有 `kin-*` 槽位，重启 `vm2api` 一次即可生效。
+
+## 1.4.235 — 2026-11-27 · JEV 降误封热修：豁免 Claude Code `auto_mode_classifier`、内置题库 v2.1 与置信度分层封禁
+
+- **前置审查豁免 Claude Code `auto_mode_classifier` 旁路请求**：
+  - `applyProtocolIntercept` 提前识别 `classifyClaudeRequestPurpose(inbound, { officialTraffic: official })`，对 `auto_mode_classifier` 旁路安全自检请求保留既有已封禁会话/设备拦阻，但跳过 `blocked_tool`、`system_prompt_rewrite`、硬正则、拒答缓存与 JEV 评审（标记 `by: 'classifier'` /「内置分类器豁免」），与后置 `refusalSessionBlockDecision` 保持一致，避免将审查模板误判并永久封死主编码会话。
+- **内置题库升级至 v2.1 并自动无感迁移**：
+  - `USAGE_POLICY_INSTRUCTION` 补充豁免 Claude Code 自动安全审查模板（`<transcript>`、`err on the side of blocking`、`<block>`）与本地测试账号/密码脚本；`NSFW_INSTRUCTION` 明确放行不含露骨性内容或性器官描写的日常情感安慰与普通恋爱拥抱对话。
+  - 将 `1.4.234` v2 内置文案纳入 `LEGACY_BUILTIN_INSTRUCTIONS` / `LEGACY_SAFETY_INSTRUCTIONS`，未手改面板文案升级后自动刷新生效。
+- **JEV 封禁置信度分层（拦截与三振封禁解耦）**：
+  - 新增 `JEV_BAN_CONFIDENCE_FLOOR = 0.25` 与 `shouldEscalateJevBan()`：单题非 `nsfw` 处于中等区间（`0.25 <= score < threshold - 0.08`）时仅返回单次 `429`（`Retry-After: 60`、`error_details.ban_skipped = 'borderline_score'`），不再永久封禁会话或累加设备违规；高置信命中（`< 0.25`）、任意 `nsfw` 命中或多题同时命中仍执行原有「封会话 + `[10, 10, 0]` 三振设备封禁」。
+- 部署说明：本次改动仅涉及控制面（`src/lib/protocol/`），零数据库迁移，无前端、`bin/` 或 `deploy/payload.json` 变更。预期 **`SLOT_SYNC=skip`**，重启 `vm2api` 一次即可生效。
+
+## 1.4.234 — 2026-11-27 · JEV 题库 v2 与分级封禁/429 伪装闭环、上游 4xx 四分桶与风控日志诊断面板、CRAG 订阅异步并发探测、Codex 用量窗口巡检、按档透传 usage 与 CRAGGemini 维护行修复
+
+- **JEV 内置题库 v2 与会话/设备分级封禁闭环（#1958）**：
+  - 升级内置三题题库（`usage_policy` / `nsfw` / `abuse`）并对未手改面板文案自动无感迁移；长文本窗口（`>= 1024`）改为头 30% + 尾 70% 首尾保留（`sliceJevState`）；硬规则新增 `[MODE: UNRESTRICTED SANDBOX]` / `clr_all_context` 越狱检测；修复降级文案误报 `密钥失效`。
+  - 默认阶梯改为 `[10, 10, 0]`（支持非递减校验）；JEV 命中同步按 `sha256(principal, 'session', rootSessionId)` 严格分租永久封禁根会话（含 Claude Code 子 Agent，避免跨租户会话 DoS）并推进设备分级计数；第 1/2 次触发及 10 分钟临时封禁期间向客户端返回伪装 `429` 负载与 `Retry-After`（后台日志保留 `policy_blocked` / `refusal_guard`），第 3 次永久封禁返回 `400`。
+- **后置上游 4xx 四分桶、漏网 JEV 留证与风控/日志 UI 诊断（#1959）**：
+  - `classifyUpstreamError()` 精准区分 `policy` / `third_party` / `protocol` / `auth_suspect`，并引入双轨防误杀机制（JEV 全题 `>= 0.85` 首次触发 `usage_policy` 仅记精确指纹，不污染全局 MinHash 或罚设备）；仅当放行后遭上游拒答或高危 401/403 时落盘 `jev_state` 与各题安全分（`jev_score_*`、`gate_miss`、`risk_bucket`）；JEV 默认决策超时提升至 `4000ms`。
+  - 风控面板补齐根会话封禁管理、可读 `identity_value` 解封弹窗、服务端 `via` 筛选、「上游漏放 / 前置拦截率」指标卡与日志详情「风控与审核裁决」对照卡。
+- **CRAG 订阅状态异步并发探测与前端维护行修复（#1949、#1948）**：
+  - `assertCragSubscriptionTargetAsync` 与 `countEnabledSlots`（并发上限 8、单槽报错提前终止）将 `GET /api/panel/crag-subscription` 从串行同步阻塞改为非阻塞异步探测，消除多槽宿主事件循环长时间卡顿。
+  - 修复前端 CRAGGemini 内核行在首次查询取消或后端超时后永久停在「正在读取宿主状态…」的问题（新增 15s 超时 `gemini_maintenance_timeout`、`pending+idle` 自动重读与重试按钮）。
+- **Codex 用量窗口巡检与按档 usage 透传（#1951、#1946）**：
+  - `usageProbeMonitor` 新增 `codexUnifiedForUsageProbe` 从 `vm.codex_usage` 合成窗口视图，使 Codex 槽在 5h/7d 窗口过期后同样触发一次性 `/usage` 刷新（仍复用既有 `usage_probe.enabled` 开关）。
+  - 系统提示词配置新增按档默认关闭的 `usage_passthrough_presets`（「对外完整透传 usage」）开关，开启后不扣除网关注入的人设/环境/常驻约束 token。
+- 部署说明：本次改动仅涉及控制面（`src/lib/`、`src/server.mjs`）与前端（`web/src/`），零数据库迁移；`deploy/payload.json`（`kin-kernel` `b2dbec57…`、`CRAG 3.1.24`、`CRAGGemini 0.4.14`）、Gemini 宿主/维护脚本与 `bin/` / `share/wrap-cli` 相对 `1.4.233` 均未变。预期 **`SLOT_SYNC=skip`**，无需执行 `wrap-cli/sync`、无需重启 `vm2api-gemini` 或任何既有 `kin-*` 槽位，重启 `vm2api` 一次即可生效。
+
+## 1.4.233 — 2026-11-27 · 钉选 CRAG 3.1.24 与 CRAGGemini 0.4.14 签名载荷、Gemini 粘性调度与 429/502/503 容错、409 工具续接清理及宿主机 AppArmor/KVM 文档补齐
+
+- **钉选 CRAG `3.1.24` 与 CRAGGemini `0.4.14` 签名载荷（#1954、#1952，`dofastted/crag#34`，`dofastted/antigravity-cli-proxy#19`）**：
+  - **CRAG `3.1.24`**（`deploy/payload.json` 的 `crag_release` 指向 `payload-2026.11.27-crag-3.1.24`，`src/lib/admin/kernel-catalog.mjs` 追加 `3.1.24` 并保留 `3.1.23`）：修复工具续接回合被上游拒绝（含空 `content: []` `reasoning_extraction`）后，客户端追加新用户输入触发 `409 refused_continuation_conflict` 永久死锁的问题，允许不同后续提交创建隔离快照分支；控制面 `src/lib/core/errors.mjs` 同步将终态 409 冲突标记为不可重试。
+  - **CRAGGemini `0.4.14`**（`deploy/payload.json` 的 `geminiDefaultLinuxAmd64.tag` 指向 `payload-2026.11.27-gemini-0.4.14`）：上游 503 时保持 `agy` 常驻不重启，支持 429 `restart_resume` 续传。
+- **Gemini 粘性调度、429/502/503 容错与定期账号状态巡检（#1952）**：
+  - 复用 `StickyRouter` 实现 Gemini 粘性路由：429 先在同账号执行一次 `restart_resume` 重试，二次 429 释放粘性并切换账号；503 故障转移不触发熔断或不可调度；502 支持 `unschedulable_on_502` 开关避免 502→503 循环；全池不可调度时返回 `429 gemini_pool_overloaded`；新增定期账号状态与配额巡检及面板展示。
+- **Gemini 会话冲突与宿主机安全加固收口（#1940、#1943、#1944）**：
+  - **工具续接 409 冲突清理（#1944）**：`gemini_session_conflict` 时除释放粘性绑定外，同步清理 `continuationCallIds` 对应的工具续接绑定；`!sessionConflictRetried` 与 `maxAccountSwitches > 0` 门禁确保同请求重试不再复用卡住的出站会话，且 `mas=0` 场景不重试；同步修正 `RUN_ERRORS` 文案。
+  - **AppArmor 与维护守护进程对齐（#1940、#1943）**：维护守护进程目录同步安装 `gemini_host_apparmor.py`；收紧 bwrap `execvp` stderr 分类正则，补齐 license-align CI 与 Biome 检查。
+- **KVM 升级文档更正（#1945）**：
+  - 明确 `kin-guest-setup` 升级后需按流程重建 runner 容器以使 9p `cache=none` 等来宾脚本改动生效。
+- 部署说明：本次改动涉及控制面（`src/lib/`、`src/server.mjs`）、前端（`web/src/`）、`deploy/install.sh`、`deploy/payload.json`（更新 `CRAG 3.1.24` 与 `CRAGGemini 0.4.14`，沿用 `kin-kernel` `b2dbec57…`）及 Gemini 宿主/维护脚本（`scripts/gemini-host.py`、`scripts/gemini_host_account.py`、`scripts/gemini_host_apparmor.py`、`scripts/gemini_host_native.py`）；无新增数据库迁移。因 `bin/kin-kernel` 与 `share/wrap-cli/cli-node` 字节未变，预期 **`SLOT_SYNC=skip`**（无需执行 `wrap-cli/sync` 或重启既有 `kin-*` 槽位）；需同步更新 Gemini 宿主/维护脚本并重启 `vm2api-gemini-maintenance`、`vm2api-gemini` 与 `vm2api`。
+
+## 1.4.232 — 2026-11-26 · Gemini 多格式 RT 导入、Ubuntu 26.04 AppArmor 托管 bwrap、409 冲突重试、代理探测错峰、Codex 续热与配额窗口修复
+
+- **Gemini 宿主机安全与可靠性修复（#1922、#1923、#1925、#1926、#1929、#1932、#1933、#1934、#1935、#1938）**：
+  - **多格式 OAuth Refresh Token 导入与宿主机探针（#1938）**：支持裸 RT、Antigravity RT 导出数组、CPA / sub2api 导出格式归一化导入；OAuth 客户端配置通过宿主机环境变量（`KIN_GEMINI_OAUTH_*`）经标准输入 JSON 注入 `gemini_host_account.py`（零硬编码、未配置时 fail-closed 返回 `oauth_client_not_configured`）。
+  - **Ubuntu 26.04 AppArmor 托管 bwrap 与打包对齐（#1929、#1932）**：新增 `scripts/gemini_host_apparmor.py` 与原子安装托管 bwrap 入口，`gemini-maintenance.py` 的 `RUNTIME_FILES` 补齐 helper 打包。
+  - **bwrap 沙箱故障与许可错误解耦（#1926）**：`classify_craggemini_license_cli_error` 准确区分 `gemini_sandbox_unavailable` / `gemini_sandbox_apparmor_restricted`（HTTP 503），不再误报 `license_invalid`（403）。
+  - **409 会话冲突恢复与工具 schema 清洗（#1923、#1933、#1925、#1934）**：`tool_continuation_aborted` 映射为 `gemini_session_conflict`（409），清空粘性绑定（含 `mas=0` 场景）后重试一次且不记单元熔断；`gemini-convert.mjs` 去重 `required`、规避桥接层字段冲突并修复多轮 `toolSummary` 回流。
+  - **并发 SOCKS 探测错峰与 `proxy_ready` 对齐（#1922、#1935）**：远端 SOCKS 探测改为串行 400ms 错峰，`proxyFor` 与代理池一致仅在行 `dead` 时标记不可用，新建/改绑严格拒绝 `fail` 状态代理行。
+- **Codex 与管理台修复（#1920、#1927、#1939）**：
+  - 剔除配额视图中已过期的 rate-limit 窗口读数（#1920）；Codex 续热探针读取官方 5h reset 窗口并在面板保存时保留 `preheat` / `auto_renew` 与调度模式（#1927、#1939）。
+- **KVM 9p 稳定性修复（#1924、#1937）**：
+  - `kinhome`/`kinclaude` 9p 挂载改用 `cache=none` 避免 `.claude.json` 写回卡死，并补充既有来宾生效步骤文档。
+- 部署说明：本次改动涉及控制面（`src/lib/`、`src/server.mjs`）、前端（`web/src/`）与 Gemini 宿主及维护脚本（`scripts/gemini-host.py`、`scripts/gemini_host_account.py`、`scripts/gemini_host_apparmor.py`、`scripts/gemini_host_native.py`、`scripts/gemini-maintenance.py`）；`deploy/payload.json` 延续 `1.4.231` 钉选（`kin-kernel` `b2dbec57…`、`CRAG 3.1.23`、`CRAGGemini 0.4.13`）。从 `1.4.228` 直升时在线执行 PG `007` 增量加列迁移，需同步更新 Gemini 宿主与维护脚本并重启 `vm2api`、`vm2api-gemini` 与 `vm2api-gemini-maintenance`；`SLOT_SYNC=skip` 时不重启既有 `kin-*` 槽位。
+
+## 1.4.231 — 2026-11-26 · Advisor 顾问用量独立计费与双库持久化、确定性 400 熔断豁免/平台归因、钉选 CRAG 3.1.23 与新版 `kin-kernel` 载荷
+
+- **Advisor 工具 `advisor_message` 独立计费、双库持久化与全链路清洗（#1928）**：
+  - **独立计费与持久化**：`src/lib/admin/pricing.mjs` 新增 `advisorCostFromUsage`，解析 `usage.iterations` 中每条 `advisor_message`（含 `5m` / `1h` 缓存写入拆分）并按各自顾问模型单价计费累加进 `total_cost` / `actual_cost` 与 API Key 扣费（任一顾问模型缺价时 fail-closed 标记 `unpriced`）；`src/lib/protocol/openai-usage.mjs` 的 `mergeUsage` 防止后续空 `iterations: []` 覆盖已有明细；新增纯增列在线迁移 SQLite `070_usage_logs_advisor_billing.sql` 与 PostgreSQL `007_usage_logs_advisor_billing.sql`（`advisor_usage` / `advisor_cost`），贯通 `request-log.mjs` 与 `usage-logs-repo.mjs` 的 `backfillMissingCosts` / `repriceRange` 幂等重算。
+  - **确定性请求 Schema 400 熔断豁免与平台归因**：`src/lib/pool/upstream-error-policy.mjs` 新增 `isDeterministicRequestSchema400`，对 Pydantic / schema 确定性 400（如 `Extra inputs are not permitted`、`Input tag '...' found using 'type' does not match`、`Field required`、`Input should be` 等）返回 `reason: 'invalid_request_schema'` 并停止重试，不再计入单元熔断；`src/lib/admin/error-class.mjs` 新增 `gateway_protocol`（`owner: 'platform'`），将网关/内核引发的 `advisor_*` 协议 400 归因至平台而非 `client`。
+  - **Beta 补齐与残留 `input_schema` 剥离**：`src/lib/protocol/claude-code-betas.mjs` 将 `advisor-tool-2026-03-01` 触发条件扩展至 `advisor_*` 前缀与历史 `server_tool_use`（`name='advisor'`）；`src/lib/protocol/crag-whitelist.mjs` 与 `src/lib/protocol/kernel-request.mjs` 在 CRAG 与 `cli-node` 两条入口统一剥离 `advisor_*` 工具上误带的 `input_schema`（非法 `name` / 空 `model` 仍 fail-closed 拒收），同步更新 `docs/advisor.md`。
+- **钉选 CRAG `3.1.23` 与新版 `kin-kernel` 签名载荷（#1928，`dofastted/crag#33`，`dofastted/kin-kernel#1`）**：
+  - **CRAG `3.1.23`**（`deploy/payload.json` 的 `crag_release` 指向 `payload-2026.11.26-crag-3.1.23`，`src/lib/admin/kernel-catalog.mjs` 追加 `3.1.23` 并保留 `3.1.22`）：合并 `3.1.22` 的 `advisor_*` 多余 `input_schema` 剥离，并在 `NativeResponses::snapshot` 按增量/去重保留 `usage.iterations`（含 `advisor_message`），防重放重复计费。固定 `rust:1-bookworm` 容器构建（最高 `GLIBC_2.34`），沿用现役生产密钥（`9dbb4bc2…` / `835451e2…`）未轮换；`crag-v2-licensed-amd64.tar.gz` `171,335,938` B / `sha256 701a1d9e…`。
+  - **`kin-kernel` 新二进制**（`deploy/payload.json` 的 `release` 指向 `payload-2026.11.26-kernel-advisor-iterations`）：`Usage` 增加 `iterations`、`StreamAssembler` 通过 `ContentBlock::Raw` 保留 `advisor_tool_result` 并在 `message_delta` / `merge_usage` 保留非空 `iterations`，`api.rs` 改为合并而非覆盖 `request.betas`。`rust:1.98-bookworm` 容器离线构建（最高 `GLIBC_2.34`），`bin/kin-kernel` 与 `share/wrap-cli/kin-kernel.bin` 为 `13,258,640` B / `sha256 b2dbec57…`（其余 11 个非 CRAG asset 不变）。
+- 部署说明：本次改动涉及控制面（`src/lib/`）、数据库纯增列在线迁移（SQLite `070` / PG `007`，蓝绿无重启校验通过）以及 **`deploy/payload.json` 的 `kin-kernel` 与 `CRAG 3.1.23` pin**；前端（`web/src/`）、CRAGGemini（`0.4.13`）与 Gemini 宿主脚本相对 `1.4.230` 均未变。因 Claude `cli-node` 内核与 `CRAG` 载荷均已更新，预期 **`SLOT_SYNC=required`**（升级控制面后按需同步 `wrap-cli/sync` 及更新 CRAG 槽位内核）；Codex / Gemini 槽位不受影响。
+
+## 1.4.230 — 2026-11-26 · 内核不再为带 type 的工具合成 `input_schema`（advisor 全链路放行）、新增 advisor 处理说明
+
+- **`kin-kernel` 新二进制：带显式非 `custom` `type` 的工具不再被补 `input_schema`（payload pin 变更）**：
+  - 内核的 `is_server_tool_type` 原是手工维护的前缀白名单（`web_search_` / `web_fetch_` / `computer_` / `bash_` / `text_editor_` / `code_execution_` / `tool_search_`），`advisor_20260301` 不在其中；而 `ToolDefinition.input_schema` 带 `#[serde(default)]`，入站缺该字段时会在反序列化阶段被合成为 `{"type":"object","properties":{}}`，序列化时又写回出站 body，上游因此拒收：`tools.N.advisor_20260301.input_schema: Extra inputs are not permitted`。改为按结构判定（只有 `custom` 工具带 `input_schema`，有显式非 custom `type` 的工具其 schema 归上游），advisor 与未来新增的工具族一并覆盖，无需每次补前缀。
+  - 产物：`bin/kin-kernel` 与 `share/wrap-cli/kin-kernel.bin` 同步为 `13,235,464` / `sha256 020d0790…9913369`；`deploy/payload.json` 的 `release` 指向新 payload release `payload-2026.11.26-kernel-advisor-schema`（仅 `kin-kernel` 相对 `payload-2026.11.25-worker-oauth-guard` 变更，其余 11 个非 CRAG asset 原样重传）。容器内离线构建（`rust:1.98-bookworm`，rustc 1.98.1），最高 GLIBC 符号 `2.34` 与上一版基准一致，两次独立构建 sha256 逐字节相同。
+- **CRAG 内核白名单放行 advisor 的 `defer_loading`（#1916）**：`ADVISOR_TOOL_KEYS` 此前齐备了 `max_uses` / `caching` 这些真实流量从不发送的可选项，却漏掉 Claude Code 实际携带的 `defer_loading`（真实形状为 `{type, name, model, defer_loading}`），`pickKeys` 将其静默丢弃；该键在同文件的 `CUSTOM_TOOL_KEYS` 中早已放行。由于 beta 推导运行在清洗后的 body 上（`go-worker-client.mjs` 的 `main` 源自 `prepareCragRequest` 输出），丢键同时导致 `advanced-tool-use-2025-11-20` 不被声明，调用方要求的延迟加载两端皆失。
+- **新增 advisor 工具处理说明（#1917）**：`docs/advisor.md` 记录调用方真实请求形状、白名单三条 fail-closed 校验、cli-node 与 CRAG 两条路径各自的 beta 声明来源、`advisor_tool_result.content` 的三态 union，以及已修的键集遗漏形状；挂入 `docs/README.md` 索引。
+- **回退 Codex keep-alive join（#1904）**：OpenAI 的 grant 模型不需要该机制。
+- 部署说明：本次改动涉及控制面（`src/lib/protocol/`）与 **`deploy/payload.json` 的 `kin-kernel` pin**；前端（`web/src/`）、数据库迁移结构、CRAG（`3.1.21`）与 CRAGGemini（`0.4.13`）payload、Gemini 宿主脚本相对 `1.4.229` 均未变。因 Claude 槽内核二进制已更新，预期 **`SLOT_SYNC=required`**：升级后需执行 `wrap-cli/sync` 使既有 Claude 槽位取到新内核（集群槽会被重建）；Codex / Gemini 槽位不受影响。
+
+## 1.4.229 — 2026-11-26 · 加固 PostgreSQL 一键安装/迁移脚本（#1905 安全门禁与本地 URL 识别）、PG 18 调优与同步桥可观测性
+
+- **PostgreSQL 一键安装/迁移脚本安全门禁与本地地址识别加固（#1911）**：
+  - `deploy/replace-db-to-pg.sh`：新增 `verify_pg_sync_rpc_safety()`，在停止控制面或执行 SQLite → PostgreSQL 迁移前，同时校验 systemd 与 Docker 模式下的 `src/lib/db/pg/pg-sync-db.mjs` 是否包含 `#1905` 的 `PG_SYNC_PROTOCOL_ERROR` 修复，阻断在未修复的旧版控制面（`<= 1.4.226`）上盲目切换至 PostgreSQL；`--status` 输出新增 `PG 同步桥` 安全状态项；为由脚本启动的 PostgreSQL 18 容器补齐 `checkpoint_completion_target=0.9`、`max_wal_size=1GB` 与 `idle_in_transaction_session_timeout=60000` 调优参数。
+  - `deploy/install.sh`、`deploy/install-pg.sh`：新增 `url_points_to_local_host()`，修正 `need_local_pg()` 与 `need_local_redis()` 此前将已指向 `127.0.0.1` / `localhost` / `::1` 的 `DATABASE_URL` / `REDIS_URL` 误判为「外部托管服务」而跳过本地依赖启动/托管的边界问题；同步更新本地脚本缓存刷新锚点（`verify_pg_sync_rpc_safety`、`url_points_to_local_host`），确保升级后自动拉取最新安装与迁移脚本。
+  - `docker-compose.yml`：为 PostgreSQL 18 服务对齐 `checkpoint_completion_target=0.9`、`max_wal_size=1GB` 与 `idle_in_transaction_session_timeout=60000`。
+- **PostgreSQL 同步桥运行时可观测性与异常快失败（#1911）**：
+  - `src/lib/db/pg/pg-sync-db.mjs`、`src/lib/db/pg/pg-sync-worker.mjs`：`poolStats()` 新增 `stale_dropped`（陈旧回包排空计数）与 `timeouts`（同步 RPC 超时计数）指标；worker 在 `shutdown` 或 `uncaughtException` 退出前向所有已挂载 `MessagePort` 的 `SharedArrayBuffer` 置位 `signal[1] = 1` 并广播 `Atomics.notify`，让正在等待的同步调用立即失败而不空等超时。
+  - 回归测试：扩充 `test/deploy/test_install_pg.py` 与 `test/unit/pg-sync-db-rpc.test.mjs`，覆盖本地/远端 URL 识别、安全门禁拦截、PG 18 调优参数、过期回包/超时计数及 worker 异常退出快失败路径。
+- 部署说明：本次改动涉及控制面（`src/lib/db/pg/`）与部署脚本/编排配置（`deploy/install.sh`、`deploy/install-pg.sh`、`deploy/replace-db-to-pg.sh`、`docker-compose.yml`）；前端（`web/src/`）、`deploy/payload.json`（CRAG `3.1.21` 与 CRAGGemini `0.4.13`）、数据库迁移结构、Gemini 宿主脚本与 `bin/` / `share/wrap-cli` 相对 `1.4.228` 均未变，预期 `SLOT_SYNC=skip`，无需执行 `wrap-cli/sync` 或重启既有 Claude/Codex/Gemini 槽位，重启 `vm2api` 一次即可生效。
+
+## 1.4.228 — 2026-11-26 · 修复 Gemini 账号导入/授权后 `UNSUPPORTED_CLIENT` 误阻断与 CRAGGemini `CRAGR1` 兑换失败
+
+- **修复 Gemini 客户端版本标识与 `UNSUPPORTED_CLIENT`（`gemini_client_unsupported`）误阻断（#1908）**：
+  - `scripts/gemini_host_account.py`：升级 `loadCodeAssist` / `onboardUser` 元数据（补齐 `ideName: "antigravity"` 与 `ideVersion: "2.35.2"`）与 Antigravity User-Agent 梯队（`antigravity/hub/2.35.2 linux/amd64`、`antigravity/2.35.2 ... google-api-nodejs-client/10.3.0` + `X-Goog-Api-Client: gl-node/22.21.1`、`antigravity/1.5.18`），命中 `UNSUPPORTED_CLIENT` 或非 200 时自动回落至 `daily-cloudcode-pa.googleapis.com`；放行存在 `allowedTiers` 的账号自动 onboarding；当 `fetchAvailableModels` 成功返回可调用模型列表时清除误报的 `client_unsupported`。
+  - `scripts/gemini_host_native.py`、`scripts/gemini-host.py`：将 `EligibilityDiagnostic` 捕获的 `gemini_client_unsupported` 标记为存活就绪会话的 advisory 诊断，不再抢先杀死能正常推理的 `agy` 常驻进程，回合成功时自动清除，仅在进程真实失败或退出时按终态诊断上报 `403 gemini_client_unsupported`（地区/身份核验阻断语义保持不变）。
+- **修复 CRAGGemini `CRAGR1` 兑换码兑换链路与宿主机载荷/目录初始化（#1908）**：
+  - `scripts/gemini-host.py`、`src/lib/gemini/subscription.mjs`：新增无参 `ensure-payload` 控制 socket 动作（复用 `ensure_payload()` 根验签边界），当宿主机处于 `install_on_create` 尚未物化 `share/gemini/current` 时，在 `redeem` / `sync` / `recover` / `upgrade` / `bind` 遇到 `gemini_subscription_package_unready` 自动物化已暂存的签名默认载荷后再执行兑换；容器环境下优先从 `/run/crag-host-machine-id` 派生宿主机标识，对齐 Claude CRAG 订阅。
+  - `web/src/features/billing/crag-shop.tsx`、`web/src/features/import/gemini-environments.tsx`：将 `gemini_subscription_package_unready`、`gemini_subscription_authority_unavailable`、`gemini_subscription_sync_pending`、`license_unconfigured` 等错误码加入 `GEMINI_FALLBACK_DISPLAYABLE_ERRORS`，不再静默吞掉 Gemini 报错而误显 Claude 的「此码不可用于本机订阅或已失效」；补齐 `crag_subscription_host_identity_unavailable` 回落，并在已激活环境详情页保留「叠加/续费 CRAGGemini 订阅」入口。
+  - `deploy/install.sh`：保护非 `/opt/vm2api` 宿主安装目录，防止 `.env` 中的容器路径 `KIN_DATA_DIR=/opt/vm2api/data` 误覆盖 `vm2api-gemini.service` 的 `--crag-host-dir`。
+- 部署说明：本次改动涉及控制面（`src/lib/gemini/`）、前端（`web/src/`）、`deploy/install.sh` 与 Gemini 宿主脚本（`scripts/gemini-host.py`、`scripts/gemini_host_account.py`、`scripts/gemini_host_native.py`）；`deploy/payload.json`（CRAG `3.1.21` 与 CRAGGemini `0.4.13`）、数据库迁移结构与 `bin/` / `share/wrap-cli` 相对 `1.4.227` 均未变，预期 `SLOT_SYNC=skip`，无需执行 `wrap-cli/sync` 或重启既有 Claude/Codex 槽位，重启 `vm2api` 一次即可生效；Gemini 宿主机需执行 `install.sh prepare-gemini` 同步宿主脚本并重启 `vm2api-gemini`。
+
+## 1.4.227 — 2026-11-26 · 修复 PostgreSQL 同步桥接层 `PgSyncDb` 在 `Atomics.wait` 虚假唤醒或超时后的永久 RPC 响应错位
+
+- **修复 PostgreSQL 同步适配层（`PgSyncDb` + `pg-sync-worker`）RPC 协议永久错位导致的线上大面积 500 / 401 / 403（#1905）**：
+  - 根因：`src/lib/db/pg/pg-sync-db.mjs` 原先使用 4 字节二值 `0/1` `SharedArrayBuffer` 信号，且读取 `receiveMessageOnPort(this._port)` 时未校验 `msg.id === id`、也未排空过期回包。当 `Atomics.wait(signal, 0, 0, timeout)` 发生合法的 spurious wakeup（`signal[0]` 仍为 `0`）时，兜底循环 `Atomics.wait(signal, 0, 1, 1)` 因预期值不等在 `<0.1ms` 内空转 500 次提前抛错；任意早退（虚假唤醒或 `PG_SYNC_TIMEOUT`）都会把 worker 迟到的回包滞留在 FIFO `MessagePort` 中，导致进程后续全部同步 DB 查询永久偏移 ≥1 个槽位（表现为 `rows.map is not a function`、正常 API Key 误判 `401` / `403 api_key_disabled`、重复 `INSERT` 撞 `accounts_pkey` 与大面积 `500`），只能重启恢复。
+  - 修复：`src/lib/db/pg/pg-sync-worker.mjs` 将唤醒信号改为单调递增计数（`Atomics.add(signal, 0, 1)` + `Atomics.notify(signal, 0)`）并兜底捕获 `port.postMessage` 序列化异常；`src/lib/db/pg/pg-sync-db.mjs` 改为 8 字节 `SharedArrayBuffer`（分离回复计数与 worker 退出标志），请求前与等待循环中按 `msg.id < id` 排空陈旧回包、严格匹配 `msg.id === id`（遇到非法未来 id 闭失败报 `PG_SYNC_PROTOCOL_ERROR`），先读计数再读端口并按有界分片等待直至截止时间以免疫虚假唤醒与丢失唤醒；`BEGIN` 超时时异步补发 `rollback` 防止 worker 泄漏 `txClient`。
+  - 回归测试：新增 `test/unit/pg-sync-db-rpc.test.mjs`，覆盖 spurious wakeup、`PG_SYNC_TIMEOUT` 后迟到回包排空与自动自愈、`BEGIN` 超时回滚清理及结构化错误透传。
+- 部署说明：本次改动仅涉及控制面（`src/lib/db/pg/`）；前端（`web/src/`）、`deploy/payload.json`（CRAG `3.1.21` 与 CRAGGemini `0.4.13`）、数据库迁移结构、Gemini 宿主脚本与 `bin/` / `share/wrap-cli` 相对 `1.4.226` 均未变，预期 `SLOT_SYNC=skip`，无需执行 `wrap-cli/sync` 或重启既有 Claude/Codex/Gemini 槽位，重启 `vm2api` 一次即可生效。建议所有启用 `db_engine=postgres` 的生产实例立即升级至本版本。
+
+## 1.4.226 — 2026-11-26 · `cache_control` 非法断点自动纠错与 `CRAG_CACHE_CONTROL` 恢复；CRAGGemini 安装/升级与 `UNSUPPORTED_CLIENT` 修复；Codex 凭证吊销升级为不可调度与工具 schema 兼容重试；集群槽位容器先起后删
+
+- **`cache_control` 非法断点自动纠错与 `CRAG_CACHE_CONTROL` 零执行恢复（#1901）**：
+  - `src/lib/protocol/cache-ttl.mjs` 收口为缓存纠错单一真值源，新增 `normalizeCacheControlObject` / `isCleanCacheControl` / `repairCacheBreakpointsInPlace` / `repairCacheBreakpoints`（合法体零拷贝直通），覆盖 `tools`、`system`、`crag_prompt.blocks`、`messages`（含递归嵌套 `tool_result.content`）与根级 `cache_control`：剥离 `thinking` / `redacted_thinking` 断点与非 `ephemeral` 畸形标记、规范非法 TTL、按需把嵌套 `tool_result.content` 断点提升至父级、超 4 点预算时按价值从低到高裁剪（`nested` → 历史旧消息 → `tools` → `system` → 最近 2 条活跃消息）、补齐省略 TTL 并修正 `5m`/省略 → `1h` 逆序。此前 #1731 / #1849 / #1881 的收敛对这些非规范断点直接 `400 invalid_cache_control` 拒单。
+  - 合并 `normalizeCacheTtl` 与 `normalizeCacheTtlOrFallback`，`validateCacheBreakpoints` 复用 `collectCacheEntries` 保证校验与修复遍历顺序一致，`stripIllegalCacheControlFields` / `stripCacheScopeFields` 统一委托 `walkCacheNodes`。
+  - `src/lib/protocol/{anthropic-policy,crag-whitelist,handle-protocol,outbound-attempt}.mjs`、`src/lib/pool/upstream-error-policy.mjs`、`src/lib/transport/go-worker-client.mjs` 与 `protofront/internal/{server,strip}`：预算统一计入 CRAG 边界，并让零上游执行、未提交的 `502 crag_policy_blocked`（`CRAG_CACHE_CONTROL`）可恢复而非直接阻断返回。
+- **CRAG advisor 工具 `max_tokens` 与 advisor beta 声明（#1898）**：
+  - `src/lib/protocol/crag-whitelist.mjs`：`ADVISOR_TOOL_KEYS` 补回 `max_tokens`。此前键集为 `['type','name','model','max_uses','caching','cache_control']`，`pickKeys` 直接丢弃该项，等于静默取消调用方对单次 advisor consultation（thinking + text）自身开销的上限；与本批次 `tool_use.extension`、`thinking.block_binding` 同一形状，白名单 advisor 分支此前零测试覆盖。新测试钉住全部文档化选项，并保留原有 fail-closed 行为（带 `input_schema`、name 不符、model 为空的 advisor 仍直接拒绝）。
+  - `src/lib/protocol/outbound-attempt.mjs`：`prepareOutboundHeaders` 重建出站 `anthropic-beta` 时不再丢弃 advisor 的 beta —— `withRequestProtocolBetas` 从 body 重新推导时不认识该 beta（全仓零命中），为工具本身与重放结果显式声明。现代 CRAG print 的 beta 走 header，内核从 header 解析无需改动。
+- **修复 CRAGGemini 最新载荷安装/升级与 `UNSUPPORTED_CLIENT` 误判（#1899）**：
+  - `deploy/install.sh`：默认载荷缓存由硬编码 `defaults/0.3.0` 改为与 `gemini-maintenance.py` 一致的内容寻址 `defaults/<manifest_sha256>`，识别维护代理托管/CRAG 安装而不覆盖 `--public-key` / `--egress`，可用时传 `--reuse-agy`，升级陈旧默认安装时原子切换 `share/gemini/current` 并在重启失败时回滚。
+  - `scripts/gemini-maintenance.py`：识别 `defaults/` 下（或钉选发行方哈希）的默认 CRAG 公钥，`install` / `repair` / `recover` 不再与 `409 manual_source_required` / `repair_release_unknown` 互锁；`scripts/fetch-default-gemini.py` 的 `prepare()` 支持 `--reuse-agy`，`download()` / `download_bounded()` 对瞬时网络/5xx 有界重试且不重试完整性失配。
+  - `scripts/gemini_host_account.py`：`loadCodeAssist` / `onboardUser` 补齐 `platform: LINUX_AMD64`、`pluginType: GEMINI`，命中 `UNSUPPORTED_CLIENT` 时自动以备用 Antigravity User-Agent 重试，持续失败归类为 `client_unsupported` 而非笼统 `ineligible`；`scripts/gemini_host_native.py`、`scripts/gemini-host.py`、`src/lib/gemini/{routes,scheduler}.mjs` 与前端 `gemini-account-status.ts` / `gemini-recovery.ts` / `gemini-environments.tsx` 全链路透传 `client_unsupported` / `gemini_client_unsupported` 并指向「设置 → Gemini 维护」，同时防止陈旧探测结果重新污染已由实际推理证明可用的账号。
+- **Codex 凭证吊销（grant death）升级为不可调度四态（#1900）**：
+  - 现象：Codex 槽位的 401 `token_revoked` / `Encountered invalidated oauth token` 此前只换来 `codexFailureHold` 的 5 分钟进程内挂起（笼统 `oauth_401`），不落盘、不置不可调度，被吊销的槽每轮重新入选并持续打上游 401（生产上三个槽位约 11 小时每小时一次 401，面板仍显示健康）。
+  - `src/lib/protocol/codex-models.mjs`：`refreshCodexAccessToken` 读取 401/403 响应正文并将上述措辞归类为 `oauth_revoked`（带 `revoked` 标记与 `description`），普通拒绝仍为 `refresh_rejected`。`src/lib/protocol/handle-codex.mjs` 新增 `isCodexGrantDead`（措辞对齐 Claude 池，**刻意不含 `invalid_grant`**，那是重放旧 refresh token 的典型轮换竞态误报），请求路径落盘停泊并将挂起升级为永久；`search` / `images` JSON 端点共用 `parkCodexGrantDeadIfHit`，`refreshSearchAccess` 经共享在途缓存传播 `grant-dead:` 判定以覆盖合成 401（access 过期、无正文）形态。
+  - `src/lib/vm/codex-slot.mjs` 新增 `markCodexGrantDead`，复用权威变更入口 `applyUnschedulable`，幂等、不覆盖其他 unschedulable 判定（如 `organization_disabled`），并以 `_token_version` 闸门拒绝运维换票之后的迟到停泊；`src/lib/oauth/openai-quota.mjs` 的 `rotateIfNeeded` 将 `oauth_revoked` 视为结构性并停泊，面板文案区分「凭证已被吊销」与「刷新失败」。
+  - 复活路径：`commitImportedCodexVm` 与面板 `oauth/refresh` 成功后调用 `clearOpenAIAccountHold`（此前仓内没有任何地方清除该永久内存挂起，重新授权的槽位要等进程重启才对调度器可见）；`src/lib/vm/vm-registry.mjs` 的 `summarizeCodexSlot` 不再把 `refresh_error` 硬编码为 null。
+  - 同时纳入 Codex 槽位的定时凭证刷新（`src/lib/oauth/credential-refresh-monitor.mjs`、`src/server.mjs`），与既有刷新监控同一套调度。
+- **Codex 工具 schema 编译失败兼容重试（#1879）**：`src/lib/protocol/codex-convert.mjs` 新增 `codexCompatibleFunctionTools()`，`handle-codex.mjs` 仅在收到 400 `invalid_json_schema` 且匹配 `Invalid schema for 'tools[N].parameters': Unsatisfiable schema:`、尚未向客户端输出、尝试预算允许时，于同一槽位与会话重试一次，只为省略 `strict` 的函数工具补 `strict: false`，保留工具顺序、名称、参数 schema 与显式 `strict`；兼容重试计入总尝试预算，上游再次拒绝即如实返回。实测一次含 57 个工具的请求由 400 变为 200 `response.completed`。
+- **集群槽位容器先起新再删旧（#1884）**：`src/lib/cluster/remote-slot.mjs` 的 `startRemoteSlotAdmitted` 不再先 `removeContainer` 再重建。控制面升级会改变每个节点槽位的镜像 tag（内容寻址载荷哈希），随后的重建若在镜像构建/文件推送/`docker create`/`docker start` 任一步因链路饱和断开（典型为升级后 `warmNodeSlotImages` 的构建风暴），槽位会落得没有任何容器——泄漏的 `slot-runtime:` 维护挂起使其无法调度，且凭证在此期间停止刷新（生产已出现两次）。现改为把旧容器改名留底（`migrationBackupName` 控制在 Docker 63 字符限制内）、断开其网络以释放 endpoint、在真实名称下创建并启动新容器、确认起稳后再删除留底；任一步失败则回滚——删除半成品、改回原名、按快照恢复网络 endpoint、原先在运行的重新启动。新增回归 `test/unit/remote-slot-restart-loop.test.mjs`。
+- 部署说明：本次改动涉及控制面（`src/`）、前端（`web/src/`）、Go 协议前置（`protofront/`，运行期默认 `KIN_PROTO_FRONT=node`）、`deploy/install.sh` 与 Gemini 宿主/维护脚本（`scripts/gemini-host.py`、`scripts/gemini-maintenance.py`、`scripts/gemini_host_account.py`、`scripts/gemini_host_native.py`、`scripts/fetch-default-gemini.py`）；`deploy/payload.json`（CRAG `3.1.21` 与 CRAGGemini `0.4.13`）、数据库迁移结构与 `bin/` / `share/wrap-cli` 相对 `1.4.225` 均未变，预期 `SLOT_SYNC=skip`，无需执行 `wrap-cli/sync` 或重启既有 Claude/Codex 槽位，重启 `vm2api` 一次即可生效；Gemini 宿主机需执行 `install.sh prepare-gemini` 同步宿主与维护脚本后重启 `vm2api-gemini`，CRAGGemini 安装/升级与 `UNSUPPORTED_CLIENT` 修复才会生效。
+
+## 1.4.225 — 2026-11-26 · 修复 Claude Code `response stream was malformed`（`response_headers` 子串误过滤与保活帧交错）；CRAG 内核白名单保留 `tool_use.extension`；恢复详情面完整邮箱展示与名称优先语义
+
+- **修复下游 Claude Code `API Error: The response stream was malformed` 且网关零错误日志（#1888）**：
+  - `src/lib/protocol/handle-protocol.mjs`：新增 `createResponseHeadersSseFilter()`，仅丢弃真正的 `response_headers` 控制帧（`event: response_headers` 或 JSON `type === "response_headers"`）。此前 `/response_headers/.test(line)` 会命中任何正文/思考/工具 JSON 中含该字面量的模型增量，而前导 `event: content_block_delta` 与尾随空行仍被写出，下游收到空 `data` 触发 `JSON.parse("")` → `SyntaxError`，网关侧却记录 `200 OK`。
+  - `src/lib/protocol/stream-keepalive.mjs`：保活心跳在具名 SSE 帧（`event:` 到空行之间）写入中时让行（`inFrame` 守卫），避免切断 SSE 帧；在 `message_start` / `message_delta` / `endAttempt()` 时清理活动块状态，支持 `server_tool_use`，并阻止已关闭索引的增量重新装载 `blockIndex`，消除 `StreamMalformedEventError("closed")`。
+  - `src/lib/transport/go-worker-client.mjs`：非 handoff SSE 读取改用 `StringDecoder("utf8")` + `decoder.end()`，修复跨 TCP 分块的多字节字符被 `chunk.toString("utf8")` 截断损坏。
+  - 新增回归 `test/unit/stream-keepalive.test.mjs`、`test/unit/stream-queue-keepalive.test.mjs`。
+- **恢复管理面详情页完整邮箱与名称优先标题语义（#1880，修 #1819 回归）**：
+  - `web/src/lib/vm-kind.ts`、`web/src/components/platform-chip.tsx`：`slotDisplayTitle` / `SlotIdentity` 恢复「自定义名称优先 → 邮箱 → id」，不再让脱敏邮箱顶掉自定义名称（此前破坏详情页标题、各弹窗标题、集群表与 key 弹窗的既有命名工作流）。
+  - `web/src/features/vm/vm-detail-card.tsx`、`detail-status-board.tsx`、`detail-account-tab.tsx`、`vm-row-detail.tsx`、`web/src/features/import/gemini-environments.tsx`：详情卡「邮箱」、状态板、账号 tab「ChatGPT 账号」、行展开详情与 Gemini 环境详情直出完整邮箱（admin-only 控制台的账号审阅、换邮箱核对与风控判读主键）；列表/网格/选择器维持 `formatSlotEmail` 脱敏 + 悬停 title 全文，防偷窥口径不变。
+  - `web/src/features/vm/vm-stats-dialog.tsx`、`web/src/features/keys/key-limits-dialog.tsx`：修正悬停 title 不再挂脱敏字符串。
+- **修复 CRAG 零信任白名单丢弃 `tool_use.extension` 致已发工具重放在逐跳净化时失效（#1893）**：
+  - `src/lib/protocol/crag-whitelist.mjs`：`BLOCK_KEYS_BY_TYPE.tool_use` 键集补回 `extension`。#1731 的零信任白名单按类型键集重建每个内容块，`tool_use` 键集遗漏该键，`pickKeys` 因此在 CRAG 路径上将其丢弃——`handle-protocol.mjs` 恢复的网关自有已发工具重放（含 `extension`）在随后的逐跳净化中被再次抹掉。该值由重放账本铸造并覆盖客户端回传内容，且 CRAG 续接哈希覆盖这些字节，必须原样透传（与 `thinking.block_binding` 同形，`cli-node` 侧 `kernel-request.mjs` 本就保留）。
+  - `test/unit/outbound-log-envelope.test.mjs` 对齐 #1731 的出站信封断言语义，并将 `outbound-log-envelope` 纳入 `package.json` 的核心测试集。
+- 部署说明：本次改动仅涉及控制面（`src/lib/protocol/`、`src/lib/transport/`）与前端（`web/src/`）；`deploy/payload.json`（CRAG `3.1.21` 与 CRAGGemini `0.4.13`）、数据库迁移结构、Gemini 宿主脚本与 `bin/` / `share/wrap-cli` 相对 `1.4.224` 均未变，预期 `SLOT_SYNC=skip`，无需执行 `wrap-cli/sync` 或重启既有 Claude/Codex/Gemini 槽位，重启 `vm2api` 一次即可生效。
+
+## 1.4.224 — 2026-11-26 · 加固 CRAG 订阅/商城归属与直充续费链路、对齐 CRAGGemini 订阅同步；CRAG 槽位内核能力重派与计费增强；Gemini 回调会话与零令牌排空归并
+
+- **CRAG 订阅与商城重构回归修复与归属安全加固（配套 `dofastted/crag#30` 与新版 `crag-shop`）**：
+  - `src/lib/vm/crag-subscription.mjs`、`src/lib/admin/crag-subscription-routes.mjs` 及前端 `crag-device-identity.tsx`、`crag-host-subscription.tsx`、`crag-cloud-orders.tsx`、`crag-subscription-errors.ts`、`queries.ts`：整机迁移（`POST /api/panel/crag-subscription/migrate`）要求提供原宿主机下任一历史订单号或原 `CRAGR1` 兑换码作为归属凭证并在迁入时立即绑定目标宿主机随机凭据；首次直充拉取 `CRAGH2` 权益后立即通过 `/recover` 替换临时占位凭据；修正云端历史订单面板有效兑换券计数（兼容 `active` 布尔字段）与续费后动态有效期展示（优先 `grant_expires_at`）。
+  - `src/lib/admin/crag-shop.mjs`：修复已完成直充订单在 `POST /apply` 与 `POST /apply-renewal` 时因跳过远端状态检查误调 `/claim` 失败的问题，对直充订单执行 `/claim` 返回明确 `409 shop_direct_credit_no_voucher` 并自动同步宿主机权益。
+  - `src/lib/gemini/subscription.mjs`：对齐 `crag-auth-gemini` 订阅链路，支持无本地凭据的直充/迁移宿主机首次 `status({ sync: true })` 自动拉取 `CRAGH2` 权益并立即绑定本地随机凭据，同时在凭据失配时借助本地已签名权益自动执行 `/recover` 恢复。
+- **CRAG 协议预检、号池故障隔离与按模型 Advisor 计费增强**：
+  - 支持 `crag_drop_foreign_thinking` 的 `foreign_only` 状态（#1887），允许 `tool_addition` / `tool_removal` 块通过内核预检、计入嵌套 `tool_result` 缓存断点并在内核白名单中保留 `thinking.block_binding`；当槽位因内核能力拒绝时自动重派一次、对重复不透明 CRAG 429 施加模型级冷却并将单会话 `stop-400` 熔断记账收口为单次；从 `usage.iterations` 上报按模型拆分的 Advisor 用量与费用（#1886）。
+- **Gemini 回调日志与零令牌工具排空**：记录回调 `conversation_id`、为第三方请求提供 `session_id` 回退，并折叠零令牌工具排空帧（#1882）。
+- 部署说明：本次改动仅涉及控制面（`src/`）与前端（`web/src/`）；`deploy/payload.json`（CRAG `3.1.21` 与 CRAGGemini `0.4.13`）、数据库迁移结构、Gemini 宿主脚本与 `bin/` / `share/wrap-cli` 相对 `1.4.223` 均未变，预期 `SLOT_SYNC=skip`，无需执行 `wrap-cli/sync` 或重启既有 Claude/Codex 槽位，重启 `vm2api` 一次即可生效（整机迁移归属校验与优惠券锁价续费需配套已部署的新版 `crag-auth` 与 `crag-shop`）。
+
+## 1.4.223 — 2026-11-26 · 钉选 CRAGGemini 0.4.13（阻止 `agy` 20k MCP 工具截断）并收紧线协议工具名 55 字符上限
+
+- **阻止 `agy 1.5.9` 20k Token 预算静默截断客户端/MCP 工具，并钉选 `CRAGGemini 0.4.13` 签名载荷**：
+  - `deploy/payload.json` 将 `geminiDefaultLinuxAmd64` 升级至 `payload-2026.11.26-gemini-0.4.13`（对应 `dofastted/antigravity-cli-proxy#18` / `v0.4.13`，沿用现有 `crag-auth-gemini` 授权锚 `f9572077…` / `d2470877…`），通过 `Hook::CustomizationBudget` 解除 20,000-token `CustomizationTokenBudget` 截断、消除布尔 `additionalProperties` Schema 冗余描述、`defer_ack=1` + `POST /internal/mcp/listed` 延迟确认 `tools/list` 刷新竞争，并仅剥离内部 `crag`/`craggemini` 前缀以完整保留客户端 `mcp__<server>__<tool>` 声明（#1873）。
+  - `src/lib/protocol/gemini-convert.mjs` 与 `test/unit/gemini-convert.test.mjs` 将出站 wire 工具名缩短策略统一收口为 55 字符上限（叠加 `mcp_crag_` 前缀后严格不超过 64 字符 `ValidateToolName` 限制）（#1873）。
+- 部署说明：本次改动仅涉及控制面（`src/lib/protocol/gemini-convert.mjs`）与 `deploy/payload.json`（CRAGGemini 默认载荷由 `0.4.12` 升级至 `0.4.13`，CRAG 维持 `3.1.21`）；前端（`web/src/`）、数据库迁移结构、Gemini 宿主脚本与 `bin/` / `share/wrap-cli` 相对 `1.4.222` 均未变，预期 `SLOT_SYNC=skip`，无需重启既有 Claude/Codex 槽位；升级控制面并在 Gemini 宿主机切换 CRAGGemini `0.4.13` 载荷、重启 `vm2api` 与 `vm2api-gemini` 即可生效。
+
+## 1.4.222 — 2026-11-26 · Gemini 定向 AppArmor userns 策略与沙箱探针；常规日志错误详情持久化、writeHead 响应头捕获与跨跳关联 ID
+
+- **Gemini 定向 AppArmor userns 策略、真实沙箱探针与安全 OAuth 早退归因**：
+  - `deploy/install.sh` 与 `scripts/gemini-maintenance.py` 仅在开启 `kernel.apparmor_restrict_unprivileged_userns=1` 的宿主机按条件生成并原子加载受管 `/etc/apparmor.d/vm2api-gemini`（`abi <abi/4.0>`、`flags=(unconfined)`、`userns,`），并将 `AppArmorProfile=vm2api-gemini` 与 `After/Requires=apparmor.service` 内联至 `/etc/systemd/system/vm2api-gemini.service`（保持零 drop-in 约定，缺依赖或存在人工自定义配置时闭失败）（#1868，修 #1847）。
+  - `scripts/gemini-host.py`、`scripts/gemini-maintenance.py`、`src/lib/gemini/routes.mjs` 及前端设置/导入/账号状态页新增有界无网 `setpriv` + `bwrap` 沙箱探针与 `sandbox` 维护检查项（区分 `gemini_sandbox_apparmor_restricted` 与 `gemini_sandbox_unavailable`，正/负 TTL 缓存并支持诊断强制刷新）；OAuth 登录通过 `Agy.poll_exit_status()`（`waitid(..., WNOWAIT)`）区分真实 8 秒超时与子进程早退/沙箱拒绝且零 PTY 泄露（#1868）。
+- **常规日志结构化错误详情持久化、`writeHead` 响应头捕获与跨跳关联 ID**：
+  - 新增纯增量可空迁移 `src/lib/db/migrations/069_log_error_details_and_hop_correlation.sql`（SQLite）与 `src/lib/db/pg/pg-migrations/006_log_error_details_and_hop_correlation.sql`（PostgreSQL 对等），为 `usage_logs` 与 `request_attempts` 补充 `upstream_type`、`error_details` / `error_details_json`、`error_code`、`hop_request_id` 及 `provider_{run,turn,attempt,request}_id`；`src/lib/core/errors.mjs` 新增白名单标量脱敏器持久记录 `#1705` 续接标量与 410 `reason`，`handle-protocol.mjs` 不再让泛化 `upstream_error` 掩盖具体映射码（#1869，关联 #1845）。
+  - `src/lib/admin/request-log.mjs` 完整包装 `res.writeHead` 各类签名并在脱敏前按线序合并 `res.getHeaders()` 与 `writeHead` 头，确保 debug 日志保留 `x-request-id` 与 `x-should-retry`；`go-worker-client.mjs`、`native-handoff.mjs`、`log-fields.mjs`、`failover-runner.mjs` 及前端日志详情页（`SummaryTab`、`LogicTraceTab`）全链路记录并展示单跳 `hop_request_id` 与内核 `providerResult` 关联 ID（内部 `x-gateway-request-id` 仅限 Unix socket 且不进 CRAG v2 透传白名单）（#1869）。
+- 部署说明：本次改动涉及控制面（`src/`）、前端（`web/src/`）、数据库增量迁移（SQLite `069` / PostgreSQL `006`，纯可空 `ADD COLUMN IF NOT EXISTS` 在线无重写）、`deploy/install.sh` 及 Gemini 宿主与维护脚本（`scripts/gemini-host.py`、`scripts/gemini-maintenance.py`）；`deploy/payload.json`（CRAG `3.1.21` 与 CRAGGemini `0.4.12`）及 `bin/` / `share/wrap-cli` 相对 `1.4.221` 未变，预期 `SLOT_SYNC=skip`，无需重启既有 Claude/Codex 槽位；Gemini 宿主机同步脚本并刷新维护 bundle 后需重启 `vm2api-gemini` 与 `vm2api-gemini-maintenance` 一次以启用 `sandbox` 探针与 OAuth 早退归因。
+
+## 1.4.221 — 2026-11-26 · 修复 Gemini `crag_subscription` 分片崩溃 503 循环；钉选 CRAG 3.1.21 与遥测上传核验；商城画布缓存持久化、日志思考后缀对齐与 PostgreSQL 备份预检加固
+
+- **修复 Gemini `crag_subscription` 分片 `license_error` 导致的周期性 `503 gemini_native_worker_unavailable`**：
+  - `scripts/gemini-host.py` 在 `payload_mode == "crag_subscription"` 时强制 `_use_sharded_daemon()` 返回 `False`（统一走单账号 `NativeSession` 进程池，与每环境独立 `/etc/machine-id` 设备绑定保持一致），并对齐 `daemon_status()` 的 `planned_shards` 计算（#1863）。
+  - 新增 `_clear_shard_fault()`，移除 `_acquire_shard_for_account()` 启动即清零退避计数的缺陷（仅在健康检查或 `open_stream` 真正就绪后重置），恢复 `2s → 60s` 指数退避；在 `_stream_native_infer()` 中，当分片在发送 SSE 响应头之前崩溃且开启 `daemon_fault_isolation` 时透明隔离并同请求回落至单账号 `NativeSession`（#1863）。
+- **CRAG 遥测上传核验并钉选 CRAG `3.1.21` 签名载荷**：`deploy/payload.json` 将 CRAG 载荷升级至 `payload-2026.11.26-crag-3.1.21`；扩展 `src/lib/transport/rust-kernel-client.mjs`、`src/lib/vm/slot-process-status.mjs`、`src/lib/admin/kernel-catalog.mjs` 与前端 `telemetry-pane.tsx` / `seed-policy-card.tsx` / `detail-page.tsx`，补齐 CRAG 遥测上传校验状态与文档说明（#1859）。
+- **CRAG 商城商品画布缓存持久化、Gemini 日志模型名对齐与 PostgreSQL 备份预检对齐**：
+  - `src/lib/admin/crag-shop.mjs`、`crag-shop-supplier.mjs` 与 `web/src/features/billing/crag-shop.tsx` 持久化商品目录画布缓存，支持摘要哈希跳过重复拉取与上游超时回退（#1862）。
+  - `src/lib/protocol/log-fields.mjs`、`src/lib/db/repos/usage-logs-view.mjs` 与 `web/src/features/logs/log-display.ts` 将 Gemini 思考档位后缀与上游裸 `modelVersion` 视为同源匹配（#1860）。
+  - `src/lib/admin/backup-service.mjs`、`panel-routes.mjs` 与 `web/src/features/settings/backup-pane.tsx` 对齐 PostgreSQL 备份预检、HTTP 状态码与界面展示（#1858）。
+- 部署说明：本次改动涉及控制面（`src/`）、前端（`web/src/`）、`deploy/payload.json`（CRAG 升级至 `3.1.21`，CRAGGemini 维持 `0.4.12`）与 `scripts/gemini-host.py`；数据库迁移结构与 `bin/` / `share/wrap-cli` 相对 `1.4.220` 未变，预期 `SLOT_SYNC=skip`；Gemini 宿主机同步 `scripts/gemini-host.py` 后重启 `vm2api-gemini` 即可彻底消除 `503 gemini_native_worker_unavailable`（`v1.4.211`～`v1.4.220` 旧版在升级前可通过将 `accounts_per_daemon` 设为 `1` 临时止血）。
+
+## 1.4.220 — 2026-11-26 · 钉选 CRAGGemini 0.4.12 并恢复 agy 工具执行；修复 PostgreSQL `cooldown_until` 类型归一与一键切库脚本
+
+- **恢复 CRAGGemini `agy` 客户端工具执行并钉选 `0.4.12` 签名载荷**：
+  - `deploy/payload.json` 将 `geminiDefaultLinuxAmd64` 升级至 `payload-2026.11.26-gemini-0.4.12`（对应 `dofastted/antigravity-cli-proxy#16` / `v0.4.12`，沿用生产授权锚 `f9572077…` / `d2470877…` 与 `agy` `39816d49…`）（#1854）。
+  - `scripts/gemini-host.py` 移除原生启动参数中的 `--mode plan`，避免 CRAGGemini 运行态锁死在计划模式；`src/lib/protocol/gemini-convert.mjs` 在工具转换链路剥离 `mcp_crag_*` / `mcp__crag__*` / `mcp_craggemini_*` / `mcp__craggemini__*` 内部前缀（#1854）。
+- **PostgreSQL 迁移与运行时修复**：
+  - `src/lib/gemini/scheduler.mjs`、`src/lib/db/repos/request-attempts-repo.mjs` 与 `scripts/migrate-sqlite-to-pg.mjs` 将 `request_attempts.cooldown_until` 统一归一化为整型 epoch 毫秒，避免 ISO 时间戳字符串触发 PostgreSQL `bigint` 写入/迁移异常（#1852）。
+  - `deploy/replace-db-to-pg.sh` 的 `resolve_api_key()` 改为优先读取生效的 systemd `KIN_API_KEY` 而非陈旧 `.env` 中的 `VM2API_API_KEY`，并在 `cleanup_on_failure()` 回滚前先 `stop` 再 `start` `vm2api`，防止失败回退时进程继续持有已移除的 PostgreSQL 配置（#1855）。
+- 部署说明：本次改动涉及控制面（`src/`）、`deploy/payload.json`（CRAGGemini 默认载荷由 `0.4.11` 升级至 `0.4.12`，CRAG 维持 `3.1.20`）、`scripts/gemini-host.py`、`scripts/migrate-sqlite-to-pg.mjs` 与 `deploy/replace-db-to-pg.sh`；前端（`web/src/`）、数据库迁移结构与 `bin/` / `share/wrap-cli` 相对 `1.4.219` 均未变，预期 `SLOT_SYNC=skip`，无需重启既有 Claude/Codex 槽位；Gemini 宿主机同步脚本、更新 `deploy/payload.json` 与维护 bundle 并切换 CRAGGemini `0.4.12` 载荷后，重启 `vm2api-gemini` 与 `vm2api-gemini-maintenance` 一次即可生效。
+
+## 1.4.219 — 2026-11-25 · 修复 Gemini bwrap 直连目录穿越与熔断错误归因；Go 协议前置 sidecar 与官方透传开关；Gemini 代理选择器展示 IP/出口 IP/地区
+
+- **修复 Gemini `bwrap` 直连目录穿越权限与熔断错误归因回归（消除全模型 503）**：
+  - `scripts/gemini-host.py` 修复 `/run/vm2api-gemini/d`（`direct_root`）`0750` 权限阻断非特权 `bwrap` worker（`--clear-groups`）穿越挂载及 `<short_name>` 启动前非 `0700` 触发 `craggemini` `Config::validate()` 失败的问题：启动时创建/自愈 `direct_root` 为 `0711`（`root:gateway_gid`，仅穿越不可列举）、worker 启动前以 `0700`（`uid:uid`）创建 `native_dir`，待 worker 就绪后在 `_expose_direct_socket()` 将 `native_dir` 切换为 `0710`（`uid:gateway_gid`）并将 `kernel.sock` 设为 `0660`（`uid:gateway_gid`）（#1848）。
+  - `scripts/gemini_host_native.py`、`src/lib/gemini/direct-client.mjs`、`src/lib/gemini/scheduler.mjs` 与 `src/lib/gemini/routes.mjs` 将内核 `account_circuit_open` 与全部候选账号被 `unitCircuit` 熔断的场景统一归因为 `503 gemini_native_worker_unavailable`（`gemini_operation_busy` 严格保留给队列满/并发饱和），并将公网 503 池并发文案（「当前可用 Gemini 账号并发繁忙，请稍后重试」）与面板 409 单环境锁文案分离（#1848）。
+- **Go 无状态协议前置 sidecar、Web Settings 官方请求体透传开关与 130 用例离线基线**：
+  - 新增纯 Go 标准库协议前置 sidecar（`protofront/` → `bin/kin-proto-front`）与 `src/lib/transport/proto-front-client.mjs`，实现星形 IR 与 4+1 入站协议双向编解码、Web Settings + 官方请求体双闸门透传校验、面向 CRAG/CRAGGemini/Codex 的防撞车剥离与畸形 JSON Schema `fail_closed_schema` 400 拦截，并通过 `KIN_PROTO_FRONT=node|shadow|go` 控制灰度切流（默认保持 `node` 不启动 sidecar，零行为变更、可即时回退）（#1849）。
+  - `src/lib/protocol/codex-route.mjs` 新增 `codex.official_passthrough`（默认 `true`）、`src/lib/gemini/routing-config.mjs` 新增 `gemini.official_passthrough`（默认 `true`），前端在 `web/src/features/settings/openai-pane.tsx` 与 `gemini-config-pane.tsx` 暴露对应「官方 Codex/Gemini 请求体透传」开关；新增 `scripts/protocol-baseline/` 130 用例离线基线并将 `protofront` 接入 CI 与 `scripts/check-gofmt.mjs`（#1849）。
+- **Gemini 代理选择器与详情页展示代理地址、出口 IP 与地区**：`web/src/features/import/gemini-operations.ts` 扩展 `GeminiProxy` 公开字段并新增 `geminiProxyAddress()` / `geminiProxyOptionLabel()`（安全处理 IPv6 方括号、区分中转域名与实测 `geo.ip`），同步应用于 `gemini-environments.tsx`（导入下拉与详情「绑定代理」）及 `gemini-proxy-panel.tsx`（重绑下拉与已绑卡片新增「代理地址」/「出口 IP」行）（#1843）。
+- 部署说明：本次改动涉及控制面（`src/`）、前端（`web/src/`）、Gemini 宿主脚本（`scripts/gemini-host.py`、`scripts/gemini_host_native.py`）以及默认关闭的 Go 协议前置源码（`protofront/`，运行期默认 `KIN_PROTO_FRONT=node`）；`deploy/payload.json`（CRAG `3.1.20` 与 CRAGGemini `0.4.11`）、`scripts/gemini-maintenance.py`、数据库迁移结构与 `bin/` / `share/wrap-cli` 相对 `1.4.218` 均未变，预期 `SLOT_SYNC=skip`，无需重启既有 Claude/Codex 槽位；Gemini 宿主机同步 `scripts/gemini-host.py` 与 `scripts/gemini_host_native.py` 后需重启 `vm2api-gemini` 一次以启用 `bwrap` 直连目录两阶段权限修复。
+
+## 1.4.218 — 2026-11-25 · CRAG 订阅宿主机直充/锁价续费/整机迁移与云端订单；PostgreSQL 运行时、备份与一键迁移加固；CRAG v2 续跑 transcript 迁至来宾 tmpfs
+
+- **CRAG 订阅极简重构（`host_id` 直充、锁价续费、云端历史订单与整机零冷却迁移）**：
+  - `src/lib/vm/crag-subscription.mjs` 与 `src/lib/admin/crag-subscription-routes.mjs` 在 `GET /api/panel/crag-subscription` 暴露完整 64 位十六进制 `host_id`，允许无本地凭据时零 Bearer 调用并在 `status()` 自动拉取已直充或升级的 `CRAGH2` 权益；新增 `GET /api/panel/crag-subscription/orders` 与 `POST /api/panel/crag-subscription/migrate`（支持 64-hex `host_id` 或设备 UUID，零冷却整机迁移）。
+  - `src/lib/admin/crag-shop.mjs` 与 `src/lib/admin/crag-shop-supplier.mjs` 在创建标准/设备订单时自动注入当前宿主机 `host_id` 实现支付完成后直充激活，并支持 `sku: "renewal"` + `renew_order_id` 一键锁价续费（不再依赖旧版 `CRAGRP1` `renewalProof`，商品涨价或下架后仍锁定原实付金额）。
+  - 前端新增 `web/src/features/billing/crag-cloud-orders.tsx`（`CragCloudOrdersPanel`），并扩展 `crag-shop.tsx`、`crag-device-identity.tsx`、`crag-host-subscription.tsx`、`crag-subscription-errors.ts` 与 `queries.ts`，展示可复制完整 `host_id`、有效/总计兑换券数、云端历史订单、一键锁价续费与整机/单笔迁移（保留 `#1826` 身份冲突重建能力）（#1842，配套 `dofastted/crag#28`）。
+- **PostgreSQL 运行时、备份恢复、流式迁移预检与 systemd 一键脚本端到端加固**：
+  - 运行时与可观测性：`src/lib/db/database.mjs` 新增 `withSavepoint()` 并接入 `write-behind.mjs`、`request-log.mjs`、`legacy-import.mjs` 隔离 PG 事务内单条 SQL 异常（防 `25P02` 污染批次）；`pg-sync-db.mjs` 在 worker `error`/`exit` 时唤醒 `Atomics.wait` 并施加有界 RPC 超时；`usage-logs-repo.mjs` / `usage-logs-view.mjs` 统一不区分大小写检索（`LOWER(col) LIKE ?`）并经 `settings.usage_logs_db_created_at` 保留历史覆盖起点；`cache-client.mjs` 在 Redis 不可达时回退 PG `LISTEN/NOTIFY`；`dashboard-aggregator.mjs` 对齐 `IGNORED_ERROR_CODES` 并在咨询锁下清理 24 小时前 outbox；`database-metrics.mjs` 暴露 `pg_top_tables` 与 `pg_dashboard_watermark`（#1841）。
+  - 备份与恢复：`backup-core.mjs` 通过 `PGPASSWORD` 传递凭据而非命令行 URI、`dumpPgLogicalNdjsonGz()` 按外键拓扑序经服务端 `NO SCROLL CURSOR` 流式导出、`restorePgSnapshotJob()` 以 `readline` 流式恢复并加 `lock_timeout = '30s'`；`backup-service.mjs` 回收 `pg_dump`/`pg_restore` 子进程并识别 `.pgdump` / `.pg.ndjson.gz` 孤儿归档（#1841）。
+  - 迁移器与部署脚本：`scripts/migrate-sqlite-to-pg.mjs` 新增零停机 `--preflight` 预检、默认拒绝静默丢表/丢列（需显式 `--allow-partial-schema`）、安全对齐种子表、大表字节级进度及 `--verify` 序列与订单/VM 校验；`deploy/install-pg.sh`、`deploy/replace-db-to-pg.sh`、`deploy/install.sh` 与 `docs/POSTGRES_MIGRATION.md` 支持 systemd `vm2api.service` 优先检测、`systemctl show` 读取真实 drop-in 端口/环境、`0600` `.env.postgres` 凭据隔离及 Phase 0 零停机预检（#1841）。
+- **CRAG v2 续跑 transcript 目录同步迁至来宾 tmpfs 避免 9p 写回卡死**：`docker/kin-kvm/guest/kin-crag-apparmor` 抽象 `isolate_tmpfs` / `release_tmpfs`，在 `#1741` `/run/kin/work` 之外新增受管 drop-in `46-vm2api-crag-transcripts.conf`，在内核启动前防符号链接跟随并将 `/home/kincli/.claude/projects` 挂载为来宾 tmpfs（`mode=0700,uid/gid=kincli,size=512m,nosuid,nodev`），失败时自动退回原 9p 目录，离开 CRAG v2 时清理受管 drop-in 且保留管理员自定义文件（#1838）。
+- 部署说明：本次改动涉及控制面（`src/`）、前端（`web/src/`）、PostgreSQL 迁移/安装脚本（`deploy/install*.sh`、`deploy/replace-db-to-pg.sh`、`scripts/migrate-sqlite-to-pg.mjs`）及 KVM guest 侧脚本（`docker/kin-kvm/guest/kin-crag-apparmor`）；`deploy/payload.json`（CRAG `3.1.20` 与 CRAGGemini `0.4.11`）、Gemini 宿主脚本、SQLite 迁移结构与 `bin/` / `share/wrap-cli` 相对 `1.4.217` 均未变，常规升级预期 `SLOT_SYNC=skip`，无需重启既有 Claude/Codex 槽位（KVM CRAG v2 槽位下次重启启用 `46-vm2api-crag-transcripts.conf`；CRAG 订阅直充/锁价续费/整机迁移需配合 `crag-auth` `dofastted/crag#28` 生效）。
+
+## 1.4.217 — 2026-11-25 · Codex `token_revoked` 自动摘牌；探活组织禁用直挂四态；主动查询静置窗边界修复；无凭证运行槽与额度条交互校准
+
+- **Codex 槽位 OpenAI `token_revoked` 凭证吊销与 Claude 同口径自动摘牌**：将 OpenAI 401 吊销文案（`token_revoked` / `invalidated oauth token`）统一纳入错误分类（`classifyOAuth401` / `GRANT_DEAD`）、`FailoverRunner` 刷新恢复、`credential-refresh-monitor`、`oauth-credentials`（`refreshErrorCodeOf` 写盘归一为 `oauth_revoked`）、调度资格门、transport 致命判定、`usage-probe-monitor`（跳过死凭证探活）、`panel-api` 遗留清理与前端 `web/src/lib/vm-status.ts` 状态模型，避免死号持续占座雪崩；中流（`terminalState: incomplete`）吊销维持 `oauth_unconfirmed` 保守语义，历史 `refresh_error: "token_revoked"` 旧值同步判死（#1814）。
+- **官方 `/usage` 探活识别组织禁用并直接挂起槽位**：`src/lib/pool/upstream-error-policy.mjs` 导出共享检测器 `isOrganizationDisabledText` 与 `isOrganizationDisabledUsageResult`（覆盖 `400`/`401`/`403` 及对象/字符串形态）；`panel-api.mjs` 探活在裸 401 致命分支之前识别组织禁用并直接 `markUnschedulable('organization_disabled')`（重读 `vm.json` 同步刷新可用性），仅操作员手动恢复；`account-quota.mjs` 不再对组织禁用打 `rate_limited` 退避并保留原始错误文案；`usage-probe-monitor.mjs` 跳过已挂起的 `organization_disabled` 槽位避免持续消耗 403 并覆写挂起时间（#1822）。
+- **主动用量查询保留近期无 Header 推理的静置保护**：`src/lib/pool/account-quota.mjs` 的 `5h`/`7d` 与 `7d_oi` 主动对账路径改用 `maxTimestamp(existingSampleMs, latestActivityAtMs)`，避免近期仅更新 `last_used_at` 而未带新额度 Header 的推理被普通主动查询绕过 5 分钟静置窗，显式 `force_reconcile` 行为保持不变（#1836，关联 #1776、#1820）。
+- **前端无凭证运行槽状态与额度条展示校准**：`web/src/lib/vm-status.ts` 的 `vmRunning()` 仅按实际运行态判定（`running`/`ok`/`active`，缺省 `status` 时才结合 `has_token` 兜底），修复无凭证但仍在运行的槽位在面板误显为「停止」且无法关机/改编号的死锁（#1824）；`web/src/features/vm/vm-list-table.tsx` 移除额度进度条内易被误读为用量游标的竖直时间刻线，保留悬停 `title` 时间进度提示（#1810）。
+- 部署说明：本次改动仅涉及控制面（`src/`）与前端（`web/src/`）；`deploy/payload.json`（CRAG `3.1.20` 与 CRAGGemini `0.4.11`）、Gemini 宿主脚本、数据库迁移结构与 `bin/` / `share/wrap-cli` 相对 `1.4.216` 均未变，预期 `SLOT_SYNC=skip`，无需重启既有 Claude/Codex 槽位（若从 `1.4.215` 直接跨版升级至 `1.4.217`，需一并按 `1.4.216` 说明同步 Gemini 宿主脚本并切换 CRAGGemini `0.4.11` 载荷）。
+
+## 1.4.216 — 2026-11-25 · 钉选 CRAGGemini 0.4.11 与 1-hop 直连数据面；设置页全量巡检校准；CPA/sub2api 导入、主动用量对账、CRAG 冲突重建与槽位邮箱脱敏统一
+
+- **CRAGGemini `0.4.11` 签名载荷升级、429 恢复增强、分片订阅守卫与 1-hop 直连数据面**：
+  - `deploy/payload.json` 将 `geminiDefaultLinuxAmd64` 升级至 `payload-2026.11.25-gemini-0.4.11`（Debian 12 离线构建 `<= GLIBC_2.34`，沿用既有生产授权锚 `f9572077…` / `d2470877…` 与 `agy` `39816d49…`），交付 `dofastted/antigravity-cli-proxy#13` 与 `#14`（`gemini-4-carbon-high` 推理强度、默认 `agy` 详略度、原生四协议 API、`agy 1.5.9` 非 200 错误体捕获、槽位池恢复与按账号 `LicenseGate` 隔离）（#1832）。
+  - 优化 `src/lib/gemini/routes.mjs`、`prompt-normalizer.mjs`、`scheduler.mjs` 与 `src/lib/protocol/{gemini-convert,handle-protocol}.mjs`，按 `(target, upstreamModel)` 缓存出站载荷与归一化结果、文件指纹化缓存许可与短时目录；结构化区分 Google 429 `QUOTA_EXHAUSTED`（含 `quotaResetDelay` / `retryDelay`）与无原因 `gemini_content_rejected`（内容拒绝不冷却/不切号，短 RPM 有界重试）；`scripts/gemini-host.py`、`scripts/gemini_host_native.py` 与 `scripts/gemini-maintenance.py` 在 `crag_subscription` 模式下启用 `CragDaemonShard`、按账号落盘 `crag-license`（`0600`）实时同步激活/吊销状态，暴露 `/run/vm2api-gemini/d/<short>/kernel.sock` 并新增 `POST /infer-target`；新增 `src/lib/gemini/direct-client.mjs` 实现热态 OAuth 回合 Node → CRAGGemini Unix Socket 1-hop 直连流式推理与连接池 `/cancel`，异常时透明闭失败回退至 `POST /infer`（#1829）。
+- **Gemini 账号导入新增支持 CPA 与 sub2api 格式**：扩展前端本地解析与多账号选择器（`web/src/features/import/gemini-account-import.ts`、`gemini-environments.tsx`，单文件上限 2 MiB）与后端归一化（`src/lib/gemini/oauth-import.mjs`、`routes.mjs`），在原有 Antigravity Tools 导出之外支持 CLIProxyAPI（`type: "antigravity"` / `"gemini"`）与 sub2api（多账号包/单账号 JSON、OAuth 与 API Key、混合平台过滤），始终仅提交最小凭据且不上传/转发 `refresh_token`，同步更新 `docs/gemini-host.md`（#1821）；补齐 `test/unit/gemini-host.test.mjs` 对 `#1806` 默认调度字段的断言基线（#1833）。
+- **设置页与运维控件全量巡检校准（Batch 1 & Batch 2）**：
+  - 路由、调度、协议与脱敏语义校准：新增 `web/src/features/settings/routing-draft.ts`，移除保存「设置 → 协议」时的静默 `inheritProtocolOnSlots()` 副作用并保留未暴露 `compatibility` 字段；按变更区块触发归一化、缓存失效与保存提示，`SaveBar` 跨非路由标签持续可见，13 张摘要卡「待保存」角标按自身字段切片计算；校准会话绑定文案、移除死滑块 `pool.seat_grace_ms`、对齐 `FailoverRunner` / `PoolPane` 默认值与 `<Link>` 导航；启停与策略替换统一调用 `ensureRedaction` 并在禁用/替换时回收旧 `kin-redact` 子进程，`PUT /api/panel/routing` 在 `400` 阶段严格校验脱敏规则上限、`exhaustion_guard_new_session <= exhaustion_guard_stop`、`codex.catalog_client_version` 与日志保留/容量参数，`GET /api/panel/routing` 返回生效 `max_body_bytes` / `max_body_mib`，修复 `eagerToolStreamingEnabled` 默认极性（#1831）。
+  - 顶栏权限、槽位面板与运维控制对齐：`ProfileDropdown` 与 `CommandMenu` 按面板视图权限过滤并完成 `ConfigDrawer` 中文化；优化 `OfficialCcSettingsPane`、`HealthPane`、`TelemetryPane`（拆离即时槽位与延后全局策略卡片、修复单位切换改写草稿）与 `Socks5Pane`；`notify.mjs` / `notify-pane.tsx` 补齐邮件（SMTP）渠道编辑与测试并规范化 `/cc#/cluster` 链接；`backup-pane.tsx` 替换原始配置块为本地化自动备份卡片并校验恢复/下载可用性；`GET /api/panel/version?refresh=1` 支持强制刷新且失败不续期 5 分钟缓存；`gemini-install-pane.tsx` 补全 `gemini_maintenance_*` 中文说明与提交不确定态区分（#1830）。
+- **主动用量查询受控校准陈旧 Header 与强制对账**：`AccountQuota.ingestOAuthUsage` / `createActiveUsageQuery` 保持被动探测 `shouldCopyOfficialToExtra()` 守卫不变，仅在主动查询 `200 OK` 且字段完整时按窗口独立校验单调性、空闲态、`#1758` `reset_boundaries` 与 5 分钟静置窗，安全回校准陈旧 `5h`/`7d`/`7d_oi` Header 并清理过期冷却；对齐 `quota-tiers.mjs` `isNearLimit()`；`POST /api/panel/vms/:id/usage/query` 支持 `{ force_reconcile: true }` 并返回对账/保留窗口与剩余静置时间，前端展示保留反馈与二次确认强制对账弹窗（#1820，关联 #1776）。
+- **CRAG 宿主身份冲突自动重建与手动重建路由**：`src/lib/vm/crag-subscription.mjs` 在 `host_id_collision` 时通过 `rebuildDeviceIdentity({ reason: 'host_id_collision' })` 优先切换无冲突硬件源、全部冲突时生成全新 128-bit 身份并立即签发配对凭据，`redeem()` / `claimByOrder()` 自动重建并重试一次；新增 `POST /api/panel/crag-subscription/rebuild-identity` 并在订阅页与宿主订阅提示中提供一键重建按钮（#1826）。
+- **全槽位邮箱脱敏展示统一收口**：在 `web/src/lib/vm-kind.ts` 新增唯一事实来源辅助函数 `formatSlotEmail` / `slotRawEmail` / `slotDisplayTitle`（保留前 5 字符加省略号 + `@` + 域名前 5 字符，悬浮 `title` 保留完整邮箱），统一应用于 Claude / Codex / Gemini 机架卡、槽位表、行展开详情、详情页、密钥弹窗、集群机器详情与 Gemini 环境页，并在 `src/lib/vm/vm-registry.mjs` 保留顶层 `vm.email` 回退（#1819）。
+- 部署说明：本次改动涉及控制面（`src/`）、前端（`web/src/`）、`deploy/payload.json`（CRAGGemini 默认载荷由 `0.4.10` 升级至 `0.4.11`，CRAG 维持 `3.1.20`）以及 Gemini 宿主脚本（`scripts/gemini-host.py`、`scripts/gemini_host_native.py`、`scripts/gemini-maintenance.py`）；数据库迁移结构与 `bin/` / `share/wrap-cli` 均未变，预期 `SLOT_SYNC=skip`，无需重启既有 Claude/Codex 槽位；Gemini 宿主机同步脚本并切换 `0.4.11` 加密载荷后需重启 `vm2api-gemini` 与 `vm2api-gemini-maintenance` 生效。
+
+## 1.4.215 — 2026-11-25 · CRAGGemini 席位许可语义/同步恢复/换签对齐；`gemini-4-carbon-high` 思考强度与多协议对齐
+
+- **CRAGGemini 席位许可语义、同步恢复与载荷密钥换签全链路对齐**：
+  - `src/lib/gemini/subscription.mjs` 与 `src/server.mjs` 新增 `hasSyncPending()`、`recover()`、`refreshExpiredEntitlement()` 及启动/后台 15s 恢复循环，并通过 `withLock` 串行化同步避免竞态；`verifyCragGeminiSlotPermit()` 对载荷密钥漂移抛出 `license_payload_key_mismatch`，`bindEnvironment()` 在 `payload_key_conflict` / `host_binding_conflict` 时自动带 `reissue: true` 重试换签；导出唯一事实来源 `RECOVERABLE_GEMINI_SEAT_CODES`（`license_required` / `license_binding_mismatch` / `license_expired` / `license_payload_key_mismatch`）供 `src/lib/gemini/scheduler.mjs` 复用自愈；`src/lib/gemini/routes.mjs` 新增 `POST /api/panel/gemini/crag-subscription/sync` 与 `GET ?sync=1` 并在拉取库存前自动恢复残留 `sync-pending`（#1825）。
+  - `scripts/gemini-host.py` 与 `scripts/gemini_host_native.py` 不再将 `craggemini` 非零退出一律塌缩为 `license_invalid`，改为解析结构化 JSON/stderr 精确归因，识别 `sync-pending` 返回 `gemini_subscription_sync_pending`（HTTP 503），并在 `license_status()` 中比对 `CRAGS1`/`CRAGL1` 与 `manifest.json` 的 `payload.key_id`（向下兼容 `0.4.10` 二进制）（#1825）。
+  - `web/src/lib/gemini-account-status.ts` 与 `web/src/features/import/gemini-environments.tsx` 区分「宿主订阅同步中」与「未激活」、提供「继续同步订阅」操作按钮，补齐 `license_payload_key_mismatch` / `gemini_subscription_sync_pending` 文案，并将失效席位按钮与指引统一为「重新绑定 CRAG 席位」（#1825）。
+- **Gemini `gemini-4-carbon-high` 思考强度传播、`agy` 默认详略度与多协议对齐**：完善 `src/lib/gemini/model-catalog.mjs`、`src/lib/protocol/gemini-convert.mjs`、`src/lib/protocol/gemini-model-policy.mjs`、`src/lib/gemini/routes.mjs` 与 `scripts/gemini-host.py`，补齐 OpenAI Chat `reasoning_content` / `extra_body.google.thinkingConfig`、OpenAI Responses `configuration_update` / `reasoning.encrypted_content` 往返及 Anthropic 会话中段 `output_config.effort` / `redacted_thinking` 签名透传（#1823）。
+- 部署说明：本次改动涉及控制面（`src/`）、前端（`web/src/`）与 Gemini 宿主脚本（`scripts/gemini-host.py`、`scripts/gemini_host_native.py`）；`deploy/payload.json`（CRAG `3.1.20` 与 CRAGGemini `0.4.10`）、数据库迁移结构与 `bin/` / `share/wrap-cli` 均未变，预期 `SLOT_SYNC=skip`，无需重启既有 Claude/Codex 槽位；Gemini 宿主机同步脚本后需重启 `vm2api-gemini` 生效。
+
+## 1.4.214 — 2026-11-25 · 钉选 CRAG 3.1.20 与 CRAGGemini 0.4.10；多 CLI 429 触发词归一化与 410/429 透传；Gemini 串行每小时健康缓存
+
+- **CRAG 3.1.20 与 CRAGGemini 0.4.10 签名载荷全线升级**：
+  - `deploy/payload.json` 与 `src/lib/admin/kernel-catalog.mjs` 升级 CRAG 至 `3.1.20`（`payload-2026.11.25-crag-3.1.20`，对应 `dofastted/crag@v3.1.20` PR `#26`），修复孤儿 transcript JSONL 回收（#1726）、首字节前 401 续跑可重试与 410 结构化 `details.reason`（#1215）及 `GET /api/oauth/usage` 转发（#1311），沿用生产授权锚（`9dbb4bc2…` / `835451e2…`）；同步在 `src/lib/core/errors.mjs` 对 `410 Gone` 按白名单透传 `details.reason`（`waiting_expired` / `handoff_expired` / `receipt_expired` / `cancelled`）（#1816）。
+  - `deploy/payload.json` 升级 CRAGGemini 默认载荷至 `0.4.10`（`payload-2026.11.25-gemini-0.4.10`，对应 `dofastted/antigravity-cli-proxy@v0.4.10` PR `#12`），修复 MCP 冷启动同步等待、支持 OpenAI Responses `namespace` 工具（#1805）并捕获透传上游 429 `Retry-After`（#1769），沿用既有 CRAGGemini 授权锚（`f9572077…` / `d2470877…`）；同步更新 `scripts/gemini_host_native.py` 与 `scripts/gemini-host.py` 透传有界 `retry_after_ms` / `Retry-After` 至 `scheduler.mjs`（#1816）。
+- **CRAGGemini 多 CLI 上游 429 触发文本归一化补全**：`src/lib/gemini/prompt-normalizer.mjs` 新增带代码围栏保护的幂等规则，覆盖二分定位的 4 项触发词——Claude Code `2.1.332` `<pasted_content>` 警告、官方 `pi`、`omp`（含 Hashline `UNSEEN. Re-read first.`）与 Codex CLI `0.171.0`，同步扩展 `detectCliFamily` 与 `LEADING_CLI_IDENTITY_RE`（#1816）。
+- **Gemini 串行每小时健康探测缓存与设置页控制**：`src/lib/admin/health-probe.mjs` 扩展支持 `gemini-*` 模型（默认探测间隔 `3600s`、缓存 TTL `5400s`），跨全部入站协议（Google 原生、OpenAI Chat/Responses、Anthropic Messages 流式与非流式）与 CRAGGemini/API 通道直接命中缓存，全网关 Claude/OpenAI/Gemini 探测统一走单串行队列（`concurrency = 1`）；前端 **设置 → 探测 → 健康缓存**（`web/src/features/settings/health-pane.tsx`）新增 Gemini 开关、间隔、TTL、探测模型、快照展示与立即探测按钮（#1815）。
+- 部署说明：本次改动涉及控制面（`src/`）、前端（`web/src/`）、`deploy/payload.json`（CRAG `3.1.20` 与 CRAGGemini `0.4.10`）以及 Gemini 宿主脚本（`scripts/gemini-host.py`、`scripts/gemini_host_native.py`）；`bin/kin-kernel`、`share/wrap-cli` 与数据库迁移未变，预期 `SLOT_SYNC=skip`，无需重启既有 Claude/Codex 槽位；Gemini 宿主机同步脚本并切换 `0.4.10` 加密载荷后需重启 `vm2api-gemini` 生效，CRAG `3.1.20` 经面板内核页或 `install.sh` 升级生效。
+
+## 1.4.213 — 2026-11-25 · Google/Gemini 独立模型策略、`medium` 默认思考强度与模型/计费定价页接入
+
+- **Google / Gemini 独立模型策略与 `medium` 默认思考强度**：新增 `src/lib/protocol/gemini-model-policy.mjs`（持久化键 `gemini_model_policy`），严格作用于 `gemini-*` 系列与 Gemini 槽位，缺省为所有 Gemini 模型启用 `default_effort: 'medium'`；新增 `GET/PUT/POST /api/panel/model-policy?platform=google`、`POST /api/panel/model-policy/sync-gemini` 与 `catalog-monitor` 定时同步（融合实时 Gemini 槽位、Gemini API 端点与 `models.dev` Google 目录）；在全部入站协议（`gemini`、`openai-chat`、`openai-responses`、`anthropic`）省略思考强度时自动注入默认 `medium`（显式指定强度或关闭思考时保持原样，且不破坏 CRAGGemini SHM 最小载荷约束），支持无后缀 Gemini 模型在 Antigravity 槽位解析到 `-medium` 档位，并在 `scheduler.catalog()` / `scheduler.stream()` 执行启停策略开关（#1811）。
+- **模型页与计费页接入 Google 模型定价**：将 Google Gemini 模型接入 `pricing-view`、模型页 Google 供应商标签与「同步 Google」流程，并在计费页新增 Google 定价表与 `google/*` 价格覆写弹窗（#1811）。
+- 部署说明：本次改动涉及控制面（`src/`）与前端（`web/src/`）；`deploy/payload.json` 载荷钉选（CRAG `3.1.18`、CRAGGemini `0.4.9`、最新 `kin-worker`）、`scripts/gemini-host.py`、数据库迁移结构与 `bin/` / `share/wrap-cli` 均未变，预期 `SLOT_SYNC=skip`，无需重启 `vm2api-gemini` 或既有 Claude/Codex 槽位。
+
+## 1.4.212 — 2026-11-25 · Gemini 槽位面板控制与视图全面对齐；`/crag-subscription` 自动识别 CRAGGemini `CRAGR1` 兑换码
+
+- **Gemini 槽位面板控制与视图与 Claude/GPT 槽位全面对齐**：新增 `src/lib/gemini/slot-prefs.mjs`（基于 `SettingsRepo` `gemini_slot_prefs` 持久化 `schedulable`、`schedule_level` P1–P10 与 `display_name`，无需数据库迁移）并接入 `createGeminiScheduler` 调度与熔断/冷却清理；扩展 `GET /api/panel/gemini` 返回用量、费用、健康度、在途请求、调度与限制状态，新增 `/health`、`/stats`、`POST /schedulable`、`PATCH /prefs`、`POST /recover`、`PATCH /owner` 接口；前端补齐 Gemini 主题样式、`CRAGAnti` 标识、`VmTable` / `VmRowDetail` / `VmBlade` / `VmUnit` / `FleetPulse` / `VmStatsDialog` / `VmActionMenu` 及详情弹窗内联调度与基础配置表单（#1806）。
+- **订阅页主兑换框自动识别 CRAGGemini `CRAGR1` 兑换码**：`web/src/features/billing/crag-shop.tsx` 在 `/crag-subscription` 主输入框提交 `CRAGR1.<43>` 时，优先尝试 Claude CRAG 兑换；仅在 Claude 返回 `redeem_unavailable` 或 `crag_subscription_host_package_unready`（未消耗任何额度）时自动回落至 `/api/panel/gemini/crag-subscription/redeem`，成功即激活 CRAGGemini 宿主订阅并刷新 Gemini 环境库存，明确冲突/载荷错误准确透出，双侧账本保持完全隔离（#1807）。
+- 部署说明：本次改动涉及控制面（`src/`）与前端（`web/src/`）；`deploy/payload.json` 载荷钉选（CRAG `3.1.18`、CRAGGemini `0.4.9`、最新 `kin-worker`）、`scripts/gemini-host.py`、数据库迁移结构与 `bin/` / `share/wrap-cli` 均未变，预期 `SLOT_SYNC=skip`，无需重启 `vm2api-gemini` 或既有 Claude/Codex 槽位。
+
+## 1.4.211 — 2026-11-25 · 载荷全线对齐最新构建（CRAG 3.1.18 与最新 `kin-worker`）
+
+- **CRAG 签名载荷升级至 `3.1.18`**：`deploy/payload.json` 的 `crag_release` 升级至 `payload-2026.11.25-crag-3.1.18`（对应 `dofastted/crag@v3.1.18`），整合 PR `#24`（中断工具续接 30 秒冷却防抖、最多 2 次有界冷恢复与 409 结构化诊断元数据，配套 `vm2api` `#1705`）与 PR `#25`（3.1.17 非流式/合成 SSE `safeguard_results` 透传），沿用既有生产信任锚（`9dbb4bc2…` / `835451e2…`）与官方 Claude Code `2.1.321`；同步更新 `src/lib/admin/kernel-catalog.mjs` 的 `CRAG_PINNED_RELEASES`。
+- **重编并钉选最新 Linux amd64 `kin-worker`**：`deploy/payload.json` 的 `release` 升级至 `payload-2026.11.25-worker-oauth-guard`，`bin/kin-worker` 更新为最新 `worker/` 源码编译产物（包含 `90b8c1210` 代理回退、`fbb7cc8a0` `--attempt-guard` 节点侧刷新防重放日志、`f51d809b0` `guard-probe` 自愈探针与 `730414a57` 凭证去 `email`）；其余槽位与辅助载荷（`cli-node 2.1.321`、`kin-oauth-auth` Chrome 133 TLS、`kin-kernel`、`kin-egress`、`kin-codex-kernel`、`kin-computer`、`kin-slot-gate` 与 `CRAGGemini 0.4.9`）均为最新指向。
+- 部署说明：本版仅更新 `deploy/payload.json`、`src/lib/admin/kernel-catalog.mjs` 与版本号（`VERSION` / `CHANGELOG.md`）；前端、数据库迁移与 `scripts/gemini-host.py` 未变。`bin/kin-worker` 字节变更，既有槽位需按维护窗口同步/重启后启用新版 `guard-probe` 与刷新防重放日志；CRAG `3.1.18` 经面板内核页或 `install.sh` 升级生效；`CRAGGemini 0.4.9`、`cli-node`、`kin-kernel` 与 `kin-oauth-auth` 字节未变。
+
+## 1.4.210 — 2026-11-25 · Codex 借槽稳定出站会话；Gemini 诊断校验实际配置 egress 与保留核验链接；面板详情按需展示 Claude 官方侧额度差异
+
+- **Codex 借用非 home 槽时在当前绑定代次内稳定 `outbound_session_id`**：修复 home 槽仍在池中且并发满、请求借用其他槽位时，因 `attemptStartedAt` 参与 `epoch` 导致每次借用都重铸 `outbound_session_id` / `prompt_cache_key` 并打散 prompt cache 的问题；`handleCodexProtocol` 仅在 live home 存在且选中非 home 槽时按 `(sessionKey, homeVm, homeSession, generation, borrowerVm)` 派生稳定材料，保持不迁移 home、跨借用槽隔离、迁移换代自动刷新以及 `passthrough` 行为不变（#1787，修 #1771）。
+- **Gemini 维护诊断校验服务单元实际配置的 `--egress` 可执行文件**：修复 `scripts/gemini-maintenance.py` 的 `Maintenance.inspect()` 硬编码检查 `runtime/bin/kin-egress`，导致全新 `install.sh install` 部署后因单位配置为 `INSTALL_DIR/bin/kin-egress` 而必报 `gemini_maintenance_egress_invalid`（以及残留旧 `runtime` 副本掩盖已损坏配置路径）的问题；改为读取受管 unit 的规范化 `--egress` 路径并沿用原有 root 属主、不可写、哈希钉选与可执行校验（#1795，关联 #1770）。
+- **已订阅 Gemini 账号保留安全 Google 核验链接并避免误告警**：`scripts/gemini_host_account.py` 在 `paidTier` / `currentTier` 非空时不改变原有非阻断 `parse_ineligibility` 语义，独立提取安全的 `VALIDATION_REQUIRED` 官方验证链接至 `account.validation_url`；`scripts/gemini-host.py` 在账号已通过真实推理验证（`inference_proven`）后的刷新中同步清除替代套餐的残留 `validation_url`（不误清 `location_unsupported` 等阻断）；前端将纯参考链接标记为 `advisory`，在机架/列表页不覆盖正常状态或挂黄标，在账号页与试聊页以中性样式提供验证入口（#1794，回应 #1766）。
+- **面板详情按需展示 Claude 官方侧与保守合并两套额度存储**：`src/lib/admin/panel-api.mjs` 在账号与 VM 投影中增加白名单只读字段 `quota_observations`（不改调度准入、保守合并规则或触发额外上游请求，槽位换绑时隔离旧账号快照）；前端仅在详情面板、行展开详情与统计弹窗中当官方侧存储与当前展示值存在差异或官方窗口陈旧时渲染折叠对比，不影响机架主卡三行基线对齐，并明确标注官方侧为可变存储状态（#1792，回应 #1776）。
+- 部署说明：本次改动涉及控制面（`src/`）、前端（`web/src/`）与 Gemini 宿主脚本（`scripts/gemini-host.py`、`scripts/gemini_host_account.py`、`scripts/gemini-maintenance.py`）；`deploy/payload.json` 载荷钉选（CRAG `3.1.17`、CRAGGemini `0.4.9`）、数据库迁移结构与 `bin/` / `share/wrap-cli` 均未变，预期 `SLOT_SYNC=skip`，无需重启既有 Claude/Codex 槽位；Gemini 宿主机如需生效 `pinned_egress` 诊断与核验链接修复，需执行 `install.sh prepare-gemini` 同步宿主脚本。
+
+## 1.4.209 — 2026-11-25 · CRAGGemini 多 CLI 提示词统一归一化；上游 400/403 纳入单元熔断；托管密钥直从面板限额；空 effort 默认回落与巡检对齐
+
+- **CRAGGemini 多 CLI 提示词统一归一化管线**：新增 `src/lib/gemini/prompt-normalizer.mjs` 作为唯一事实来源，覆盖 15+ 主流编码 CLI（Claude Code、Codex CLI、OpenCode、Gemini CLI、Cursor、Cline、Roo Code、Kilo Code、Windsurf/Cascade、Aider、GitHub Copilot、Continue、Amp、Factory Droid、Hermes、OpenClaw、Oh-My-Pi）经四协议进入 CRAGGemini 通道的提示词清洗与去冲突；跨供应商计费行剥离与语义归一化统一保护 Markdown 代码围栏（`` ``` `` / `~~~`），范围扩展至 `contents` 内嵌系统封装与 `tools[].functionDeclarations[].description`，并在 `official_full` 模式采用成对标签匹配消除 `agy 1.5.9` 宿主标签冲突（不误伤 TypeScript 泛型）；`routes.mjs` 缺省执行归一化并上报脱敏 `hop_meta.prompt_normalization` 遥测，新增 `routing.compatibility.craggemini_prompt_normalization`（`auto` | `strict` | `off`）及 `panel-api.mjs` 校验，直连 Gemini API 密钥通道与普通用户文本保持原样（#1793）。
+- **上游 400 与 403 失败纳入单元熔断计数**：Claude VM（`upstream-error-policy.mjs`、`failover-runner.mjs`）将上游 400（`invalid_request`、`credential_refresh_failed`、`organization_disabled` 及修复后仍 400）与上游 403（`permission_denied`、`proxy_or_edge_forbidden`、`fable_plan_denied`、`organization_disabled`）计入 `UnitCircuit` 连续失败次数（`invalid_request` 仍维持不切号直接返回 400，本地校验/能力拒绝、`license_*`、内容安全/AUP 与首次可修复 400 不计入）；Gemini 调度器（`scheduler.mjs`）将 `gemini_invalid_request`（400）及 `gemini_location_unsupported`、`gemini_account_verification_required`、`gemini_account_ineligible`（403）移出 `NON_CIRCUIT_FAILURES` 计入单账号熔断（半开探针命中时重开熔断）；同步面板熔断文案与 `docs/gemini-host.md` 为 `400/403/5xx`（#1796）。
+- **托管密钥按面板并发/RPM 限额执行，不再被内置 60 网关令牌桶误拦**：`src/server.mjs` 的 `requireAuth()` 在托管密钥通过 `apiKeyStore.canAccept()` 后不再额外套用默认 `KIN_RATE_CAP=60` 网关令牌桶，避免面板配置无限制或高于 60 的并发/RPM 被静默截断；主环境密钥仅在显式配置 `KIN_RATE_CAP` 时启用令牌桶限流，同步更新 `config.mjs`、`security.mjs` 与 `docs/API.md`（#1790）。
+- **空 `effort` 按省略处理并统一回落模型默认强度**：跨 Anthropic Messages、OpenAI Chat/Responses、Codex、Gemini、CRAG 白名单/打印提示词、API 渠道、协议 beta、分类器校验与请求日志，将空串、纯空白与 `null` 的 `effort` 统一视作省略；在边界剥离空的 `output_config.effort` 与 `crag_options.effort`，统一由 `resolveModelDefaultEffort` 按「面板 `default_effort` → 模型目录默认 → `high`」回落（`off` 仅剥离不注入）（#1791）。
+- **文本与语义对齐巡检修复（run 3）**：SQLite → PostgreSQL 迁移脚本与 mock 种子库补齐 `gemini_environment_owners` 表；PostgreSQL 仪表盘聚合器改为在蓝绿激活阶段（`runAtActivation('background')`）启动并于 `onLeaderStop` 停止（清理 `kickoff` 定时器）；Responses WebSocket 握手与错误帧保留 `Retry-After` 头与 `error.details` 元数据；前端密钥管理弹窗保留 `category: 'all'` 与 `permission_tier: 'tenant'` 语义不再误降级或误拦保存；系统提示词页接入 `craggemini_system_prompt` 超长 `SaveBar` 拦截与分标签真实保存 Toast，后端复用 `CRAGGEMINI_PERSONA_PRESETS` / `CRAGGEMINI_SYSTEM_PROMPT_MAX` / `KEY_CATEGORIES` 常量；修正 Gemini 禁用态文案（`403 gemini_disabled`）、粘性 TTL 零值语义（不保留）、旧菜单名「设置 → Gemini 维护」与多处文档，并清理零引用的旧 `api-endpoints` 组件及 `withPgTransaction` / `publicModelId` 死代码（#1781）。
+- 部署说明：本次改动涉及控制面（`src/`）、前端（`web/src/`）、迁移/校验脚本（`scripts/migrate-sqlite-to-pg.mjs`、`scripts/seed-mock-sqlite.mjs`、`scripts/verify-craggemini-sessions.mjs`）及 `deploy/install.sh` / 文档；`deploy/payload.json` 载荷钉选（CRAG `3.1.17`、CRAGGemini `0.4.9`）、`scripts/gemini-host.py` / `gemini-maintenance.py`、数据库迁移结构与 `bin/` / `share/wrap-cli` 均未变，预期 `SLOT_SYNC=skip`，无需重启 `vm2api-gemini` 或既有 Claude/Codex 槽位。
+
+## 1.4.208 — 2026-11-25 · 修复 Claude Code 系统提示词中双用途安全工具括注触发 Google 上游 429 误判
+
+- **修复 CRAGGemini 出站 `systemInstruction` 另一处 Claude Code 指纹触发 429**：对失败的真实 `claude-cli` 43KB 系统提示词逐段与逐句二分实测确认，除 `You are Claude Code` 横幅外，Google Antigravity 上游还会对 Claude Code 内置安全提示中的固定句式 `Dual-use security tools (C2 frameworks, credential testing, exploit development) require clear authorization context` 直接返回 `429 RESOURCE_EXHAUSTED`（其余 80 个系统段落、37KB 对话内容与全部工具声明均返回 `200 OK`）。`src/lib/gemini/system-prompt.mjs` 在 `sanitizeCragGeminiSystemText()` 中将该括注归一化为 `Dual-use security tools require clear authorization context`，完整保留安全约束语义并消除 `claude-cli` 误触 429。
+- 部署说明：本次改动仅涉及控制面 `src/lib/gemini/system-prompt.mjs` 与单测；前端、`scripts/gemini-host.py`、CRAG/CRAGGemini 载荷钉选、数据库结构与 `bin/` / `share/wrap-cli` 均未变，预期 `SLOT_SYNC=skip`，无需重启 `vm2api-gemini` 或既有 Claude/Codex 槽位。
+
+## 1.4.207 — 2026-11-25 · 修复 CRAGGemini 入站第三方 CLI 系统身份横幅触发 Google 上游 429 误判
+
+- **修复 CRAGGemini 出站 `systemInstruction` 第三方 CLI 身份横幅触发 429**：实测确认 Google Antigravity 上游对 `systemInstruction` 中大小写不敏感的 `You are Claude Code` / `You are OpenCode` 直接返回 `429 RESOURCE_EXHAUSTED`（即使账号配额 95–100% 且切号重试全部账号均失败）。`src/lib/gemini/system-prompt.mjs` 在 `applyCragGeminiPromptPolicy()` 中对 CRAGGemini 出站 `systemInstruction` 自动将冲突的第三方 CLI 身份声明归一化为 `You are a coding assistant`，保留其余全部指令不变，消除 `claude-cli` / OpenCode 请求误触 429。
+- 部署说明：本次改动仅涉及控制面 `src/lib/gemini/system-prompt.mjs` 与单测；前端、CRAG/CRAGGemini 载荷钉选、数据库结构与 `bin/` / `share/wrap-cli` 均未变，预期 `SLOT_SYNC=skip`，无需重启既有 Claude/Codex 槽位。
+
+## 1.4.206 — 2026-11-25 · 修复 Gemini 429 跨账号切号与冷却隔离；`apply-policy` 热同步空闲回收与预热槽位
+
+- **修复 Gemini 429（`RESOURCE_EXHAUSTED`）切号与冷却缺陷**：
+  - `src/lib/gemini/scheduler.mjs` 与 `src/lib/gemini/routes.mjs` 修复首字节/内容输出前的 `start` / `meta` SSE 帧误置 `emittedOutput` 阻断跨账号切换的问题，仅在下游实际写出响应头或收到内容事件时才禁止切号；
+  - `all_cooled_probe` 严格保留按最早冷却过期时间排序的探测顺序，避免被 `poolScheduler.reserveExternalCandidates()` / 字母序覆写并锁死在同一账号序列；同时在每次尝试开始时更新 `lastUsed`，确保失败场景下均衡轮转生效；
+  - 被动 429 冷却收口至单模型维度（`modelCooldowns`），避免单个模型（如 `gemini-4-neon-xhigh`）限流误伤同账号下其它健康模型，同时保留主动 0% 配额组冷却；
+  - `known(error)` 保留 `upstreamStatus`、`retryAfterMs`、`retryAfter`、`timing`、`usage`、`details`，并解析上游 429 响应的 `retry_after_ms` / `Retry-After` 指导冷却时长。
+- **修复 `scripts/gemini-host.py` 策略热同步**：`NativeSession.apply_policy()` 与 `CragDaemonShard.apply_policy()` 在 `PUT /internal/v1/policy` 成功后同步调用 `POST /internal/v1/accounts/<id>/scale` 推送 `idle_ttl_secs` 与 `min_warm_slots`（`concurrency-set` 与 `sync_account` 同步携带 `min_warm_slots`），修改 `session_idle_ttl_secs` 等池参数立即对运行中账号生效，无需重启 `vm2api-gemini`。
+- 部署说明：本次改动覆盖控制面 `src/lib/gemini/scheduler.mjs`、`src/lib/gemini/routes.mjs` 及 Gemini 宿主机脚本 `scripts/gemini-host.py`；前端、CRAG/CRAGGemini 载荷钉选、数据库结构与 `bin/` / `share/wrap-cli` 均未变，预期 `SLOT_SYNC=skip`，无需重启既有 Claude/Codex 槽位；需同步 `scripts/gemini-host.py` 到宿主机并重启 `vm2api-gemini` 与 `vm2api-gemini-maintenance`，再灰度/覆盖发布控制面 `v1.4.206`。
+
+## 1.4.205 — 2026-11-25 · CRAGGemini 0.4.9 MCP 桥内部暴露名称收口为 `crag`（`mcp_crag_*`）
+
+- **CRAGGemini 0.4.9 MCP 桥命名收口**：`deploy/payload.json` 的 `geminiDefaultLinuxAmd64` 升级至 `payload-2026.11.25-gemini-0.4.9`。MCP 桥服务名由 `craggemini` 统一收口为 `crag`，`agy` 内部工具暴露前缀统一为 `mcp_crag_<tool>`（不再携带详细 `gemini` 后缀）；写入 `mcp_config.json` 时自动清理旧版 `craggemini` 条目避免重复挂载，同时保留对历史前缀的兼容剥离。
+- 部署说明：仅更新 `deploy/payload.json` 中 `geminiDefaultLinuxAmd64` 载荷钉选（`0.4.8 → 0.4.9`）与版本号，控制面代码、前端、CRAG 内核钉选（`3.1.17`）、数据库结构及 `bin/` / `share/wrap-cli` 字节均未变，预期 `SLOT_SYNC=skip`，无需重启既有 Claude/Codex 槽位；Gemini 宿主机同步 `0.4.9` 载荷后重启 `vm2api-gemini` 与 `vm2api-gemini-maintenance`。
+
+## 1.4.204 — 2026-11-25 · CRAGGemini 0.4.8 Pool 模式每槽位 MCP 工具桥接；`control.sock` 并发队列扩容与 `IncompleteRead` 收口
+
+- **CRAGGemini 0.4.8 修复客户端工具 MCP 桥接（消除 `502 gemini_tool_call_required`）**：`deploy/payload.json` 的 `geminiDefaultLinuxAmd64` 升级至 `payload-2026.11.25-gemini-0.4.8`。`craggemini` 加密引导程序通过共享同步模块 `mcp_stdio` 直接短路执行 `--internal-mcp`（消除对 `mcp-bridge.json` 误走 `vm_id="standalone"` 授权校验导致的 `license_binding_mismatch` 与重复 memfd 解密）；Pool 模式启动 `AgySlot` 前自动并发安全地写入 `mcp-bridge.json` 与 `<agy_home>/.gemini/config/mcp_config.json`，并通过 `CRAGGEMINI_SLOT_ID → X-Craggemini-Slot-Id` 将 `/internal/mcp/*` 路由至对应槽位独立的 `McpCoordinator`；提交 prompt 前同步等待 `agy` 完成 `tools/list` 刷新（含空工具回合清理），并修复多会话并发下的 `ToolContinuation` 挂起工具匹配（#1775）。
+- **CRAGGemini 宿主并发队列与流式异常收口（消除 10 并发突发 `503 gemini_host_unavailable`）**：`scripts/gemini-host.py` 将 `ThreadingUnixStreamServer.request_queue_size` 由 Python 默认 5 提升至 128，并将主 accept 循环中的 `host.cleanup()` 节流至 `>= 0.25s`，防止高并发突发溢出内核连接队列；`_stream_native_infer` 与 `scripts/gemini_host_native.py` 补全捕获 `http.client.HTTPException`（如 `IncompleteRead`）并统一收口为 `502 gemini_inference_failed`（#1775）。
+- 部署说明：本版涉及 CRAGGemini 宿主脚本（`scripts/gemini-host.py`、`scripts/gemini_host_native.py`）与 `deploy/payload.json` 中 `geminiDefaultLinuxAmd64` 载荷钉选（`0.4.7 → 0.4.8`）。控制面代码、前端、CRAG 内核钉选（`3.1.17`）、数据库结构及 `bin/` / `share/wrap-cli` 字节均未变，预期 `SLOT_SYNC=skip`，无需重启既有 Claude/Codex 槽位；Gemini 宿主机需同步宿主脚本并更新 `0.4.8` 载荷后重启 `vm2api-gemini` 与 `vm2api-gemini-maintenance`。
+
+## 1.4.203 — 2026-11-25 · CRAGGemini 0.4.7 故障转移与宿主网络加固；省略 `cache_control.ttl` 按路由配置补齐；托管 Key 超限响应统一；Claude 重置后预重置配额头对账与 Codex 自定义时长窗口
+
+- **非透传请求省略 `cache_control.ttl` 按 Web 路由配置补齐**：修复未声明 `ttl` 的 `cache_control` 被误作隐式 `5m`、在 CRAG V3 / HTTP hop 级联降级及未热读磁盘 `routing.json` 的问题；官方透传继续保留调用方省略的 TTL，补齐 `politeEphemeral` 类型校验与 `workerEnvelope` 对 `crag_options.cache_ttl` 的回退读取（#1772）。
+- **托管 API Key 超限响应统一为 `402`/`429` 并附限额元数据与 `Retry-After`**：USD 总额度与滚动消费窗口超限统一返回 `402`，请求数 / RPM / 并发保持 `429`，在 `error.details` 与 `/v1/me/quota` 的 `blocked_by` 补充 `limit_type`、`current`、`limit`、`remaining`、`reset_at`、`retry_after` 与 `Retry-After` 响应头，同时保留旧 `error.type` 兼容、修正双配额及下调 RPM 边界，并在 Gemini 路由保持 `publicError()` 基础设施脱敏边界（#1765）。
+- **Claude 确认配额重置后对账预重置头与单飞缓存隔离**：在 `AccountQuota` 持久化按账号/窗口的 `reset_boundaries` 与 `applied_reset_ops`，屏蔽重置前在途请求/探测/晚到 429 的旧高利用率与旧冷却覆盖；修补 `FailoverRunner` 预重置 429 跳过冷却、`usageCache` `clear()` 失效在途 flight 并按真实上游请求打标时序、以及重置后有效 `0%` 探测同步清理预重置 `rate_limit_reset_at`（#1758）。
+- **Codex 配额窗口按实际时长分类并忽略 0 分钟记录**：按正向 `window_minutes` 归类 `5h` / `24h` / `7d` 等自定义时长窗口、过滤 `<= 0` 分钟异常记录，同步更新调度排序、本地闸线、`oauth-credentials.mjs` `isQuotaParkReason()` 及前端机架/配额/弹窗视图，并保持无 `window_minutes` 历史快照兼容（#1764）。
+- **CRAGGemini 0.4.7 载荷升级、首字节前 502/504 故障转移与可观测性**：`deploy/payload.json` 钉选 `payload-2026.11.24-gemini-0.4.7`，补齐首字节前 502/504 跨账号切换、被动冷却账号回退与请求尝试记录（#1763）；修复 `scripts/fetch-default-gemini.py` 校验远程 manifest 时错误要求 `manifest.json` 自哈希导致远程拉取失败的问题（#1767）。
+- **CRAGGemini 宿主网络中继与早期退出快失败**：`scripts/gemini-host-egress.sh` 与 `scripts/gemini-host.py` 改为宿主机 OUTPUT 中继转发 netns 出口流量并上报脱敏的认证失败阶段（中继句柄命名为 `egress_relay` 避免遮蔽 `Terminal.relay()`）（#1761）；`craggemini` 早期退出时以有界 stderr 排空与白名单分类（`invalid_config` / `license_error` / `bind_failed`）快速失败，零原始 stderr 泄露，并在 `read_exit_detail()` 中优先尊重注入的 `native_exit_reader`（#1760）。
+- **CRAG v2 槽位工作目录迁至 guest tmpfs 避免 9p 写回卡死**：`docker/kin-kvm/guest/kin-crag-apparmor` 为 `kin-kernel.service` 安装受管 drop-in `45-vm2api-crag-work.conf`，启动前防符号链接跟随并以原子 `uid/gid` 选项将 guest tmpfs 挂载到 `/run/kin/work`（`mode=0700,size=256m,nosuid,nodev`），挂载失败自动退回原 9p 目录，离开 CRAG v2 时清理 drop-in，老 guest 镜像无需重建、下次 CRAG 启动即生效（#1741）。
+- **蓝绿部署支持只加型 SQLite 迁移无停机放行**：新增 `deploy/bluegreen/migration-guard.mjs` 并接入 `bg-deploy.sh` 与 `docs/BLUEGREEN.md`，在确认新增 SQLite 迁移仅包含安全加表/加列/小表索引时保持零停机蓝绿切换；全路径闭失败校验已存在表、已有表 `CHECK`/`NOT NULL DEFAULT NULL`、缺失 DB 文件与升级引擎回退逻辑（#1762）。
+- 部署说明：本版涉及控制面、前端、蓝绿部署脚本（`deploy/bluegreen/`）、CRAG guest 挂点脚本（`docker/kin-kvm/guest/kin-crag-apparmor`）、CRAGGemini 宿主脚本（`scripts/fetch-default-gemini.py`、`scripts/gemini-host-egress.sh`、`scripts/gemini-host.py`、`scripts/gemini_host_native.py`）与 `deploy/payload.json` 中 `geminiDefaultLinuxAmd64` 载荷钉选（`0.4.6 → 0.4.7`）。CRAG 内核钉选（`3.1.17`）、数据库结构及 `bin/` / `share/wrap-cli` 字节均未变，预期 `SLOT_SYNC=skip`，无需重启既有 Claude/Codex 槽位；Gemini 宿主机需执行 `install.sh prepare-gemini` 同步宿主脚本与 `0.4.7` 载荷。
+
+## 1.4.202 — 2026-11-24 · 强制函数调用未兑现时明确失败；上游 modelVersion 如实透出；`service_tier` 能力边界显式化
+
+- **`mode=ANY` / 必需 `tool_choice` 却无函数调用时明确失败**：此前上游以 `STOP` 结束且零 `functionCall` 时,网关仍按成功回复返回 `200`,依赖函数回调交付消息的客户端表现为「模型有输出但没发消息」。现把强制工具意图经 `restoreContext.toolChoice` 传到能观察响应的调度层,在未兑现时返回 `502 gemini_tool_call_required`（已登记进 `FAILURES` 并归入不熔断集合,不会被当作瞬时故障在账号间反复重试）；`AUTO` 的纯文本成功与真实函数调用均不受影响（#1750,修 #1732）。
+- **上游报告的 `modelVersion` 如实透出并标记错配**：区分「请求的」`requested_model`、「派发的」`dispatched_model` 与「回来的」`response_model`,客户端收到的 `modelVersion` 取上游真实值而非静默替换,同时在 `usage_logs` 写入 `model_mismatch`。流式、非流式与尾块错配三种路径一致,无错配时 `model_mismatch = 0`（#1747,修 #1728）。
+- **`service_tier` 的能力边界显式化**：传入 `service_tier: "standard_only"` 而所选 CRAG 内核未声明 `request_service_tier` 能力（以及所有 `cli-node` 路径）时,预检阶段直接返回 `400 unsupported_capability`（`error.param = "service_tier"`,`error.details.execution_path` 标明 `crag` 或 `claude_vm`,`retryable: false`,零上游执行）,**不再静默移除或改写为 `auto`**；内核声明该能力后原样透传（#1752,回应 #1520）。
+- **日志新增 `failed_only` 过滤**：覆盖「非 2xx」、「`final_state` 非 `verified`」与「带错误码」三类,因此能捞出已提交响应头后才失败的 `200` 流式请求;既有 `exclude_status_200` 行为不变（#1753,修 #1213）。
+- **文档**：补充自托管载荷、公钥与兑换渠道的说明（#1745）。
+- 部署说明：本版仅涉及控制面与前端（`src/lib`、`web/src`、`docs/`）。`deploy/payload.json` 的载荷钉选（CRAG `3.1.17`、CRAGGemini `0.4.6`）、`scripts/`、`bin/`、`share/wrap-cli` 与数据库结构均未变,预期 `SLOT_SYNC=skip`,无需重启既有槽位,也无需执行 `install.sh prepare-gemini`。
+
+## 1.4.201 — 2026-11-24 · 热修：CRAGGemini 恢复剥离 `safetySettings`；未验签载荷不再挡住内核页的升级
+
+- **热修：`target: 'antigravity'` 恢复剥离 `safetySettings`,不再返回 400**（revert `#1735`）：常见 Gemini SDK 与 GUI 客户端（Cherry Studio、Vercel AI SDK `@ai-sdk/google` 等）会给**每个**请求自动附上 5 条 `BLOCK_NONE` 的默认 `safetySettings`。`#1735` 对非空 `safetySettings` 一律以 `400 gemini_unsupported_turn` 拒绝,使这些客户端在 CRAGGemini OAuth 账号上开箱即坏。现恢复 `#1718` / `#1733` 的行为:CRAGGemini 通道干净剥离该字段并保留入站调试捕获,Gemini API key 通道照旧原样转发给上游（#1754）。
+- **未验签的已装载荷不再让每个发布都显示“不兼容”**：在维护守护进程之外安装的 CRAGGemini 载荷身边没有验签资产（无 `manifest.sig`、`gemini-ed25519.pub`、`gemini-release.json`）,`cached_payload()` 因此返回空,`payload_status()` 让 `version` / `cli_version` 保持 `None`,`can_update()` 的 `installed is not None` 失败关闭,于是 `compatible` 恒为 `false`——`1.4.200` 新增的内核页 CRAGGemini 安装/更新/回滚在这类宿主上无法执行,而它是唯一带备份与回滚的升级路径。现从已装 manifest 自报的 `software_version` 读出版本,**仅供“不往低版本降”的序关系比较**；`state` 继续是 `unverified`、`issue` 原样保留,目标载荷仍做完整验签才会替换任何东西。CRAG manifest 无 `cli_version` 字段,仅当其自身 `sha256` 映射记录的 `agy` 正是本发布钉住的那个时才按钉住的 CLI 排序,否则 CLI 保持未知而不假定（#1746）。
+- 部署说明：本版仅涉及控制面与 CRAGGemini 维护守护进程脚本（`scripts/gemini-maintenance.py`）。`deploy/payload.json` 的载荷钉选（CRAG `3.1.17`、CRAGGemini `0.4.6`）、数据库结构与 `bin/` / `share/wrap-cli` 字节均未变,预期 `SLOT_SYNC=skip`,无需重启既有 Claude/Codex 槽位。`scripts/` 不在 `remote-apply.sh` 应用范围内:本条修复位于维护守护进程中,需在宿主机执行 `install.sh prepare-gemini` 更新维护代理后才会生效,随后方可在内核页对 CRAGGemini 执行远程版本升级。
+
+## 1.4.200 — 2026-11-24 · 内核页新增 CRAGGemini 安装、远程版本更新与回滚
+
+- **内核管理页（`/wrap`）追加 CRAGGemini 内核安装与更新**：在“可用内核”区块新增宿主机级 `CRAGGemini` 行，展示当前载荷状态、版本、订阅与环境计数，支持选择官方远程发布或锁定版本执行安装、更新、锁定版本一键升级与回滚，实时展示维护作业阶段与中文错误说明；共享维护常量、阶段/错误映射与版本比较工具收敛至 `web/src/features/settings/gemini-maintenance.ts`，与设置页复用单一真值源（#1748）。
+- **后端发布列表与锁定版本透出**：`GET /api/panel/kernels/releases` 新增校验完整的官方 `payload-YYYY.MM.DD-gemini-X.Y.Z` 发布列表（`craggemini`），`GET /api/panel/kernels` 追加 `deploy/payload.json` 的 `gemini_pin`（保持既有 Claude VM `kernels: ['cli-node', 'crag']` 不变），`src/lib/gemini/maintenance.mjs` 按需透传宿主机维护代理的 `supports_remote_releases` 能力标记（#1748）。
+- **宿主机远程载荷拉取与空闲预热池静默**：`scripts/fetch-default-gemini.py` 与 `scripts/gemini-maintenance.py` 支持拉取并校验官方远程 CRAGGemini 发布（严格锚定宿主机 root-owned `deploy/payload.json` 的 Ed25519 公钥指纹，限制可信 GitHub HTTPS 域名与下载大小上限，并复用已校验 `agy`）；`scripts/gemini-host.py` 新增仅限 `uid == 0` 的 `/maintenance-quiesce`，升级前先回收空闲常驻预热池（有活跃推理/终端/认证时返回 `busy` 不打断），避免空闲常驻池触发 `409 gemini_maintenance_busy`（#1748）。
+- 部署说明：本版涉及控制面、前端与 CRAGGemini 宿主脚本（`scripts/fetch-default-gemini.py`、`scripts/gemini-host.py`、`scripts/gemini-maintenance.py`）；`deploy/payload.json` 载荷钉选（CRAG `3.1.17`、CRAGGemini `0.4.6`）、数据库结构与 `bin/` / `share/wrap-cli` 字节均未变，预期 `SLOT_SYNC=skip`，无需重启既有 Claude/Codex 槽位。`scripts/` 不在 `remote-apply.sh` 应用范围内：仅更新控制面时内核页会自动识别旧版维护代理并降级为本地随包版本安装，需在宿主机执行 `install.sh prepare-gemini` 更新维护代理与宿主脚本后，远程版本拉取与空闲预热池静默能力才会生效。
+
+## 1.4.199 — 2026-11-24 · CRAG 内核 pin 确认为 3.1.17
+
+- **CRAG 内核 pin 保持 `payload-2026.11.24-crag-3.1.17`**：`deploy/payload.json` 与 `v1.4.197` 逐字节一致。开发过程中曾短暂改钉 `payload-2026.11.19-crag-3.1.7`（未发布的 `1.4.198`），经确认 `3.1.17` 才是预期下发的内核，已还原。
+- **撤回未发布的 `1.4.198` 中「`v1.4.197` 不要部署」的说明**：该说明不成立。`v1.4.197` 的 CRAG pin 与本版相同，内容无问题；`1.4.198` 未打 tag、未发布。
+- 其余内容与 `v1.4.197` 一致，详见下方该版条目。
+- 部署说明：CRAGGemini 载荷钉 `payload-2026.11.24-gemini-0.4.6`，两个数据库迁移（SQLite `068`、PostgreSQL `005`）对存量部署为无操作，`bin/` 字节未变（预期 `SLOT_SYNC=skip`）。`share/crag/kernels/` 与 `share/gemini/` 均**不在** `remote-apply.sh` 的应用范围内：CRAG 内核随 `install.sh` / 面板内核管理生效，CRAGGemini 载荷与宿主脚本需执行 `install.sh prepare-gemini`。
+
+## 1.4.197 — 2026-11-24 · CRAGGemini 0.4.6 与 CRAG 3.1.17 载荷升级；集成 API 与多层密钥归属隔离；PG 一键安装加固
+
+- **CRAGGemini 通道精简与账号会话隔离，载荷钉到 0.4.6**：`deploy/payload.json` 的 `geminiDefaultLinuxAmd64` 由 `payload-2026.11.24-gemini-0.4.4` 升级到 `payload-2026.11.24-gemini-0.4.6`；精简 CRAGGemini 的 SHM 入站路径、隔离各账号会话，并新增 `scripts/verify-craggemini-sessions.mjs` 会话校验脚本（#1733）。
+- **零信任协议白名单清洗与 CRAG 3.1.17**：`crag_release` 由 `payload-2026.11.23-crag-3.1.14` 升级到 `payload-2026.11.24-crag-3.1.17`，新增 `src/lib/protocol/crag-whitelist.mjs` 对出站协议做白名单清洗，并支持 2.1.330 的 Auto Mode（#1731）。
+- **通用外部集成 API 与多层推理密钥权限隔离**：新增 `/api/integration/v1/*` 独立集成令牌体系（`sk-int-*`，仅落库 HMAC-SHA256 哈希），默认仅允许本机回环直连并按需放开 `allow_remote` + IP 白名单；推理密钥引入 `platform` / `tenant` / `resource` 三层权限与双向归属隔离，写侧跨归属域绑定返回 `403 scope_owner_mismatch`，运行时在 `ApiScheduler`、`api-protocol`、`handle-protocol`、`gemini/scheduler`、`gemini/routes` 与 `/v1/models`、`/v1beta/models` 统一过滤（#1730）。
+- **PostgreSQL 一键安装加固与 SQLite 无缝迁移**：加固 PG 一键安装路径、依赖自动准备与由 SQLite 平滑迁移的流程（#1712）。
+- **宿主不再向过旧载荷下发它拒绝的内核配置键**：`#1704` 起宿主会把九个调度 / SHM 键写进 `kernel.json`，但这些键只有 0.4.5 及以后的载荷接受，而当时钉住的仍是 0.4.4——于是 `v1.4.193`～`v1.4.196` 发布的宿主脚本会让自己钉住的载荷拒绝配置，worker 在桥接握手前退出并对外表现为 `gemini_native_bridge_timeout`。现按载荷版本下发：只有确实读出低于 0.4.5 的版本才不下发这些键，缺失或读不出版本时保持原行为，不静默降级；同时 `CragDaemonShard` 分片路径（`#1704` 新增、无旧形态）在过旧载荷上退回按账号的 `NativeSession`（#1734，修 #1729）。
+- **CRAGGemini 无法应用的 `safetySettings` 改为明确报错**：`buildGeminiRequest` 的 antigravity 分支此前从不设置该字段，带值的安全策略被静默丢弃并按成功返回，调用方无从察觉。现以 `400 gemini_unsupported_turn` 拒绝并提示「省略该字段或改用 Gemini API key 环境」；空数组不要求任何配置，仍原样放行且不转发；直连 Gemini API 渠道照旧生效（#1735）。
+- **请求日志的用量、缓存、思考强度、TPS 与调试捕获对齐**（#1727）；**Fable 额度错误与账号冷却解耦**：纯 Fable 额度等待不再误报 `529`，未知 429 不再扩大为账号硬冷却（#1722）。
+- **修复 `dev` 上三条失败单测并加固 `Agy` / `NativeAgy` 清理路径**：`Agy.close()` 与 `NativeAgy` 的错误上报分支改用带默认值的属性读取，避免 `__init__` 中途失败时用 `AttributeError` 盖掉原始错误（#1736）。
+- 部署说明：本版涉及控制面、**两个槽位载荷 pin**（CRAGGemini `0.4.4 → 0.4.6`、CRAG `3.1.14 → 3.1.17`）、宿主脚本（`scripts/gemini-host.py`、`scripts/docker-entrypoint.sh`、`scripts/panel-upgrade.sh`）与**两个数据库迁移**（SQLite `068_multi_tier_key_permissions.sql`、PostgreSQL `005_multi_tier_key_permissions.sql`）。两个迁移均为新增列 / 新增表：`api_endpoints.owner_user_id` 可空无默认，存量端点因此全部视为平台自建；`api_keys.permission_tier` 默认 `platform`，存量密钥落在该档后仍可访问平台自建资源，**对存量部署为无操作**。`bin/` 字节未变，预期 `SLOT_SYNC=skip`。`scripts/` 不在 `remote-apply.sh` 的应用范围内，宿主侧改动与 `0.4.6` 载荷需执行 `install.sh prepare-gemini` 才会生效（该步骤会重启 `vm2api-gemini.service`）；本版包含 #1734 的版本闸门后该步骤才是安全的——在此之前「新宿主脚本 + 0.4.4 载荷」会使 Gemini worker 无法启动。
+
+## 1.4.196 — 2026-11-24 · 热修：CRAGGemini 性能配置改为初 / 中 / 高三档并移除 Web 底层协议术语
+
+- **Web 设置页「Gemini」性能配置三档化与文案脱敏**：将原底层传输参数区块替换为「CRAGGemini 性能配置」**初 / 中 / 高**三档单选（均沿用后端既有 `gemini.shm` 配置链路，分别映射到 `2/8 MiB`、`4/16 MiB`（默认）、`16/64 MiB`，兼容既有历史数值回显），同步替换设置页副标题与守护进程实时状态卡中的底层协议与通道术语为「性能配置」「通道请求 / 校验异常」「通道入站 / 出站」。
+- **受影响历史 Release 处置**：`v1.4.193`、`v1.4.194`、`v1.4.195` 三个控制面 Release 的 Web 页面包含旧版底层术语，已由本热修版 `v1.4.196` 替代并撤回上述三个 GitHub Release 条目。
+- 部署说明：本版仅涉及 Web 前端（`web/src/features/settings/`），控制面 API、宿主脚本、`deploy/payload.json` 与 Claude/Codex 槽位内核字节均未变，预期 `SLOT_SYNC=skip`，无需重启既有槽位或重新执行 `prepare-gemini`。
+
+## 1.4.195 — 2026-11-24 · CRAGGemini 请求字段剥离与调试日志捕获；独立 Go Chrome-TLS `kin-oauth-auth`
+
+- **CRAGGemini 不受支持字段的剥离与调试体捕获**：`buildGeminiRequest` 在 `target: 'antigravity'` 下不再下发 CRAGGemini（`ALLOWED_BODY_KEYS`）与 Antigravity 拒绝的顶层 `safetySettings` / `cachedContent`，仅在直连 Gemini API 渠道且值非空时保留；宿主 `_extract_native_turn_body` 同步剥离 `safetySettings` / `cachedContent` / `conversationId` / `stream` 并把 `conversationId` 归一化为 `conversation_id`；公开处理器新增 `requestLog.tapResponse` 挂载与 debug 模式下的 `inbound_body` / `outbound_body`（含 `outbound_body_source` 区分 `craggemini` 与 `gemini_api`）捕获（#1718）。
+- **`kin-oauth-auth` 改为独立 Go Chrome-TLS 构建**：`deploy/payload.json` 的槽位载荷钉住 `payload-2026.11.24-oauth-chrome-tls`，`bin/kin-oauth-auth` 由原先 47.4 MB 的打包产物替换为 11.6 MB 的独立 Go 二进制（#1717）。
+- 部署说明：本版涉及控制面、宿主脚本（`scripts/gemini-host.py`）与 `bin/kin-oauth-auth`。**`kin-oauth-auth` 是 OAuth 换票组件且本次为整体构建链路替换**，`verify-live.py` 的门禁不覆盖真实换票，上线后请单独验证一次 OAuth 授权流程。Claude/Codex 槽位内核与 `wrap-cli` 字节未变，预期 `SLOT_SYNC=skip`；`scripts/` 不在 `remote-apply.sh` 的应用范围内，宿主侧的剥离逻辑需执行 `install.sh prepare-gemini` 才会生效（该步骤会重启 `vm2api-gemini.service`）。
+
+## 1.4.194 — 2026-11-24 · CRAGGemini 请求净化与 Antigravity-Manager 对齐；空 `safetySettings` 不再误判为不支持
+
+- **CRAGGemini 请求净化与 Antigravity-Manager 转换对齐**：修复客户端（Claude Code、OpenAI Chat/Responses、Gemini）向 `target: 'antigravity'` 发送 Unix 路径、斜杠前缀词、ANSI/控制字符、计费头或空占位轮次时返回的 `400 unsupported_turn`；`src/lib/protocol/gemini-convert.mjs` 现剥离 ANSI 转义与非法 `Cc` 控制字符（保留 `\n`/`\r`/`\t`）并归一化孤立代理项，对 `contents` 与 `functionResponse.response` 中空白前缀的 `/` 以 `U+200B` 转义（`systemInstruction` 与 `functionCall.args` 的字面路径保持原样），增强计费头剥离（代码块保护 + `cc_version=`/`cch=`）、过滤空与占位轮次、支持 Anthropic `role: 'system'`、跳过 `server_tool_use`/`web_search_tool_result`、补全空 `tool_result`；净化后的单轮请求可进入具备 `multi_turn` 的现代 CRAGGemini 槽位，旧版受限 `native_tui` 槽位保持 fail-closed（#1708）。
+- **空 `safetySettings` / `cachedContent` 不再被判为需要 `generation_config`**：`classifyGeminiCapabilities` 原先对这两项用存在判定，而 `safetySettings: []` 解析后是空数组、`[] != null` 为真，于是一个**未配置任何内容**的空值会把 `plainText` 置空，使调度器对原生传输本可服务的纯文本请求返回 400 `gemini_unsupported_turn`；现改为与相邻 `generationConfig` 一致的非空判定。同时 `classifyGeminiCapabilities` 新增返回 `unsupportedFields`，调度器的 400 消息会点名具体字段（如 `unsupported in this request: safetySettings`），此前调用方只能自行二分 payload 才能定位（#1709，修复 #1703）。
+- 部署说明：本版仅涉及控制面（`src/lib/protocol/gemini-convert.mjs`、`src/lib/gemini/scheduler.mjs`、`src/lib/gemini/system-prompt.mjs`、`src/lib/gemini/routes.mjs`），不含宿主脚本与载荷变更；`deploy/payload.json` 的 `0.4.4` 钉住沿用前版，Claude/Codex 槽位内核与 `wrap-cli` 字节未变，预期 `SLOT_SYNC=skip`，无需执行 `wrap-cli/sync` 或重启既有 `kin-*` 槽位。
+
+## 1.4.193 — 2026-11-24 · Gemini 调度配置与分片 CRAGGemini 守护进程；部分续写 409 诊断字段透传
+
+- **Gemini 调度配置页与 SSOT 路由模式**：设置 → 调度新增 `Gemini` 独立入口（`gemini-config`），提供调度策略、并发、分片守护进程、性能配置与故障熔断配置，原设置 → 运维 → `Gemini 维护` 及既有深链保持不变；新增 `src/lib/gemini/routing-config.mjs` 作为 Gemini 路由单一事实来源（`enabled`、5 个协议开关、`pool`、`sticky`、`failover`、`shm`），含严格校验、`routing.json` 持久化与 `PUT /api/panel/routing` 的实时 `apply-policy` 下发；调度器支持 `balanced` / `fill` / `round_robin` 策略、会话粘滞 TTL 绑定与可配置的账号切换上限和冷却；新增管理员专用 `GET /api/panel/gemini/daemon-status` 与 `POST /api/panel/gemini/daemon-action`（#1704）。
+- **分片 CRAGGemini 守护进程与高性能通道控制**：`scripts/gemini-host.py` 新增 `CragDaemonShard`，单个 `craggemini` 进程可托管至多 `accounts_per_daemon`（默认 `50`）个 OAuth `agy` 账号，保持按账号的代理与目录隔离及独立数据通道（置 `1` 退化为严格按账号隔离）；新增 `runtime-policy.json` 持久化、`PUT /internal/v1/policy` 与 `POST /internal/v1/accounts/{id}/lifecycle` 实时下发，以及分片故障域隔离与自动回退 `NativeSession`（#1704）。
+- **部分续写 409 透传安全诊断字段**：`partial_provider_output_nonretryable` 的 409 现按白名单透传 `prior_reason`、`interrupted_at`、`retry_after_sec`、`recovery_attempts`、`max_recoveries`、`recovery_exhausted`，未知字段与嵌套对象一律丢弃，`retryable: false` 保持不变以继续关闭 SDK 自动重试；其他 409 判定不变（#1705）。
+- 部署说明：本版涉及控制面、前端与 CRAGGemini 宿主脚本（`scripts/gemini-host.py`、`scripts/gemini_host_native.py`）。`deploy/payload.json` 的 `0.4.4` 载荷钉住与上一版一致，未再变更；Claude/Codex 槽位内核与 `wrap-cli` 字节未变，`remote-apply.sh` 报 `SLOT_SYNC=skip`，无需执行 `wrap-cli/sync` 或重启既有 `kin-*` 槽位。**分片守护进程与高性能通道能力位于宿主脚本内**，宿主侧需执行 `install.sh prepare-gemini` 才会生效（该步骤会重启 `vm2api-gemini.service`）；仅覆盖控制面时面板可见新配置页，但分片调度仍按既有 `NativeSession` 路径运行。
+
+## 1.4.192 — 2026-11-24 · PostgreSQL 与多级缓存支持；CRAGGemini 系统提示词控制与 `0.4.4` 载荷；集群遥测与代理池重启宽限窗修复
+
+- **PostgreSQL 数据库引擎与多级缓存支持**：扩展数据库层支持 PostgreSQL（兼容既有 SQLite 单文件与隔离单测），新增 `src/lib/db/pg/` 连接池管理、Advisory Lock 并发安全迁移（`001`–`004`）、SQL 方言兼容层与仪表盘预聚合器；新增 `src/lib/cache/` L1 LRU + Singleflight + 可选 L2 Redis 缓存与跨实例实时失效（Redis 异常自动 Fail-Open 降级 L1）；重构在线备份/恢复至独立 Worker（支持 `pg_dump` 与流式 `.pg.ndjson.gz` 防死锁批量恢复）；配套流式迁移工具 `scripts/migrate-sqlite-to-pg.mjs`、生产一键切流与 `--rollback` 脚本 `deploy/replace-db-to-pg.sh`（`deploy/install.sh` 升级时检测到已有 `data/kin.db` 自动保持 `VM2API_DB_DRIVER=sqlite` 防误切空库），以及 Web 数据库与缓存监控面板（#1699）。
+- **CRAGGemini 系统提示词控制与 `0.4.4` 载荷钉住**：系统提示词页面新增 `CRAGGemini (Antigravity)` 标签页，支持 `official_full`（官方提示词）与 `zero`（0 提示词替换）两种模式及可选全局系统提示词（`compatibility.craggemini_persona_preset` / `craggemini_system_prompt`）；控制面与宿主（`scripts/gemini-host.py`、`scripts/gemini_host_native.py`）透传 `system_prompt_mode`（向下兼容旧版 worker）；`deploy/payload.json` 钉住签名载荷 `payload-2026.11.24-gemini-0.4.4`（`craggemini` 0.4.4 + `libagy_bridge.so`）（#1700）。
+- **CRAGGemini 后台重认证检查锁并发与日志修复**：`_schedule_reauth_check_locked` 后台线程不再持全局 `host.lock` 执行网络 I/O，`refresh_account` 自身为忙碌判定与尾部状态变更（`env` 更新、`save()`、`stop_native_session`、`_schedule_warm_locked`）及 `pull_models` 写盘取锁，并在环境于探测期间被删除时跳过回写；将 `except BaseException: pass` 改为捕获 `Exception` 并向 `stderr` 输出脱敏错误日志，不吞 `KeyboardInterrupt` / `SystemExit`（#1695，修复 #1674）。
+- **代理池 boot 探活宽限窗（按失败形状收窄）**：新增 `boot_grace_min`（默认 10 分钟，0 关闭），重启宽限窗内仅对超时类探活失败（`timeout`、`egress_timeout`、`egress_dns_timeout`、`egress_tls_timeout`）钳制 `consecutive_failures` 于 `max_failures - 1`，避免升级重启风暴瞬态超时连坐摘除整个号池；`connection_refused` 等明确拒绝保持原有 `dead` 与级联禁用判定（#1698，替代 #1640）。
+- **集群 Docker CRAG 遥测修复与测试缝隙清理**：补齐指纹目录 `0755`/`0644` 权限归一化、`writeKernelConfig` 为集群 Docker CRAG 槽位输出 `dmi_dir: '/etc/kin-dmi'`、CRAG 重装保留原生遥测设置、上游 `reason`/`upstream_message` 透传以及旧集群容器缺失挂载时的维护态重建路径（复用 `slot-computer-files.mjs` 单一挂载来源）（#1636，修复 #1592）；移除 `fleet-update.mjs` 与 `slot-process-status.mjs` 中依赖测试替身判定的分支，确保每次 CRAG 重启前无条件写入内核配置并可观测验证（#1696）。
+- 部署说明：本版涉及控制面（含 `Dockerfile` 新增 `postgresql-client` 及 `pg`/`ioredis` 依赖）、前端、CRAGGemini 宿主脚本（`scripts/gemini-host.py`、`scripts/gemini_host_native.py`）与 `geminiDefaultLinuxAmd64`（`0.4.4`）加密载荷；Claude/Codex 槽位内核与 `wrap-cli` 字节未变，`remote-apply.sh` 报 `SLOT_SYNC=skip`，无需执行 `wrap-cli/sync` 或重启既有 `kin-*` 槽位。存量 SQLite 宿主执行 `install.sh upgrade` 会自动保持 `VM2API_DB_DRIVER=sqlite`，待需要时再执行 `sudo bash deploy/replace-db-to-pg.sh` 平滑迁移。
+
+## 1.4.191 — 2026-11-24 · Gemini 原生 `/v1beta` + `/v1` 端口与 Gemini API 多协议渠道；不合格原生会话快速失败；Gemini 槽位状态紧凑化
+
+- Gemini 公开端口补齐：新增 `/v1/models/:model:(generateContent|streamGenerateContent)` 稳定路径与单模型查询 `GET /v1beta/models/:model`、`GET /v1/models/:model`；`/v1/models*` 允许 `?key=` 鉴权，CORS 放行 `x-goog-api-key`、`x-goog-api-client`；`category=api` 密钥访问 `/v1beta/models*` 与 `/v1/models/:model:*` 时分流至 API 渠道，不再误落本地 CRAGGemini host socket（#1690）。
+- API 渠道新增 `gemini` 协议（默认 `https://generativelanguage.googleapis.com` + `x-goog-api-key`，兼容 `Bearer` / `x-api-key`）：拉取模型优先原生 `/v1beta/models`（支持 `nextPageToken`），遇反代 HTML/404/405 回退 `/v1/models`；探测优先 `/v1beta/models/:model:generateContent` 并拦截 HTML 200 误判；复用 `gemini-convert.mjs` 打通原生 Gemini、OpenAI Chat、OpenAI Responses 与 Anthropic Messages 四协议入站转发；面板 API 渠道页、端点编辑抽屉与密钥弹窗同步支持（#1690）。
+- CRAGGemini 不合格原生会话快速失败：`open_worker_stream()` 在启动轮询与等待响应头期间监听 `EligibilityDiagnostic`，`VALIDATION_REQUIRED` / `UNSUPPORTED_REGION` 等不合格会话直接返回 HTTP 403 并取消在途 worker 回合，不再阻塞到 `first_byte_timeout_ms`（90s）；账号存在阻断性 `account.eligibility` 或锁存的 `native_diagnostic` 时跳过常驻预热并上报 `runtime_ready=false`，避免僵尸 `bwrap + craggemini + agy` 槽位；`refresh_account()` 在资格变化或清除时回收失效 `NativeSession` 并在合格后重新预热，完成 Google 验证后无需重启 `vm2api-gemini.service`；`gemini-host-resident.py` 接入原生测试驱动，确保在 CI 中实际执行（#1688）。
+- 面板：CRAGGemini 槽位代理改用标准 `ProxyChip` 渲染（#1689）；Gemini 槽位状态在 VM 表格内压缩为单行（保持 38px 行高）、机架卡片固定两行，完整证据移至悬停提示；资格提示在资格判定早于最近一次成功宿主推理时不再显示过期黄色警告，且仅当两个时间戳都可解析时才隐藏，缺失 `checked_at` 的 `verification_required` 账号仍显示警告与验证链接（#1691、#1692）。
+- 部署说明：本版涉及控制面、前端与 CRAGGemini 宿主脚本（`scripts/gemini-host.py`、`scripts/gemini_host_native.py`，部署于 `/usr/local/lib/vm2api-gemini/scripts/`）；`deploy/payload.json`、Claude/Codex 槽位内核与 `wrap-cli` 字节未变，`remote-apply.sh` 报 `SLOT_SYNC=skip`，无需执行 `wrap-cli/sync` 或重启既有 `kin-*` 槽位。
+
+## 1.4.190 — 2026-11-24 · 修复 CRAGGemini 兑换码授权中心默认指向 `/gemini`；thinking 块去重与流中断诊断增强
+
+- 修复 CRAGGemini 宿主兑换码无法兑换并误报「无法连接 CRAGGemini 授权中心，请稍后重试。」的缺陷：`src/lib/gemini/subscription.mjs` 原默认 `DEFAULT_AUTHORITY` 误指向 Claude `crag-v2` 授权根 `https://www.vm2api.org` 而非 `https://www.vm2api.org/gemini`，导致未显式设置 `KIN_CRAG_GEMINI_AUTHORITY_URL` 的宿主收到 `409 issuer_mismatch`；同时 `AUTHORITY_ERRORS`、`routes.mjs`（`HOST_ERRORS`）与前端 `gemini-redeem-dialog.tsx` 遗漏登记 `issuer_mismatch`、`payload_key_unknown` 等终态错误码，将其静默折叠为 `502 gemini_subscription_authority_unavailable` 并残留 `sync-pending`。现默认指向 `https://www.vm2api.org/gemini`，并完整透传 `issuer_mismatch`、`payload_key_unknown`、`payload_key_conflict`、`renewal_unavailable`、`host_transfer_cooldown`、`request_conflict`、`invalid_request` 与 `not_found`（#1684）。
+- 修复 Anthropic 协议层重复 `thinking` 块去重与实时交接（native handoff）在 `max_tokens` 或流中截断下的处理逻辑，并在 `onRetryableTruncation` 回调记录原始上游错误类型、错误码与消息，避免确定性截断与瞬态掉线在日志中难以区分（#1681）。
+- 对齐 `test/e2e/api-keys.e2e.test.mjs` 的 Gemini 密钥隔离断言至非共享 OpenAI 路径 `/v1/completions`，与共享路径准入语义保持一致（#1685）。
+- 部署说明：本版仅涉及控制面与前端（`deploy/payload.json`、槽位内核与 `wrap-cli` 字节未变，`remote-apply.sh` 报 `SLOT_SYNC=skip`，无需执行 `wrap-cli/sync` 或重启既有 `kin-*` 槽位）。尚未升级至 `v1.4.190` 的存量 `v1.4.184`–`v1.4.189` 宿主机，也可临时配置环境变量 `KIN_CRAG_GEMINI_AUTHORITY_URL=https://www.vm2api.org/gemini` 并重启控制面立即恢复 CRAGGemini 兑换码使用。
+
+## 1.4.189 — 2026-11-24 · Antigravity 模型分流（`ag-` 前缀）、配额组冷却故障转移与 Gemini 计费日志；默认载荷自动派生与审计对齐
+
+- Antigravity 模型按厂商分流并追加 `ag-` 前缀，统一接入 `all` / `gemini` 密钥路由与前端分组展示：新增 `src/lib/gemini/model-catalog.mjs` 作为唯一真值源，配合 `scripts/gemini_host_account.py` 采集 `fetchAvailableModels` 的 `modelProvider` 写入 `account.model_catalog`；Google Gemini 模型保持 `gemini-*`，Anthropic / OpenAI 第三方衍生模型以 `ag-` 前缀对外暴露（如 `ag-claude-sonnet-4-6-high`、`ag-gpt-oss-120b-medium`），下发上游时自动剥离前缀、响应回显公开模型 ID；`all` 密钥仅对 `gemini-*` 与 `ag-*` 分流至 Antigravity（不劫持原生 `claude-*` / `gpt-*`），`anthropic` / `openai` 密钥保持严格隔离；面板详情与测试下拉框同步按 Google Gemini / Anthropic（`ag-` 前缀）/ OpenAI 第三方分组展示（#1678）。
+- Gemini 调度器新增按配额组独立 429 冷却与首包前自动故障转移：`src/lib/gemini/scheduler.mjs` 维护 `(accountId, quotaGroup)`（`gemini` / `gemini-argon-wtu` / `3p`）、`(accountId, model)` 与账号级冷却表，并结合 `account.quotas` / `account.quota_groups` 主动跳过已耗尽或受限账号；`3p`（Claude 等）触发 429 时仅冷却该账号的 `3p` 池，不影响同账号 `gemini` 池调度；首包输出前遇到 429、`gemini_account_verification_required`、`gemini_location_unsupported`、`gemini_operation_busy`、`gemini_proxy_error` 等错误自动切换至下一健康账号（#1678）。
+- Gemini 接入官方参考定价与逐回合请求日志计费：`src/lib/admin/builtin-rates.mjs` 与 `src/lib/admin/price-catalog.mjs` 新增 `google` 平台费率表与 `models.dev` 解析，并支持剥离 `ag-` 前缀及思考强度后缀（`-low/-medium/-high/-xhigh`）使 `ag-claude-*` / `ag-gpt-*` 自动复用官方费率；`createGeminiPublicHandler`、`src/server.mjs` 与 `handle-protocol.mjs` 贯通 `requestLog` 单次落库（无重复写入），控制面在接入日志后向面板上报 `billing_ready: true`（#1678）。
+- Gemini 上游错误处置指引与测试默认值优化：补齐 `gemini_account_verification_required`、`gemini_location_unsupported`、`gemini_oauth_required`、`gemini_quota_exhausted`、`gemini_proxy_error` 等上游错误的处理建议与可一键打开/复制的 `https://accounts.google.com/` 验证链接 UI；测试对话默认提示词改为 `hello`、默认模型优先选择 `Gemini 4 neon`（#1676）；修复控制面遗漏注册 `gemini_authorization_unavailable` 导致授权启动失败被错误折叠为「未检测到可用的 Gemini 宿主机服务」的问题（#1675）。
+- 修复 `scripts/fetch-default-gemini.py` 硬编码 `VERSION = "0.3.0"` 与 `deploy/payload.json` 载荷版本漂移导致 `prepare-gemini` 及维护代理 `stage_pinned()` 拒绝合法清单的缺陷：改为直接从 `deploy/payload.json` 读取并校验 release tag 后反推版本，不再维护重复常量（#1680，修复 #1677）。
+- 审计对齐修复：控制面蓝绿交接时将 `warmGemini` 周期定时器改为注册到 `onLeaderStop` 而非等待 `server.close`；补齐 `batch_group` 路由配置持久化与面板透出；`vm-package` 补齐 Claude 家族会话上限字段导入导出；移除废弃的 `gemini-test-chat.tsx` 并对齐 Gemini 错误提示与运维入口文案（#1679）。
+- 部署说明：本版涉及控制面、前端与 CRAGGemini 宿主脚本（`/usr/local/lib/vm2api-gemini/scripts/`）；`deploy/payload.json` 载荷钉选（`craggemini 0.4.3`）、Claude/Codex 槽位内核与 `wrap-cli` 字节均未变，`remote-apply.sh` 报 `SLOT_SYNC=skip`，无需执行 `wrap-cli/sync` 或重启既有 `kin-*` 槽位。
+
+## 1.4.188 — 2026-11-24 · CRAGGemini 0.4.3 原生多轮/视觉/联网与 OAuth 换票风控加固；蓝绿部署、内核槽位租约与批量组调度
+
+- 升级锁定 `deploy/payload.json` 的 `geminiDefaultLinuxAmd64` 至 [`payload-2026.11.23-gemini-0.4.3`](https://github.com/dofastted/vm2api/releases/tag/payload-2026.11.23-gemini-0.4.3)（`craggemini 0.4.3`，Debian 12 构建，最高符号要求 `GLIBC_2.34`）：包含 `0.4.2` 的 `memfd` 守卫派生修复与池就绪度修正（#1663），并进一步将媒体临时目录迁入 `/work/.craggemini-media/<req>` 配合只读白名单打通图片识别（多模态 `inlineData` / `image_url`）、原生多轮会话记忆与内部 `search_web`/`read_file` 工具事件过滤，完整支持联网搜索与 4 协议透传（#1667）。
+- CRAGGemini OAuth 换票与设备指纹真实化加固及凭证健康对齐：修复 `Login.finished()` 误以 `.config/antigravity` 在 T+0ms `SIGKILL` 正在初始化的 `agy` 的缺陷，改为等待完整稳定期（`3s–6s`）并先发 `SIGTERM` 优雅落盘；`Headless` 拉取模型继承已授权 profile 的 `installation_id` 与 `cache/default_project_id.txt`；每个环境按 ID 确定性派生独立 `bwrap --hostname ws-<8hex>`；`scripts/gemini_host_account.py` 升级至官方最新 `antigravity/hub/2.34.0` User-Agent、模型与配额探测切至 `daily-cloudcode-pa.googleapis.com`、解析并严格校验透出 Google `ineligibleTiers`（`eligibility` 与 `https://accounts.google.com/` `validation_url`）；新增 `_profile_credential_health` 脱敏凭证健康视图与未就绪会话指数退避，消除 `invalid_grant` 槽位每 32 秒空转重启（#1667）。
+- 修复存量已授权 OAuth 环境停留在「尚未拉取模型，不能调度」与缺失套餐信息的问题：`scripts/gemini-host.py` 的 `warm` 流程为缺少模型或套餐的已授权 OAuth 环境自动调度后台 `_post_auth_provision`（带冷却限流）；`src/lib/gemini/routes.mjs` 的 `warmGeminiEnvironments` 在 `models_discovered !== true` 时不再提前跳过预热（#1663）。
+- 蓝绿部署与控制面平滑交接：新增 `deploy/bluegreen/` 部署套件、`docs/BLUEGREEN.md` 与控制面 `handover` 切换链路，支持 standby 预热校验、重叠期负载统计、后台备份与订阅文件安全切换（#1601）。
+- 调度池内核槽位租约与批量组调度：新增 `kernel-lease` 按 CRAG 内核实时容量准入请求（#1639）；新增 `batch-group` 为无会话 API 批量流量提供粘性弹性成员集调度（#1635）；修复 CRAG 测试夹具文件显式 `0644` 权限（#1668）。
+- 部署说明：本版涉及控制面、CRAGGemini 宿主脚本（`/usr/local/lib/vm2api-gemini/scripts/`）与 `geminiDefaultLinuxAmd64`（`0.4.3`）加密载荷；Claude/Codex 槽位内核与 `wrap-cli` 字节未变，`remote-apply.sh` 报 `SLOT_SYNC=skip`，无需执行 `wrap-cli/sync` 或重启既有 `kin-*` 槽位。
+
+## 1.4.187 — 2026-11-24 · 热修：恢复宿主身份以存储值为准，并自动回收 1.4.186 误退役的身份
+
+- 热修 1.4.186 导致在用宿主鉴权失败（`license_crag_host_usage_unverified` / HTTP 403，「暂时无法核对宿主机 CRAG 运行额度」）。1.4.186 将采样硬件视为唯一真值，存储的 `host_id` 一旦与采样值不符即被整套退役；对采样值已漂移的宿主，这相当于把已付费的身份换成授权端从未签发过的新身份，`status` 随即返回 404、拿不到任何权益，槽位准入全部失败。生产日志确认 4 台宿主落入此状态（新 `host_id` 在账本中不存在）。
+- 恢复 `deviceIdentity()` 以存储身份为准、且不做值比较：宿主已针对该身份付费，重新生成的 machine-id、重建的容器或更换的网卡都不应使其变成陌生人。碰撞问题仍在零代价处解决——`candidateRaws` 依唯一性排序，**首次**安装改从 MAC 或 SMBIOS UUID 派生，不再落到云镜像共享的 `machine-id`；已相撞的宿主仍由显式 `rebuildDeviceIdentity({ reason })` 修复，而非让每台宿主的身份各自漂移。
+- 受损宿主自愈：`deviceIdentity()` 在准入时回收 1.4.186 留下的 `*.legacy` 身份文件（`host_id`、`credential`、`device_uuid`、`entitlement.code`、`redeem.json` 等整套移回），无需任何运维操作。无条件回收是安全的，理由唯一——被换上的新身份在授权端没有记录，不可能完成过兑换，这正是故障本身的症状。显式重建改用 `.retired` 后缀并先清除 `.legacy`，以免有意的重建在下次准入时被自愈撤销。
+- 保留 1.4.186 的两个 fallback 源：`dmi`（SMBIOS 每实例 UUID）排在 `machine-id` 之前，`cpu` 垫底且不唯一（同机型读数相同），仅用于让既无合格网卡也无 SMBIOS UUID 的宿主拿到身份而非直接被拒；`rebuildDeviceIdentity()` 复用同一条链，故不再因缺少合格网卡而拒绝重建。
+- 部署说明：本版仅涉及控制面 `src/lib/vm/crag-subscription.mjs`，槽位内核与 `wrap-cli` 字节未变，`remote-apply.sh` 报 `SLOT_SYNC=skip`，无需执行 `wrap-cli/sync` 或重启既有 `kin-*` 槽位。受影响宿主在升级后的首次槽位准入时自动恢复。
+
+## 1.4.186 — 2026-11-23 · 宿主身份改以采样设备为唯一真值，修复克隆镜像 host_id 相撞导致的永久 403
+
+- 修复从同一云镜像克隆的宿主互撞 `host_id` 后、后注册者永久 403 的缺陷：云镜像普遍不重置 `/etc/machine-id`，由它派生的 `host_id` 在多台实例上相同，而 `deviceIdentity()` 原先原样返回已存储的 `host_id`，使相撞的值被钉在宿主自己的文件里、升级也不会自愈。现在采样到的设备是唯一真值，`credential()` 在存储值与派生值不符时整套退役旧身份——`host_id`、`credential`、`device_uuid`、`entitlement.code` 与 `redeem.json` 一并移为 `*.legacy`，避免新身份继承旧权益或半完成的兑换，且退役值不再参与任何鉴权（#1664）。
+- 身份来源按唯一性重排为 `mac → dmi → machine-id/mount → cpu`：新增 `dmi`（SMBIOS 每实例 UUID）排在 `machine-id` 之前——后者正是相撞的来源，置于其后将永远不被取用；新增 `cpu` 兜底并在代码中明示其**不唯一**（同机型读数相同），仅用于让既无合格网卡、也无 SMBIOS UUID 的宿主拿到身份而非直接被拒。`rebuildDeviceIdentity()` 改为复用同一条链，顺带解除其原本「无合格网卡即无法重建」的限制；`readStoredUuid` / `backfillUuid` 移除，可读 UUID 与 `host_id` 同源计算、天然自洽（#1664）。
+- 行为变更与迁移提示：宿主身份此后随采样来源变动，更换网卡或重建容器会使其成为新宿主，须用订单号迁移订阅（crag 的 claim-by-order）。这是本次有意接受的取舍，也是来源按唯一性而非稳定性排序的原因。放量前建议先扩大券的订单号登记覆盖面——订单号是该场景唯一的自助恢复通道，未登记的宿主只能人工逐台处理。
+- 部署说明：本版仅涉及控制面 `src/lib/vm/crag-subscription.mjs`，槽位内核与 `wrap-cli` 字节未变，`remote-apply.sh` 报 `SLOT_SYNC=skip`，无需执行 `wrap-cli/sync` 或重启既有 `kin-*` 槽位。
+
+## 1.4.185 — 2026-11-23 · CRAGGemini 常驻内核池（0.4.1）与 OAuth 自动席位/模型初始化；池超时熔断分级保持
+
+- CRAGGemini 推理内核与 `agy` 进程全面常驻化：宿主 `scripts/gemini-host.py` 将 `max_concurrency >= 1` 统一走 `pool_mode`（移除 `openvt` 单轮拉起/拆毁），移除 180 秒空闲杀进程、模型切换杀进程与单次健康探测失误即撕毁会话逻辑；新增引用计数 `SlotNetworkLease` 管理 `vm2agy<slot>` 与 `kin-egress` 生命周期，面板 `test-chat` 改为通过 `ResidentTestChatRun` 复用常驻 `NativeSession`，新增 `warm` RPC 与非阻塞后台自愈，以及控制面 `src/server.mjs` 启动 + 每 30 秒 `warmGeminiEnvironments` 巡检预热（#1658）。
+- `deploy/payload.json` 的 `geminiDefaultLinuxAmd64` 升级锁定至 [`payload-2026.11.23-gemini-0.4.1`](https://github.com/dofastted/vm2api/releases/tag/payload-2026.11.23-gemini-0.4.1)（`craggemini 0.4.1`，支持常驻 `agy` 槽位池、`graceful_cancel_v1` 原地优雅取消、池模式实时热切模型与 Arena 蓝绿轮转，沿用既有 `crag-auth-gemini` 公钥信任锚 `f6e3ef3a50fd…`）。
+- CRAGGemini 自动完成席位绑定、OAuth 模型/套餐初始化与 1 小时令牌自动续期：`src/lib/gemini/subscription.mjs` 与 `routes.mjs` / `scheduler.mjs` 自动为已授权 OAuth 环境绑定可用席位；`scripts/gemini_host_account.py` 统一使用 `User-Agent: antigravity/1.15.8 linux/amd64`、自动执行 `onboardUser` 与临期 OAuth token 刷新；`scripts/gemini-host.py` 在授权完成后自动拉取模型列表与账号套餐（#1656）。
+- 调度池静默超时熔断改进：同一槽位 2 小时内重复触发连续 3 次首字节超时熔断时，不再被下一次健康探测立即清零，按 15/30/60 分钟阶梯保持隔离并在有效成功后重置记录（#1654）；`[vm-circuit]` 日志的 `trip N in 2h` 改为严格统计并裁剪 2 小时窗口内计数（#1657）。
+- 部署说明：本版涉及控制面、CRAGGemini 宿主脚本（`/usr/local/lib/vm2api-gemini/scripts/`）与 `geminiDefaultLinuxAmd64`（`0.4.1`）加密载荷；Claude/Codex 槽位内核与 `wrap-cli` 字节未变，`remote-apply.sh` 报 `SLOT_SYNC=skip`，无需执行 `wrap-cli/sync` 或重启既有 `kin-*` 槽位。
 
 ## 1.4.184 — 2026-11-23 · CRAGGemini 兑换码与画布兑换预览，锁定加密 0.4.0 载荷；VM 并发/子代理限流与凭证脱敏
 

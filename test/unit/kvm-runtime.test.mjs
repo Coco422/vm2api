@@ -381,7 +381,9 @@ test('kvm docker run honors slotCreationLimits pids instead of hardcoding 256', 
     claude: { rate_limit_tier: 'default_claude_max_20x' },
     policy: { sessionSlots: 8, sessionSlotsOverride: true },
   }
-  const planArgs = argsFor('kvm', max20, {})
+  const defaultArgs = argsFor('kvm', max20, {})
+  assert.equal(defaultArgs[defaultArgs.indexOf('--pids-limit') + 1], '256')
+  const planArgs = argsFor('kvm', max20, { slot_capacity: { enabled: true } })
   assert.equal(planArgs[planArgs.indexOf('--pids-limit') + 1], '640')
 })
 

@@ -4,11 +4,22 @@ import http from 'node:http'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { Readable } from 'node:stream'
 import { createRespond, readBody } from '../../src/lib/http/respond.mjs'
+import { RequestLogStore } from '../../src/lib/admin/request-log.mjs'
+import { RequestAttemptsRepo } from '../../src/lib/db/repos/request-attempts-repo.mjs'
+import { UsageLogsView } from '../../src/lib/db/repos/usage-logs-view.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import { classifyUpstreamResult } from '../../src/lib/pool/upstream-error-policy.mjs'
 import { RateLimitService } from '../../src/lib/pool/rate-limit-service.mjs'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
+import { consumeNativeHandoffStream, createNativeHandoffState } from '../../src/lib/protocol/native-handoff.mjs'
+import {
+  applyClaudeSSELineToMessage,
+  claudeSSELineToResponsesEvents,
+  createClaudeMessageAssembler,
+  createResponsesStreamState,
+} from '../../src/lib/protocol/convert.mjs'
 import { callGoWorker, streamGoWorker } from '../../src/lib/transport/go-worker-client.mjs'
 import {
   finalizeAssembledAssistantHop,
@@ -625,37 +636,89 @@ for (const stream of [false, true]) {
   })
 }
 
-unixTest('CRAG cache policy rejection is returned without replay and without exposing diagnostics', async (t) => {
-  const rejection = { type: 'error', error: { type: 'api_error', message: 'Kernel rejected the request' } }
-  const facts = {
-    type: 'kin_provider_result',
-    schema_version: 2,
-    source: 'crag',
-    provider_complete: false,
-    usage_complete: false,
-    public_status: 502,
-    error: rejection.error,
-    observation: { policy_blocked: true, exception: { code: 'CRAG_CACHE_CONTROL', message: 'private observation' } },
-  }
-  const fx = await fixture(
-    (_req, res) => {
-      res.writeHead(200, { 'content-type': 'text/event-stream' })
-      res.end(resultFrame(facts) + frame(rejection))
-    },
-    { capabilities: ['native_handoff_v1', 'provider_result_v2'] },
-  )
-  t.after(() => fx.close())
-  const body = { model: 'claude-opus-5-5', messages: [{ role: 'user', content: 'hello' }] }
-  const result = await streamGoWorker(options(fx, { envelope: { body, headers: {}, stream: true } }))
-  assert.equal(result.terminalState, 'rejected')
-  assert.equal(result.body.error.code, 'crag_policy_blocked')
-  assert.equal(result.body.error.details.retryable, false)
-  assert.doesNotMatch(JSON.stringify(result.body), /private observation/)
-  const policy = classifyUpstreamResult(result)
-  assert.equal(policy.action, 'stop')
-  assert.equal(policy.cooldownUntil, null)
-  assert.equal(policy.scope, 'request')
-})
+unixTest(
+  'CRAG cache policy rejection triggers one-shot cache_control repair-and-retry without exposing diagnostics',
+  async (t) => {
+    const rejection = { type: 'error', error: { type: 'api_error', message: 'Kernel rejected the request' } }
+    const facts = {
+      type: 'kin_provider_result',
+      schema_version: 2,
+      source: 'crag',
+      provider_complete: false,
+      usage_complete: false,
+      public_status: 502,
+      error: rejection.error,
+      observation: { policy_blocked: true, exception: { code: 'CRAG_CACHE_CONTROL', message: 'private observation' } },
+    }
+    const fx = await fixture(
+      (_req, res) => {
+        res.writeHead(200, { 'content-type': 'text/event-stream' })
+        res.end(resultFrame(facts) + frame(rejection))
+      },
+      { capabilities: ['native_handoff_v1', 'provider_result_v2'] },
+    )
+    t.after(() => fx.close())
+    const body = { model: 'claude-opus-5-5', messages: [{ role: 'user', content: 'hello' }] }
+    const result = await streamGoWorker(options(fx, { envelope: { body, headers: {}, stream: true } }))
+    assert.equal(result.terminalState, 'rejected')
+    assert.equal(result.cragCacheControlBlocked, true)
+    assert.equal(result.body.error.code, 'crag_policy_blocked')
+    assert.equal(result.body.error.details.retryable, false)
+    assert.doesNotMatch(JSON.stringify(result.body), /private observation/)
+
+    // First attempt before dispatch: repair-and-retry on same account without cooldown.
+    const firstPolicy = classifyUpstreamResult(result, { repaired: false })
+    assert.equal(firstPolicy.action, 'repair-and-retry')
+    assert.equal(firstPolicy.reason, 'cache_control_repairable')
+    assert.equal(firstPolicy.retrySameAccount, true)
+    assert.equal(firstPolicy.cooldownUntil, null)
+    assert.equal(firstPolicy.scope, 'request')
+
+    // If still rejected after repair, stop cleanly without looping or cooling down the account.
+    const secondPolicy = classifyUpstreamResult(result, { repaired: true })
+    assert.equal(secondPolicy.action, 'stop')
+    assert.equal(secondPolicy.reason, 'crag_policy_blocked')
+    assert.equal(secondPolicy.cooldownUntil, null)
+    assert.equal(secondPolicy.scope, 'request')
+
+    // End-to-end FailoverRunner: first attempt rejects with CRAG_CACHE_CONTROL,
+    // second attempt strips broken caller cache_control and succeeds on the same slot.
+    const seenBodies = []
+    let selections = 0
+    const runner = new FailoverRunner({
+      scheduler: {
+        async selectAndReserve() {
+          selections++
+          return { ok: true, vmId: 'vm-01', accountId: 'acc-1', vm: { id: 'vm-01' }, release() {} }
+        },
+        markRateLimited() {
+          throw new Error('must not cool down account on CRAG_CACHE_CONTROL repair')
+        },
+      },
+    })
+    const runResult = await runner.run({
+      canonicalBody: {
+        model: 'claude-opus-5-5',
+        system: [{ type: 'text', text: 'sys', cache_control: { type: 'ephemeral', ttl: '1h' } }],
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: 'hello', cache_control: { type: 'ephemeral', ttl: '1h' } }] },
+        ],
+      },
+      model: 'claude-opus-5-5',
+      callAttempt: async ({ body: attemptBody }) => {
+        seenBodies.push(structuredClone(attemptBody))
+        if (seenBodies.length === 1) return result
+        return { ok: true, status: 200, committed: true, terminalState: 'verified', body: { id: 'msg_ok' } }
+      },
+    })
+    assert.equal(runResult.ok, true)
+    assert.equal(seenBodies.length, 2)
+    assert.equal(selections, 2)
+    assert.deepEqual(seenBodies[0].system[0].cache_control, { type: 'ephemeral', ttl: '1h' })
+    assert.equal(seenBodies[1].system[0].cache_control, undefined)
+    assert.equal(seenBodies[1].messages[0].content[0].cache_control, undefined)
+  },
+)
 
 unixTest('#1139: opaque CRAG 429 returns once without restricting the account', async (t) => {
   const error = { type: 'rate_limit_error', message: 'Error' }
@@ -1385,3 +1448,338 @@ for (const deliveryMode of ['realtime', 'verified']) {
     }
   })
 }
+
+test('realtime native handoff completes real max_tokens cut inside tool_use without native_handoff_conflict', async () => {
+  for (const closeToolBlock of [true, false]) {
+    const result = summary({ stop_reason: 'max_tokens' })
+    const toolStream = [
+      frame({
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'tool_use', id: 'toolu_cut', name: 'Write', input: {} },
+      }),
+      frame({
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'input_json_delta', partial_json: '{"filePath":"/tmp/a' },
+      }),
+      ...(closeToolBlock ? [frame({ type: 'content_block_stop', index: 0 })] : []),
+    ].join('')
+    const sse = start(result) + toolStream + resultFrame(result) + terminalFrames(result)
+    const response = Readable.from([Buffer.from(sse)])
+    response.headers = { 'content-type': 'text/event-stream' }
+    response.trailers = {}
+
+    const state = createNativeHandoffState({ nativeHandoff: true })
+    const lines = []
+    let commits = 0
+    const received = await consumeNativeHandoffStream(response, {
+      state,
+      deliveryMode: 'realtime',
+      isCommitEvent: (event) => event.type === 'content_block_start',
+      onCommit: () => commits++,
+      onEvent: (line) => lines.push(line),
+    })
+
+    assert.equal(commits, 1)
+    assert.equal(received.committed, true)
+    assert.equal(received.body.type, 'message')
+    assert.equal(received.body.stop_reason, 'max_tokens')
+    assert.deepEqual(received.body.usage, USAGE)
+    const events = eventsFrom(lines)
+    assert.ok(!events.some((event) => event.type === 'error'))
+    assert.equal(events.filter((event) => event.type === 'content_block_stop' && event.index === 0).length, 1)
+    assert.equal(events.at(-2).type, 'message_delta')
+    assert.equal(events.at(-2).delta.stop_reason, 'max_tokens')
+    assert.equal(events.at(-1).type, 'message_stop')
+  }
+})
+
+test('realtime native handoff still fails committed tool_use on refusal stop', async () => {
+  const result = summary({ stop_reason: 'refusal' })
+  const sse = start(result) + toolFrames(0, 'toolu_refused') + resultFrame(result) + terminalFrames(result)
+  const response = Readable.from([Buffer.from(sse)])
+  response.headers = { 'content-type': 'text/event-stream' }
+  response.trailers = {}
+
+  const state = createNativeHandoffState({ nativeHandoff: true })
+  const lines = []
+  const received = await consumeNativeHandoffStream(response, {
+    state,
+    deliveryMode: 'realtime',
+    isCommitEvent: (event) => event.type === 'content_block_start',
+    onEvent: (line) => lines.push(line),
+  })
+  assert.equal(received.body.type, 'error')
+  assert.equal(received.body.error.code, 'native_handoff_conflict')
+  assert.ok(eventsFrom(lines).some((event) => event.type === 'error'))
+})
+
+test('multi-chunk signature_delta appends instead of overwriting', () => {
+  const assembler = createClaudeMessageAssembler()
+  const lines = [
+    'data: {"type":"message_start","message":{"id":"msg_sig","model":"claude-opus-5","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}',
+    'data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}',
+    'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"abc"}}',
+    'data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"part1-"}}',
+    'data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"part2"}}',
+    'data: {"type":"content_block_stop","index":0}',
+  ]
+  for (const line of lines) applyClaudeSSELineToMessage(line, assembler)
+  assert.equal(assembler.message.content[0].signature, 'part1-part2')
+
+  const respState = createResponsesStreamState('claude-opus-5', 'vm-test', [])
+  for (const line of lines) claudeSSELineToResponsesEvents(line, respState)
+  const encoded = respState.output[0].encrypted_content.replace(/^anthropic-thinking-v1:/, '')
+  assert.equal(JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')).signature, 'part1-part2')
+})
+
+unixTest(
+  '#1845: protocol handler persists hop_request_id, providerResult correlation IDs, #1705 error_details, and writeHead headers',
+  async (t) => {
+    const providerSuccess = summary({
+      schema_version: 2,
+      provider_complete: true,
+      handoff_complete: true,
+      delivery_complete: true,
+      response_valid: true,
+      source: 'provider_http',
+      http_status: 200,
+      public_status: 200,
+      stop_reason: 'end_turn',
+      run_id: 'run_1845_ok',
+      turn_id: 'turn_1845_ok',
+      attempt_id: 2,
+      request_id: 'req_anthropic_ok',
+    })
+    const provider409 = {
+      type: 'kin_provider_result',
+      schema_version: 2,
+      provider_complete: false,
+      usage_complete: false,
+      source: 'crag',
+      http_status: 409,
+      public_status: 409,
+      run_id: 'run_1845_409',
+      turn_id: 'turn_1845_409',
+      attempt_id: 3,
+      request_id: 'req_anthropic_409',
+      error: {
+        type: 'partial_provider_output_nonretryable',
+        message: 'Provider output for this continuation was interrupted and cannot be replayed immediately.',
+        details: {
+          retryable: true,
+          prior_reason: 'client_cancelled',
+          interrupted_at: 1795495209,
+          retry_after_sec: 20,
+          recovery_attempts: 1,
+          max_recoveries: 2,
+          recovery_exhausted: false,
+          internal_secret: 'sk-ant-oat01-must-not-leak',
+        },
+      },
+    }
+
+    let mode = 'ok'
+    const fx = await fixture(
+      async (_req, res) => {
+        if (mode === '409') {
+          res.writeHead(409, {
+            'content-type': 'application/json',
+            'x-kin-provider-result': JSON.stringify(provider409),
+            'retry-after': '20',
+          })
+          res.end(JSON.stringify({ type: 'error', error: provider409.error, _kin_provider_result: provider409 }))
+          return
+        }
+        res.writeHead(200, {
+          'content-type': 'text/event-stream',
+          trailer: 'x-kin-provider-result',
+        })
+        res.write(
+          start(providerSuccess) +
+            textFrames(0, 'done') +
+            resultFrame(providerSuccess) +
+            terminalFrames(providerSuccess),
+        )
+        res.addTrailers({ 'x-kin-provider-result': JSON.stringify(providerSuccess) })
+        res.end()
+      },
+      { capabilities: ['native_handoff_v1', 'provider_result_v2'] },
+    )
+    t.after(() => fx.close())
+
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-nh-1845-'))
+    const logStore = new RequestLogStore({ dataDir, mode: 'debug' })
+    const attemptsRepo = new RequestAttemptsRepo(logStore.db)
+    t.after(() => {
+      logStore.db.close()
+      fs.rmSync(dataDir, { recursive: true, force: true })
+    })
+
+    const runner = new FailoverRunner({
+      attemptsRepo,
+      scheduler: {
+        async selectAndReserve() {
+          return {
+            ok: true,
+            vmId: 'vm-11',
+            accountId: 'acc-11',
+            vm: { id: 'vm-11' },
+            selectionReason: 'sticky',
+            release() {},
+          }
+        },
+        markSuccess() {},
+        markCooldown() {},
+      },
+    })
+
+    const cfg = {
+      rewrite: { enabled: false },
+      intercept: { rules: [] },
+      distill: { enabled: false },
+      limits: { max_body_bytes: 1024 * 1024, upstream_timeout_ms: 2000 },
+      paths: { project: dataDir, data: dataDir },
+    }
+    const routing = { failover: { stream_keepalive_ms: 0 } }
+    const handler = createHandleProtocol({
+      ...createRespond(cfg),
+      readBody,
+      cfg,
+      requireAuth: () => true,
+      requestLog: logStore,
+      stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },
+      groupsRepo: { rateMultiplier: () => 1 },
+      routingConfigPath: path.join(dataDir, 'routing.json'),
+      routingConfig: routing,
+      getRoutingConfig: () => routing,
+      stickyRouter: { extractPoolKey: () => null, collectPoolKeys: () => [] },
+      apiKeyStore: {},
+      accountQuota: { ingestHeaders() {} },
+      failoverRunner: {
+        run(opts) {
+          return runner.run({
+            ...opts,
+            applyAttempt: null,
+            callAttempt: ({ body, signal, onCommit }) =>
+              streamGoWorker(
+                options(fx, {
+                  envelope: { body, headers: {}, stream: true },
+                  gatewayRequestId: opts.requestId,
+                  signal,
+                  onCommit,
+                }),
+              ),
+          })
+        },
+      },
+    })
+
+    const gateway = http.createServer((req, res) => {
+      req.apiKeyKind = 'master'
+      handler.handleProtocol(req, res, 'anthropic.messages', req.url).catch((error) => {
+        if (!res.headersSent) res.writeHead(500)
+        res.end(String(error.stack))
+      })
+    })
+    await new Promise((resolve) => gateway.listen(0, '127.0.0.1', resolve))
+    t.after(async () => {
+      gateway.closeAllConnections()
+      await new Promise((resolve) => gateway.close(resolve))
+    })
+
+    const base = `http://127.0.0.1:${gateway.address().port}`
+    const okResp = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-request-id': 'gw-1845-ok' },
+      body: JSON.stringify({
+        model: MODEL,
+        stream: false,
+        max_tokens: 128,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    })
+    assert.equal(okResp.status, 200)
+    const gatewayOk = okResp.headers.get('x-request-id')
+    assert.ok(gatewayOk && gatewayOk !== 'gw-1845-ok')
+    await okResp.json()
+
+    mode = '409'
+    const errResp = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-request-id': 'gw-1845-409' },
+      body: JSON.stringify({
+        model: MODEL,
+        stream: false,
+        max_tokens: 128,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    })
+    assert.equal(errResp.status, 409)
+    const gateway409 = errResp.headers.get('x-request-id')
+    assert.ok(gateway409 && gateway409 !== 'gw-1845-409')
+    assert.notEqual(gatewayOk, gateway409)
+    assert.equal(errResp.headers.get('x-should-retry'), 'false')
+    await errResp.json()
+    await new Promise((resolve) => setImmediate(resolve))
+
+    assert.equal(fx.requests.length, 2)
+    assert.equal(fx.requests[0].headers['x-gateway-request-id'], gatewayOk)
+    assert.equal(fx.requests[1].headers['x-gateway-request-id'], gateway409)
+    const hopIdOk = fx.requests[0].envelope.request_id
+    const hopId409 = fx.requests[1].envelope.request_id
+    assert.ok(hopIdOk && hopId409 && hopIdOk !== hopId409)
+
+    // Debug hop_meta + response headers verification
+    const dbgOk = logStore.getDebug(gatewayOk)
+    assert.equal(dbgOk.hop_meta.hop_request_id, hopIdOk)
+    assert.equal(dbgOk.hop_meta.native_handoff.hop_request_id, hopIdOk)
+    assert.equal(dbgOk.hop_meta.native_handoff.run_id, 'run_1845_ok')
+    assert.equal(dbgOk.hop_meta.native_handoff.turn_id, 'turn_1845_ok')
+    assert.equal(dbgOk.hop_meta.native_handoff.attempt_id, 2)
+    assert.equal(dbgOk.hop_meta.native_handoff.request_id, 'req_anthropic_ok')
+
+    const dbg409 = logStore.getDebug(gateway409)
+    assert.equal(dbg409.response.headers['x-request-id'], gateway409)
+    assert.equal(dbg409.response.headers['x-should-retry'], 'false')
+    assert.equal(dbg409.hop_meta.hop_request_id, hopId409)
+    assert.equal(dbg409.hop_meta.native_handoff.run_id, 'run_1845_409')
+    assert.equal(dbg409.hop_meta.native_handoff.turn_id, 'turn_1845_409')
+    assert.equal(dbg409.hop_meta.native_handoff.attempt_id, 3)
+    assert.equal(dbg409.hop_meta.native_handoff.request_id, 'req_anthropic_409')
+
+    // Normal usage_logs + request_attempts + UsageLogsView verification
+    const view = new UsageLogsView(logStore.db)
+    const rowOk = view.listBatch({ request_id: gatewayOk }).logs[0]
+    assert.equal(rowOk.providerChain.length, 1)
+    assert.equal(rowOk.providerChain[0].hopRequestId, hopIdOk)
+    assert.equal(rowOk.providerChain[0].providerRunId, 'run_1845_ok')
+    assert.equal(rowOk.providerChain[0].providerTurnId, 'turn_1845_ok')
+    assert.equal(rowOk.providerChain[0].providerAttemptId, 2)
+    assert.equal(rowOk.providerChain[0].providerRequestId, 'req_anthropic_ok')
+
+    const row409 = view.listBatch({ request_id: gateway409 }).logs[0]
+    assert.equal(row409.statusCode, 409)
+    assert.equal(row409.errorCode, 'partial_provider_output_nonretryable')
+    assert.equal(row409.upstreamType, 'partial_provider_output_nonretryable')
+    assert.deepEqual(row409.errorDetails, {
+      upstream_type: 'partial_provider_output_nonretryable',
+      retryable: false,
+      prior_reason: 'client_cancelled',
+      interrupted_at: 1795495209,
+      retry_after_sec: 20,
+      recovery_attempts: 1,
+      max_recoveries: 2,
+      recovery_exhausted: false,
+    })
+    assert.equal(row409.providerChain.length, 1)
+    assert.equal(row409.providerChain[0].upstreamType, 'partial_provider_output_nonretryable')
+    assert.equal(row409.providerChain[0].errorDetails.prior_reason, 'client_cancelled')
+    assert.equal(row409.providerChain[0].hopRequestId, hopId409)
+    assert.equal(row409.providerChain[0].providerRunId, 'run_1845_409')
+    assert.equal(row409.providerChain[0].providerTurnId, 'turn_1845_409')
+    assert.equal(row409.providerChain[0].providerAttemptId, 3)
+    assert.equal(row409.providerChain[0].providerRequestId, 'req_anthropic_409')
+  },
+)

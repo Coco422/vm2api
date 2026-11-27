@@ -59,6 +59,7 @@ function addKeyUsage(into, row) {
 }
 
 /** settings key: ISO instant before which usage_logs rows may have been pruned. Monotonic. */
+export const DB_CREATED_AT_KEY = 'usage_logs_db_created_at'
 const PRUNED_THROUGH_KEY = 'usage_logs_pruned_through'
 const BILLING_STATS_CACHE_TTL_MS = 10_000
 const BILLING_BACKFILL_INTERVAL_MS = 60_000
@@ -164,14 +165,34 @@ const SUMMARY_COLUMNS = [
   'image_input_tokens',
   'image_output_tokens',
   'image_cost',
+  'advisor_usage',
+  'advisor_cost',
+  'upstream_type',
+  'error_details',
 ]
+
+function parseErrorDetails(value) {
+  if (value == null || value === '') return null
+  if (typeof value === 'object' && !Array.isArray(value)) return value
+  try {
+    const parsed = JSON.parse(String(value))
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null
+  } catch {
+    return null
+  }
+}
 
 function toRow(rec) {
   return SUMMARY_COLUMNS.map((c) => {
+    if (c === 'id') return rec.id ?? rec.request_id ?? globalThis.crypto.randomUUID()
     if (c === 'created_at') return rec.created_at ?? rec.ts ?? null
     if (c === 'ip_address') return rec.ip_address ?? rec.ip ?? null
     if (c === 'stream') return rec.stream ? 1 : 0
     if (c === 'has_tools') return rec.has_tools == null ? null : rec.has_tools ? 1 : 0
+    if (c === 'error_details' || c === 'advisor_usage') {
+      if (rec[c] == null || rec[c] === '') return null
+      return typeof rec[c] === 'string' ? rec[c] : JSON.stringify(rec[c])
+    }
     if (c === 'cache_creation_tokens' && rec[c] == null) return null
     if (
       c === 'input_tokens' ||
@@ -197,6 +218,8 @@ function fromRow(row) {
     ip: row.ip_address,
     stream: !!row.stream,
     has_tools: row.has_tools == null ? null : !!row.has_tools,
+    upstream_type: row.upstream_type ?? null,
+    error_details: parseErrorDetails(row.error_details),
   }
 }
 
@@ -370,6 +393,9 @@ export class UsageLogsRepo {
     this._vmOwner = db.prepare('SELECT owner_user_id FROM vms WHERE id = ?')
     this._listDebug = db.prepare('SELECT record_json FROM request_log_debug ORDER BY ts DESC LIMIT ?')
     this._getByRequestId = db.prepare('SELECT * FROM usage_logs WHERE request_id = ?')
+    this._addDurationByRequestId = db.prepare(
+      'UPDATE usage_logs SET duration_ms = COALESCE(duration_ms, 0) + ? WHERE request_id = ?',
+    )
     // OCTET_LENGTH counts encoded bytes and lets SQLite read TEXT size from metadata without loading each body.
     this._debugBytes = db.prepare('SELECT COALESCE(SUM(OCTET_LENGTH(record_json)), 0) AS n FROM request_log_debug')
     this._debugCount = db.prepare('SELECT COUNT(*) AS n FROM request_log_debug')
@@ -463,6 +489,38 @@ export class UsageLogsRepo {
 
   insertDebugIfAbsent(requestId, ts, record) {
     return this._insertDebugIfAbsent.run(requestId, ts || new Date().toISOString(), JSON.stringify(record)).changes > 0
+  }
+
+  /**
+   * Fold a zero-token local tool-continuation drain turn into its parent
+   * token-bearing request row (adding wall time and, in debug mode, appending
+   * a compact continuation record onto `hop_meta.tool_continuations`).
+   */
+  mergeToolContinuation(parentRequestId, { durationMs = 0, continuation = null } = {}) {
+    if (!parentRequestId) return false
+    const deltaMs = Number.isFinite(Number(durationMs)) && Number(durationMs) > 0 ? Math.trunc(Number(durationMs)) : 0
+    let updated = false
+    if (deltaMs > 0) {
+      updated = this._addDurationByRequestId.run(deltaMs, parentRequestId).changes > 0
+    }
+    if (continuation && typeof continuation === 'object') {
+      const dbgRow = this._getDebug.get(parentRequestId)
+      if (dbgRow?.record_json) {
+        try {
+          const rec = JSON.parse(dbgRow.record_json)
+          if (rec && typeof rec === 'object') {
+            if (deltaMs > 0) rec.duration_ms = (Number(rec.duration_ms) || 0) + deltaMs
+            const hopMeta = rec.hop_meta && typeof rec.hop_meta === 'object' ? rec.hop_meta : {}
+            const list = Array.isArray(hopMeta.tool_continuations) ? [...hopMeta.tool_continuations] : []
+            if (list.length < 64) list.push(continuation)
+            rec.hop_meta = { ...hopMeta, tool_continuations: list }
+            this._insertDebug.run(parentRequestId, rec.ts || new Date().toISOString(), JSON.stringify(rec))
+            updated = true
+          }
+        } catch {}
+      }
+    }
+    return updated
   }
 
   getDebug(requestId) {
@@ -580,9 +638,11 @@ export class UsageLogsRepo {
       params.push(new Date(until).toISOString())
     }
     if (q) {
-      where.push('(path LIKE ? OR error_code LIKE ? OR error_message LIKE ? OR request_id LIKE ?)')
-      const like = `%${String(q).slice(0, 100)}%`
-      params.push(like, like, like, like)
+      where.push(
+        '(LOWER(path) LIKE ? OR LOWER(error_code) LIKE ? OR LOWER(error_message) LIKE ? OR LOWER(request_id) LIKE ? OR LOWER(upstream_type) LIKE ?)',
+      )
+      const like = `%${String(q).slice(0, 100).toLowerCase()}%`
+      params.push(like, like, like, like, like)
     }
     const cond = where.length ? `WHERE ${where.join(' AND ')}` : ''
     const cap = Math.max(1, Math.min(5000, Number(maxLimit) || 500))
@@ -663,6 +723,13 @@ export class UsageLogsRepo {
   }
 
   _usageForPrice(row) {
+    let advisor_usage = null
+    if (row.advisor_usage) {
+      try {
+        const parsed = typeof row.advisor_usage === 'string' ? JSON.parse(row.advisor_usage) : row.advisor_usage
+        if (Array.isArray(parsed) && parsed.length) advisor_usage = parsed
+      } catch {}
+    }
     return {
       input_tokens: row.input_tokens,
       output_tokens: row.output_tokens,
@@ -673,6 +740,7 @@ export class UsageLogsRepo {
       web_search_requests: row.web_search_requests,
       service_tier: row.service_tier,
       speed: row.speed,
+      ...(advisor_usage ? { advisor_usage } : {}),
     }
   }
 
@@ -693,7 +761,7 @@ export class UsageLogsRepo {
       ? this.db.prepare(`
       UPDATE usage_logs
          SET input_cost = ?, output_cost = ?, cache_read_cost = ?,
-             cache_creation_cost = ?, web_search_cost = ?, image_cost = ?, total_cost = ?,
+             cache_creation_cost = ?, web_search_cost = ?, image_cost = ?, advisor_cost = ?, total_cost = ?,
              actual_cost = ?, pricing_model = ?, price_source = ?, price_version = ?,
              long_context = ?
        WHERE id = ?
@@ -701,7 +769,7 @@ export class UsageLogsRepo {
       : this.db.prepare(`
       UPDATE usage_logs
          SET input_cost = ?, output_cost = ?, cache_read_cost = ?,
-             cache_creation_cost = ?, web_search_cost = ?, image_cost = ?, total_cost = ?,
+             cache_creation_cost = ?, web_search_cost = ?, image_cost = ?, advisor_cost = ?, total_cost = ?,
              pricing_model = ?, price_source = ?, price_version = ?, long_context = ?
        WHERE id = ?
     `)
@@ -725,6 +793,7 @@ export class UsageLogsRepo {
           (r.cache_creation_cost ?? null) === (priced.cache_creation_cost ?? null) &&
           (r.web_search_cost ?? null) === (priced.web_search_cost ?? null) &&
           (r.image_cost ?? null) === (priced.image_cost ?? null) &&
+          (r.advisor_cost ?? null) === (priced.advisor_cost ?? null) &&
           (r.total_cost ?? null) === (priced.total_cost ?? null) &&
           (r.pricing_model ?? null) === (priced.pricing_model ?? null) &&
           (r.price_source ?? null) === (priced.price_source ?? null) &&
@@ -747,6 +816,7 @@ export class UsageLogsRepo {
             priced.cache_creation_cost ?? null,
             priced.web_search_cost ?? null,
             priced.image_cost ?? null,
+            priced.advisor_cost ?? null,
             priced.total_cost ?? null,
             actual,
             priced.pricing_model ?? UNPRICED_MODEL,
@@ -763,6 +833,7 @@ export class UsageLogsRepo {
             priced.cache_creation_cost ?? null,
             priced.web_search_cost ?? null,
             priced.image_cost ?? null,
+            priced.advisor_cost ?? null,
             priced.total_cost ?? null,
             priced.pricing_model ?? UNPRICED_MODEL,
             priced.price_source ?? null,
@@ -795,8 +866,9 @@ export class UsageLogsRepo {
              input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
              cache_creation_5m_tokens, cache_creation_1h_tokens, web_search_requests,
              rate_multiplier, service_tier, speed, protocol, image_model, image_usage,
-             input_cost, output_cost, cache_read_cost, cache_creation_cost, web_search_cost,
-             image_cost, total_cost, pricing_model, price_source, price_version, long_context
+             advisor_usage, input_cost, output_cost, cache_read_cost, cache_creation_cost,
+             web_search_cost, image_cost, advisor_cost, total_cost, pricing_model,
+             price_source, price_version, long_context
       FROM usage_logs
       WHERE pricing_model IS NULL
       LIMIT ?
@@ -808,6 +880,36 @@ export class UsageLogsRepo {
   /** Rewrite cost columns in [since, until]; never actual_cost / rate_multiplier. */
   repriceRange({ since, until } = {}) {
     const { cond, params } = timeCond(since, until)
+    const isPg = this.db?.engine === 'postgres'
+    if (isPg) {
+      const where = cond ? `${cond} AND id > ?` : 'WHERE id > ?'
+      const page = this.db.prepare(`
+        SELECT id, created_at, model, upstream_model, requested_model,
+               input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+               cache_creation_5m_tokens, cache_creation_1h_tokens, web_search_requests,
+               rate_multiplier, service_tier, speed, protocol, image_model, image_usage,
+               advisor_usage, input_cost, output_cost, cache_read_cost, cache_creation_cost,
+               web_search_cost, image_cost, advisor_cost, total_cost, pricing_model,
+               price_source, price_version, long_context
+        FROM usage_logs ${where}
+        ORDER BY id
+        LIMIT 2000
+      `)
+      const out = { rows: 0, changed: 0, still_unpriced: 0, delta_usd: 0 }
+      let after = ''
+      for (;;) {
+        const rows = page.all(...params, after)
+        if (!rows.length) break
+        const part = this._repriceRows(rows, { writeActualCost: false })
+        out.rows += part.rows
+        out.changed += part.changed
+        out.still_unpriced += part.still_unpriced
+        out.delta_usd += part.delta_usd
+        after = String(rows.at(-1).id)
+      }
+      out.delta_usd = Math.round(out.delta_usd * 1e8) / 1e8
+      return out
+    }
     const where = cond ? `${cond} AND rowid > ?` : 'WHERE rowid > ?'
     // Keyset pages keep a month-long range from loading every row at once.
     const page = this.db.prepare(`
@@ -815,8 +917,9 @@ export class UsageLogsRepo {
              input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
              cache_creation_5m_tokens, cache_creation_1h_tokens, web_search_requests,
              rate_multiplier, service_tier, speed, protocol, image_model, image_usage,
-             input_cost, output_cost, cache_read_cost, cache_creation_cost, web_search_cost,
-             image_cost, total_cost, pricing_model, price_source, price_version, long_context
+             advisor_usage, input_cost, output_cost, cache_read_cost, cache_creation_cost,
+             web_search_cost, image_cost, advisor_cost, total_cost, pricing_model,
+             price_source, price_version, long_context
       FROM usage_logs ${where}
       ORDER BY rowid
       LIMIT 2000
@@ -1198,7 +1301,7 @@ export class UsageLogsRepo {
     const block = `(
       COALESCE(error_code, '') = 'policy_blocked'
       OR COALESCE(via, '') IN ('hard-regex', 'jev', 'distill-detect', 'refusal-guard')
-      OR COALESCE(final_state, '') IN ('policy_blocked', 'distill_blocked', 'refusal_guard', 'refusal_similar', 'refusal_device')
+      OR COALESCE(final_state, '') IN ('policy_blocked', 'distill_blocked', 'refusal_guard', 'refusal_similar', 'refusal_device', 'refusal_session')
     )`
     const inference = `path IN ('/v1/messages', '/v1/responses', '/v1/chat/completions', '/v1/completions')`
     const row = this.db
@@ -1209,7 +1312,16 @@ export class UsageLogsRepo {
            SUM(CASE WHEN ${inference}
                      AND NOT ${block}
                      AND COALESCE(via, '') != 'warmup-intercept'
-                THEN 1 ELSE 0 END) AS passed
+                THEN 1 ELSE 0 END) AS passed,
+           SUM(CASE WHEN ${inference}
+                     AND NOT ${block}
+                     AND COALESCE(attempt_count, 0) > 0
+                     AND (
+                       COALESCE(error_code, '') IN ('content_filter_refusal', 'refusal_guard')
+                       OR COALESCE(stop_reason, '') = 'refusal'
+                       OR COALESCE(final_state, '') = 'content_filter'
+                     )
+                THEN 1 ELSE 0 END) AS upstream_refusals
          FROM usage_logs
          WHERE created_at >= ?`,
       )
@@ -1248,6 +1360,7 @@ export class UsageLogsRepo {
       total: Number(row?.total || 0),
       blocked: Number(row?.blocked || 0),
       passed: Number(row?.passed || 0),
+      upstreamRefusals: Number(row?.upstream_refusals || 0),
       keywords: collapseBlockKeywords(keywords),
       blocks: folded.blocks,
       passes: folded.passes,
@@ -1449,26 +1562,36 @@ export class UsageLogsRepo {
 
   /**
    * Earliest instant whose traffic is still fully in usage_logs: the later of the DB's
-   * creation (first migration) and the recorded prune boundary. Neither the oldest
-   * surviving row (a quiet hour looks like a gap) nor the current retain_days (raising
-   * it does not bring deleted rows back) can stand in for that boundary.
+   * creation (first migration, or preserved SQLite origin across PG migration) and the
+   * recorded prune boundary. Neither the oldest surviving row (a quiet hour looks like
+   * a gap) nor the current retain_days (raising it does not bring deleted rows back)
+   * can stand in for that boundary.
    */
   logCoverageStart() {
-    const created = Date.parse(
+    const origin = Date.parse(this._settingJson(DB_CREATED_AT_KEY) || '')
+    const schema = Date.parse(
       this.db.prepare("SELECT MIN(applied_at) AS t FROM schema_migrations WHERE version = '001'").get()?.t || '',
     )
+    let created = -Infinity
+    if (Number.isFinite(origin) && Number.isFinite(schema)) created = Math.min(origin, schema)
+    else if (Number.isFinite(origin)) created = origin
+    else if (Number.isFinite(schema)) created = schema
     const pruned = Date.parse(this._prunedThrough() || '')
-    const start = Math.max(Number.isFinite(created) ? created : -Infinity, Number.isFinite(pruned) ? pruned : -Infinity)
+    const start = Math.max(created, Number.isFinite(pruned) ? pruned : -Infinity)
     return Number.isFinite(start) ? new Date(start).toISOString() : null
   }
 
-  _prunedThrough() {
-    const row = this.db.prepare(`SELECT value FROM settings WHERE key = '${PRUNED_THROUGH_KEY}'`).get()
+  _settingJson(key) {
+    const row = this.db.prepare('SELECT value FROM settings WHERE key = ?').get(key)
     try {
       return row ? JSON.parse(row.value) : null
     } catch {
       return null
     }
+  }
+
+  _prunedThrough() {
+    return this._settingJson(PRUNED_THROUGH_KEY)
   }
 
   /**
@@ -1890,14 +2013,16 @@ export class UsageLogsRepo {
     const usage_logs = this._pruneUsage(cfg.usageCutoff)
     const debug_by_age = this._deleteOldDebug.run(cfg.debugCutoff).changes
     const debug_by_size = this.trimDebugToMaxBytes(cfg.maxBytes)
-    if (usage_logs + debug_by_age + debug_by_size > 0) {
+    if (this.db?.engine !== 'postgres') {
+      if (usage_logs + debug_by_age + debug_by_size > 0) {
+        try {
+          this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+        } catch {}
+      }
       try {
-        this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+        this.db.exec('PRAGMA optimize')
       } catch {}
     }
-    try {
-      this.db.exec('PRAGMA optimize')
-    } catch {}
     return {
       usage_logs,
       request_log_debug: debug_by_age + debug_by_size,

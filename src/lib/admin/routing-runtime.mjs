@@ -24,8 +24,9 @@ import { slotExec } from '../vm/slot-runtime.mjs'
 import { maxRequestBytes, streamIdleTimeoutMs } from '../core/config.mjs'
 
 import { accountTierKey, mergeTierMaps, normalizeTiers } from '../pool/quota-tiers.mjs'
+import { mergeBatchGroupConfig } from '../pool/batch-group.mjs'
 import { vmQuotaOverrideOf } from '../pool/vm-quota-override.mjs'
-import { PoolScheduler, normalizePoolRouting } from '../pool/pool-scheduler.mjs'
+import { PoolScheduler, normalizePoolRouting, validateQuotaRoutingPatch } from '../pool/pool-scheduler.mjs'
 import { FailoverRunner } from '../pool/failover-runner.mjs'
 import { unitCircuit } from '../pool/unit-circuit.mjs'
 import { RateLimitService } from '../pool/rate-limit-service.mjs'
@@ -37,7 +38,7 @@ import { normalizeUsageProbeConfig } from '../oauth/usage-probe-monitor.mjs'
 import { mergeNotifyConfig, validateNotifyRoutingPatch } from './notify.mjs'
 import { normalizeRedaction } from '../redaction/policy.mjs'
 import { ensureRedaction } from '../redaction/runtime.mjs'
-import { normalizeLoggingConfig } from './request-log.mjs'
+import { normalizeLoggingConfig, validateLoggingRoutingPatch } from './request-log.mjs'
 import { markVmRefreshError } from '../oauth/oauth-credentials.mjs'
 import { shouldMarkMissingRefresh } from '../pool/schedule-eligibility.mjs'
 import {
@@ -45,6 +46,8 @@ import {
   normalizeInferenceWebsocket,
   validateInferenceWebsocketPatch,
 } from '../protocol/codex-route.mjs'
+import { mergeGeminiRouting, normalizeGeminiRouting, validateGeminiRoutingPatch } from '../gemini/routing-config.mjs'
+import { callGeminiHost } from '../gemini/routes.mjs'
 import {
   validateOpenAIQuotaPatch,
   mergeOpenAIQuotaPolicy,
@@ -60,6 +63,7 @@ import { isCodexVm } from '../vm/vm-kind.mjs'
 import { syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
 import { wakeOpenAIWaiter } from '../pool/openai-account-runtime.mjs'
 import { normalizeVmConfig } from '../vm/machine-spec.mjs'
+import { normalizeCragZombieGuardConfig } from '../vm/crag-zombie-guard.mjs'
 import { applyNativeTelemetry } from '../vm/fleet-update.mjs'
 import {
   telemetryDefaultEnabled,
@@ -80,6 +84,7 @@ export function createRoutingRuntime(ctx) {
   }
   const getHealth = () => (typeof ctx.getHealthMonitor === 'function' ? ctx.getHealthMonitor() : ctx.healthMonitor)
   const getUsage = () => ctx.usageProbeMonitor
+  const getCragZombieGuard = () => ctx.cragZombieGuard
   const getNotify = () => ctx.notifyMonitor
   const setRuntimeRepo = (next) => {
     if (typeof ctx.setRuntimeRepo === 'function') ctx.setRuntimeRepo(next)
@@ -376,6 +381,7 @@ export function createRoutingRuntime(ctx) {
       ...prev,
       ...next,
       real: { ...(prev.real || {}), ...(next.real || {}) },
+      gemini: { ...(prev.gemini || {}), ...(next.gemini || {}) },
       match: { ...(prev.match || {}), ...(next.match || {}) },
     })
     getHealth()?.setConfig(routingConfig.health_probe)
@@ -389,6 +395,16 @@ export function createRoutingRuntime(ctx) {
       ...(body.usage_probe && typeof body.usage_probe === 'object' ? body.usage_probe : {}),
     })
     getUsage()?.setConfig(routingConfig.usage_probe)
+  }
+
+  function applyCragZombieGuardRoutingBody(body, previous = null) {
+    if (!body || typeof body !== 'object' || body.crag_zombie_guard == null) return
+    const routingConfig = getRouting()
+    routingConfig.crag_zombie_guard = normalizeCragZombieGuardConfig({
+      ...(previous && typeof previous === 'object' ? previous : {}),
+      ...(body.crag_zombie_guard && typeof body.crag_zombie_guard === 'object' ? body.crag_zombie_guard : {}),
+    })
+    getCragZombieGuard()?.setConfig(routingConfig.crag_zombie_guard)
   }
 
   function applyNotifyRoutingBody(body, previous = null) {
@@ -453,6 +469,7 @@ export function createRoutingRuntime(ctx) {
     const project = ctx.cfg.paths.project
     const applied = { updated: 0, queued: 0, skipped: 0, failed: [] }
     const optIn = defaultEnabled === true && prevDefaultEnabled !== true
+    let optedIn = 0
     for (const { id } of listVms(project)) {
       const vm = getVm(project, id)
       if (!vm || isCodexVm(vm)) continue
@@ -462,6 +479,7 @@ export function createRoutingRuntime(ctx) {
         fresh.seed_policy = { ...(fresh.seed_policy || {}), telemetry_disabled: false }
         fresh.updated_at = new Date().toISOString()
         atomicWriteJson(vmPath, fresh, { mode: 0o600 })
+        optedIn += 1
       }
       if (resolveKernelDataplane(vm, routingConfig) === 'crag' && !optIn && !disableNonessentialChanged) {
         applied.skipped += 1
@@ -488,6 +506,7 @@ export function createRoutingRuntime(ctx) {
         applied.failed.push(vm.id)
       }
     }
+    if (optIn) applied.opted_in = optedIn
     return applied
   }
 
@@ -496,17 +515,24 @@ export function createRoutingRuntime(ctx) {
     const hasCodexQuota = body?.codex && Object.prototype.hasOwnProperty.call(body.codex, 'quota')
     if (hasCodexQuota) validateOpenAIQuotaPatch(body.codex.quota)
     validateInferenceWebsocketPatch(body)
+    validateGeminiRoutingPatch(body)
+    validateQuotaRoutingPatch(body, getRouting()?.quota)
+    validateLoggingRoutingPatch(body, getRouting()?.logging)
     let nextRedaction = null
     if (body.redaction !== undefined) {
-      nextRedaction = normalizeRedaction(body.redaction)
-      if (nextRedaction.enabled) {
-        await ensureRedaction({ ...getRouting(), redaction: nextRedaction }, { projectRoot: ctx.cfg.paths.project })
+      nextRedaction = normalizeRedaction(body.redaction, { strict: true })
+      const effectiveRouting = {
+        ...getRouting(),
+        ...(body.failover ? { failover: { ...(getRouting()?.failover || {}), ...body.failover } } : {}),
+        redaction: nextRedaction,
       }
+      await ensureRedaction(effectiveRouting, { projectRoot: ctx.cfg.paths.project })
     }
     let routingConfig = getRouting()
     const prevOfficialCc = routingConfig.official_cc
     const prevHealthProbe = routingConfig.health_probe
     const prevUsageProbe = routingConfig.usage_probe
+    const prevCragZombieGuard = routingConfig.crag_zombie_guard
     const prevNotify = routingConfig.notify
     const prevTiers = routingConfig.tiers
     const prevIdleMs = streamIdleTimeoutMs(routingConfig)
@@ -520,6 +546,12 @@ export function createRoutingRuntime(ctx) {
     if (body.concurrency) routingConfig.concurrency = { ...(routingConfig.concurrency || {}), ...body.concurrency }
     if (body.pool) {
       routingConfig.pool = normalizePoolRouting({ ...(routingConfig.pool || {}), ...body.pool })
+    }
+    if (body.batch_group && typeof body.batch_group === 'object' && !Array.isArray(body.batch_group)) {
+      routingConfig.batch_group = mergeBatchGroupConfig({
+        ...(routingConfig.batch_group || {}),
+        ...body.batch_group,
+      })
     }
     if (body.failover) routingConfig.failover = { ...(routingConfig.failover || {}), ...body.failover }
     if (body.inference) {
@@ -553,6 +585,9 @@ export function createRoutingRuntime(ctx) {
       }
       routingConfig.codex = normalizeCodexRouting(nextCodex)
     }
+    if (body.gemini) {
+      routingConfig.gemini = mergeGeminiRouting(routingConfig.gemini, body.gemini)
+    }
     if (body.vm) {
       const prev = routingConfig.vm && typeof routingConfig.vm === 'object' ? routingConfig.vm : {}
       const next = { ...prev, ...body.vm }
@@ -577,6 +612,7 @@ export function createRoutingRuntime(ctx) {
     applyOfficialCcRoutingBody(body, prevOfficialCc)
     applyHealthProbeRoutingBody(body, prevHealthProbe)
     applyUsageProbeRoutingBody(body, prevUsageProbe)
+    applyCragZombieGuardRoutingBody(body, prevCragZombieGuard)
     applyNotifyRoutingBody(body, prevNotify)
     routingConfig.tiers = normalizeTiers(
       body.tiers ? mergeTierMaps(prevTiers, body.tiers) : prevTiers,
@@ -637,6 +673,23 @@ export function createRoutingRuntime(ctx) {
     if (body.pool) configureUnitCircuit(routingConfig)
     if (body.failover) ctx.failoverRunner?.reloadConfig?.(routingConfig.failover || {})
     const kernelReload = await reloadNeeded
+    let geminiSync = null
+    if (body.gemini) {
+      const hostCaller = ctx.callGeminiHost || callGeminiHost
+      try {
+        const res = await hostCaller('apply-policy', { policy: routingConfig.gemini })
+        geminiSync = {
+          ok: true,
+          shards_updated: Number(res?.shards_updated || 0),
+          shards_total: Number(res?.shards_total || 0),
+        }
+      } catch (error) {
+        geminiSync = {
+          ok: false,
+          code: error?.code || 'gemini_host_unavailable',
+        }
+      }
+    }
     try {
       return {
         concurrency: applyRoutingTierConcurrency(routingConfig.tiers),
@@ -648,6 +701,7 @@ export function createRoutingRuntime(ctx) {
         kernel_persona: kernelPersona,
         kernel_reload: kernelReload,
         telemetry_sync: telemetrySync,
+        gemini_sync: geminiSync,
       }
     } catch (err) {
       console.error(
@@ -662,6 +716,7 @@ export function createRoutingRuntime(ctx) {
         kernel_persona: kernelPersona,
         kernel_reload: kernelReload,
         telemetry_sync: telemetrySync,
+        gemini_sync: geminiSync,
       }
     }
   }
@@ -682,9 +737,11 @@ export function createRoutingRuntime(ctx) {
       const hasOpenAIQuota = Object.prototype.hasOwnProperty.call(doc.codex || {}, 'quota')
       doc.websocket = normalizeInferenceWebsocket(doc.websocket)
       doc.codex = normalizeCodexRouting(doc.codex)
+      doc.gemini = normalizeGeminiRouting(doc.gemini)
       doc.pool = normalizePoolRouting(doc.pool)
       doc.vm = normalizeVmConfig(doc.vm)
       if (!hasOpenAIQuota) migrateLegacyOpenAIPolicies(doc)
+      if (doc.batch_group != null) doc.batch_group = mergeBatchGroupConfig(doc.batch_group)
       if (doc.redaction != null) doc.redaction = normalizeRedaction(doc.redaction)
       return doc
     } catch (error) {

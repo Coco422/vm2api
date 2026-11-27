@@ -35,6 +35,8 @@ const empty = () => Object.fromEntries(COUNTS.map((name) => [name, 0]))
  * page cannot drift into two different verdicts for the same key.
  */
 function latestKeyStatus(last, key) {
+  if (key.paused_reason === 'auth') return 'paused'
+  if (key.paused_reason) return 'cooling'
   if (last?.http_status === 402) return 'insufficient_balance'
   if (last?.outcome === 'success') return 'normal'
   if (last?.http_status === 401 || last?.http_status === 403) return 'auth_error'
@@ -52,7 +54,7 @@ export class JevUsageRepo {
       `INSERT INTO jev_usage_events (${FIELDS.join(',')}) VALUES (${FIELDS.map(() => '?').join(',')})`,
     )
     this.sum = db.prepare(`INSERT INTO jev_usage_totals (period,${COUNTS.join(',')}) VALUES (?,?,?,?,?,?,?,?)
-      ON CONFLICT(period) DO UPDATE SET ${COUNTS.map((name) => `${name}=${name}+excluded.${name}`).join(',')}`)
+      ON CONFLICT(period) DO UPDATE SET ${COUNTS.map((name) => `${name}=jev_usage_totals.${name}+excluded.${name}`).join(',')}`)
   }
   record(event) {
     const amounts = [

@@ -1,4 +1,5 @@
 import type { GeminiEnvironment } from '@/features/import/gemini-environments'
+import type { PoolBriefRef } from './panel-pools'
 import type { WindowEstimate } from './panel-pricing'
 
 /**
@@ -130,7 +131,10 @@ export type CragTelemetryState = {
   state: 'launch_policy'
   enabled: boolean | null
   error: string | null
-  upload_confirmed: false
+  upload_confirmed: boolean
+  upload_supported?: boolean
+  last_upload_at?: string | null
+  last_error?: string | null
 }
 
 export type VmKernelHealth = {
@@ -265,6 +269,58 @@ export type SeatOccupant = {
 
 export type ScheduleState = 'on' | 'off' | 'unschedulable' | 'restricted'
 
+export type QuotaObservation = {
+  utilization: number | null
+  status: string | null
+  reset: string | null
+  sampled_at: string | null
+  stale: boolean
+}
+
+export type ActiveUsageRetentionReason =
+  | 'settle_window'
+  | 'inflight'
+  | 'newer_headers'
+  | 'reset_boundary'
+  | 'official_leftover_limit'
+
+export type ActiveUsageRetainedWindow = {
+  window: '5h' | '7d' | '7d_oi'
+  reason: ActiveUsageRetentionReason
+  official_utilization: number | null
+  retained_utilization: number | null
+  official_updated_at: string | null
+  header_sampled_at: string | null
+  settle_remaining_ms: number
+}
+
+export type ActiveUsageQueryResult = {
+  vm_id: string
+  source: string
+  probed_at?: string | null
+  five_hour?: {
+    utilization?: number | null
+    status?: string | null
+    resets_at?: string | null
+  } | null
+  seven_day?: {
+    utilization?: number | null
+    status?: string | null
+    resets_at?: string | null
+  } | null
+  seven_day_oi?: {
+    utilization?: number | null
+    status?: string | null
+    resets_at?: string | null
+  } | null
+  reconciled?: boolean
+  force_reconcile?: boolean
+  reconciled_windows?: Array<'5h' | '7d' | '7d_oi'>
+  retained_windows?: ActiveUsageRetainedWindow[]
+  can_force_reconcile?: boolean
+  settle_remaining_ms?: number
+}
+
 export type Vm = {
   id: string
   gemini?: GeminiEnvironment
@@ -335,10 +391,20 @@ export type Vm = {
     reason: string
     detail?: Record<string, unknown> | null
   } | null
-  /** Claude 单元熔断（Codex 为 null）。连续 5xx 达阈值后打开，到期只放 1 个探测。 */
+  /** Claude 单元熔断（Codex 为 null）。连续 400/403/5xx 达阈值后打开，到期只放 1 个探测。 */
   circuit?: VmCircuit | null
   cooldown_until?: number
   cooldown_reason?: string
+  /** Mutable stored quota state: official windows may be reconciled from headers. */
+  quota_observations?: {
+    official:
+      | ({ updated_at: string | null } & Record<
+          '5h' | '7d',
+          QuotaObservation | null
+        >)
+      | null
+    passive: Record<'5h' | '7d', QuotaObservation | null>
+  } | null
   utilization_5h?: number | null
   utilization_7d?: number | null
   utilization_7d_oi?: number
@@ -352,8 +418,11 @@ export type Vm = {
   codex_usage?: {
     windows?: Array<{
       id?: string
+      label?: string
       used_percent?: number | null
       reset_at?: string | null
+      reset_after_seconds?: number | null
+      window_minutes?: number | null
     }>
     quota?: {
       utilization_5h?: number | null
@@ -483,6 +552,8 @@ export type Vm = {
   schedule_level?: number
   /** 调度等级来源；缺失时按自动模式展示。 */
   schedule_level_mode?: 'auto' | 'manual'
+  /** 所属统一分组池列表（前端聚合或后端附带）。 */
+  pools?: PoolBriefRef[]
   /** 本槽工作时段；null / 缺省 = 24h 接单。窗口外不参与调度。 */
   active_hours?: VmActiveHours | null
   /** 工作时段实际使用的时区（自身钉住 → 槽位时区 → UTC）。 */

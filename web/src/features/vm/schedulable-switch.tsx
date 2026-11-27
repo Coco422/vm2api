@@ -11,6 +11,10 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+import {
+  GEMINI_INVENTORY_KEY,
+  geminiResource,
+} from '@/features/import/gemini-operations'
 import { dashboardQueryOptions } from '@/features/overview/queries'
 import { vmQueryOptions, vmsListQueryOptions } from '@/features/vm/queries'
 import { useVmPerms } from '@/features/vm/vm-perms'
@@ -38,6 +42,8 @@ export function vmSchedulableProps(vm: Vm) {
       : 'operator-off'
   return {
     vmId: vm.id,
+    isGemini: Boolean(vm.gemini),
+    disabled: vm.gemini?.auth_state === 'disabled',
     // 受限（含维护 / 代理暂停）仍是「开」：开关只表达操作员意图和不可调度。
     schedulable:
       scheduleState === 'restricted'
@@ -55,6 +61,8 @@ export function vmSchedulableProps(vm: Vm) {
 
 export function SchedulableSwitch({
   vmId,
+  isGemini = false,
+  disabled = false,
   schedulable,
   scheduleState,
   tenantState,
@@ -63,6 +71,8 @@ export function SchedulableSwitch({
   className,
 }: {
   vmId: string
+  isGemini?: boolean
+  disabled?: boolean
   schedulable: boolean
   scheduleState?: ScheduleState
   tenantState: TenantScheduleState
@@ -76,7 +86,7 @@ export function SchedulableSwitch({
   const canSchedule =
     perms.admin ||
     perms.dashboard ||
-    (perms.tenantSchedule && tenantState !== 'operator-off')
+    (perms.tenantSchedule && !isGemini && tenantState !== 'operator-off')
   const restricted = scheduleState === 'restricted'
   const [optimistic, setOptimistic] = useState<boolean | null>(null)
   const checked =
@@ -84,20 +94,38 @@ export function SchedulableSwitch({
     (perms.tenantSchedule ? tenantState === 'enabled' : schedulable)
   const mutation = useMutation({
     mutationFn: (next: boolean) =>
-      api(`/api/panel/vms/${encodeURIComponent(vmId)}/schedulable`, {
-        method: 'POST',
-        body: JSON.stringify({ schedulable: next }),
-      }),
+      api(
+        isGemini
+          ? `${geminiResource(vmId)}/schedulable`
+          : `/api/panel/vms/${encodeURIComponent(vmId)}/schedulable`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ schedulable: next }),
+        }
+      ),
     onMutate: (next) => setOptimistic(next),
     onSuccess: async (_data, next) => {
       if (perms.tenantSchedule)
         toast.success(next ? '已解除暂停' : '已暂停调度')
       else toast.success(next ? '已开启调度' : '已关闭调度')
-      await Promise.all([
-        qc.invalidateQueries({ queryKey: vmsListQueryOptions().queryKey }),
-        qc.invalidateQueries({ queryKey: dashboardQueryOptions().queryKey }),
-        qc.invalidateQueries({ queryKey: vmQueryOptions(vmId).queryKey }),
-      ])
+      await Promise.all(
+        isGemini
+          ? [
+              qc.invalidateQueries({ queryKey: GEMINI_INVENTORY_KEY }),
+              qc.invalidateQueries({
+                queryKey: dashboardQueryOptions().queryKey,
+              }),
+            ]
+          : [
+              qc.invalidateQueries({
+                queryKey: vmsListQueryOptions().queryKey,
+              }),
+              qc.invalidateQueries({
+                queryKey: dashboardQueryOptions().queryKey,
+              }),
+              qc.invalidateQueries({ queryKey: vmQueryOptions(vmId).queryKey }),
+            ]
+      )
     },
     onError: (error: Error) => {
       setOptimistic(null)
@@ -118,13 +146,15 @@ export function SchedulableSwitch({
         : checked
           ? '点击关闭调度'
           : '点击开启调度'
-  const tooltip = perms.tenantSchedule
-    ? tenantState === 'operator-off'
-      ? '管理员已关闭调度'
-      : checked
-        ? '暂停此 VM 的调度'
-        : '解除此 VM 的调度暂停'
-    : operatorTooltip
+  const tooltip = disabled
+    ? '环境已停用，请先在详情中重新授权'
+    : perms.tenantSchedule && !isGemini
+      ? tenantState === 'operator-off'
+        ? '管理员已关闭调度'
+        : checked
+          ? '暂停此 VM 的调度'
+          : '解除此 VM 的调度暂停'
+      : operatorTooltip
 
   return (
     <Tooltip>
@@ -136,7 +166,7 @@ export function SchedulableSwitch({
         >
           <Switch
             checked={checked}
-            disabled={!canSchedule || mutation.isPending}
+            disabled={disabled || !canSchedule || mutation.isPending}
             onCheckedChange={(next) => mutation.mutate(next)}
             aria-label={tooltip}
           />

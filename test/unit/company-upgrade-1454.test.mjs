@@ -47,9 +47,28 @@ test('1.4.038 schema upgrades without rewriting users, keys, VM identity or hist
             delete value.allowed_models
             assert.equal(value.api_endpoint_id, null)
             delete value.api_endpoint_id
+            for (const [column, expected] of Object.entries({
+              permission_tier: 'platform',
+              owner_id: null,
+              allowed_endpoints: '[]',
+              allowed_gemini_envs: '[]',
+              default_pool_id: null,
+              pool_binding_mode: 'legacy_scope',
+            })) {
+              assert.equal(value[column], expected, column)
+              delete value[column]
+            }
           }
           if (table === 'usage_logs') {
-            for (const added of ['usage_account_id', 'upstream_status', 'upstream_400_message']) {
+            for (const added of [
+              'usage_account_id',
+              'upstream_status',
+              'upstream_400_message',
+              'upstream_type',
+              'error_details',
+              'advisor_usage',
+              'advisor_cost',
+            ]) {
               assert.equal(value[added], null)
               delete value[added]
             }

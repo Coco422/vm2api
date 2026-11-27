@@ -34,6 +34,8 @@ export function tenantKeyCreateInput({ body, ownerId, store, vms, defaultConcurr
   return {
     ...input,
     category: 'oauth',
+    permission_tier: 'resource',
+    owner_id: ownerId,
     user_id: ownerId,
     group_id: 1,
     // An administrator's explicit user grant overrides the new-key default.
@@ -41,6 +43,6 @@ export function tenantKeyCreateInput({ body, ownerId, store, vms, defaultConcurr
     max_concurrency:
       Number.isFinite(ownerCap) && ownerCap > 0 ? ownerCap : Number.isFinite(fallback) && fallback > 0 ? fallback : 12,
     group_type: groups.size === 1 ? [...groups][0] : 'all',
-    allowed_vms: groups.size === 1 ? owned.map((vm) => vm.id) : [],
+    allowed_vms: owned.map((vm) => vm.id),
   }
 }

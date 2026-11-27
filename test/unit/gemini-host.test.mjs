@@ -20,6 +20,7 @@ import {
   isGeminiPublicPath,
   isGeminiSharedPath,
   officialGeminiAuthUrl,
+  warmGeminiEnvironments,
 } from '../../src/lib/gemini/routes.mjs'
 
 const root = '/api/panel/gemini'
@@ -306,6 +307,24 @@ test('Gemini host inference evidence follows admitted runs and their bindings', 
   })
 })
 
+test('Gemini host auto-provisions models, plan, onboarding, and token refresh', { timeout: 15_000 }, () => {
+  execFileSync('python3', ['-B', fileURLToPath(new URL('./gemini-account-and-auto-provision.py', import.meta.url))], {
+    stdio: 'pipe',
+    timeout: 12_000,
+  })
+})
+
+// The default-payload fetcher used to hardcode the release version alongside the
+// manifest pin, and the two drifted for three releases (#1677). Driven from here
+// because `test:ci`'s standing set is 13 keywords that do not include this file:
+// CI picks it up as a modified test, the same way every non-core test here runs.
+test('the default Gemini payload fetcher derives its release from the manifest pin', { timeout: 15_000 }, () => {
+  execFileSync('python3', ['-B', fileURLToPath(new URL('./fetch-default-gemini-pins.py', import.meta.url))], {
+    stdio: 'pipe',
+    timeout: 12_000,
+  })
+})
+
 test('Gemini payload redemption is admin-only and rejects malformed codes before host dispatch', async () => {
   const route = `${root}/payload/redeem`
   assert.equal(authorizePanelRoute('POST', route, 'user').ok, false)
@@ -395,6 +414,9 @@ test('only explicit platform SOCKS5 environments are created and credentials sta
   assert.deepEqual(result.body.data, {
     ...record,
     auth_method: 'oauth',
+    schedulable: true,
+    schedule_level: 5,
+    schedule_level_mode: 'auto',
     kernel_version: null,
     account: null,
     created_at: null,
@@ -407,21 +429,46 @@ test('only explicit platform SOCKS5 environments are created and credentials sta
     { ...bound, enabled: false },
     { ...bound, owner_user_id: 'tenant' },
     { ...bound, status: 'dead' },
+    { ...bound, status: 'fail', consecutive_failures: 1, last_error: 'timeout' },
   ]) {
     const blocked = setup(() => assert.fail('unavailable proxy must not reach the host'), proxy)
     assert.equal((await blocked('POST', `${root}/environments`, create)).status, 409)
   }
 })
 
-test('only a probe may use its currently bound enabled proxy with failed health', async () => {
-  for (const status of ['fail', 'dead']) {
+test('Gemini routes mirror pool policy: fail stays schedulable, dead is unavailable except probe', async () => {
+  {
     const operations = []
     const run = setup(
       (operation, payload) => {
         operations.push([operation, payload])
         return operation === 'get' ? record : { ok: false, latency_ms: 14, code: 'private', detail: proxyUrl }
       },
-      { ...bound, status },
+      { ...bound, status: 'fail' },
+    )
+    const probe = await run('POST', `${environmentPath}/proxy/probe`, { proxy_id: 'untrusted', proxy_url: 'untrusted' })
+    assert.deepEqual(probe, {
+      status: 200,
+      body: { ok: true, data: { ok: false, latency_ms: 14, code: 'gemini_proxy_probe_failed' } },
+    })
+    const allowed = await run('POST', `${environmentPath}/test-chat`, { model, prompt: 'ping' })
+    assert.notEqual(allowed.status, 409)
+    const rebindFail = await run('PUT', `${environmentPath}/proxy`, { proxy_id: bound.id })
+    assert.equal(rebindFail.status, 409)
+    assert.equal(rebindFail.body.error.code, 'gemini_proxy_unavailable')
+    assert.deepEqual(
+      operations.map(([operation]) => operation),
+      ['get', 'proxy-probe', 'get', 'test-chat', 'get'],
+    )
+  }
+  {
+    const operations = []
+    const run = setup(
+      (operation, payload) => {
+        operations.push([operation, payload])
+        return operation === 'get' ? record : { ok: false, latency_ms: 14, code: 'private', detail: proxyUrl }
+      },
+      { ...bound, status: 'dead' },
     )
     const probe = await run('POST', `${environmentPath}/proxy/probe`, { proxy_id: 'untrusted', proxy_url: 'untrusted' })
     assert.deepEqual(probe, {
@@ -628,6 +675,88 @@ test('OAuth account import redacts credentials and preserves the authorization b
   assert.equal(accepted.body.data.account.email, 'verified@example.test')
   assert.equal(accepted.body.data.runtime_ready, false)
   assert.doesNotMatch(JSON.stringify(accepted.body), /fixture-access-never-returned/)
+
+  // CPA, sub2api, and bare refresh_token formats normalize to minimal whitelisted OAuth fields
+  // before reaching the host, and responses never leak tokens back to clients.
+  const forwarded = []
+  const capture = setup((operation, payload) => {
+    forwarded.push({ operation, payload })
+    return {
+      ...record,
+      auth_state: 'authorized',
+      auth_method: 'oauth',
+      account: {
+        state: 'ok',
+        email: 'converted@example.test',
+        refresh_token: payload.oauth_account?.refresh_token,
+      },
+    }
+  })
+
+  const bareRtResp = await capture('POST', endpoint, {
+    name: 'rt-only',
+    proxy_id: record.proxy_id,
+    oauth_account: [{ email: 'rt@example.test', refresh_token: '1//06FixtureRtOnly_abc123' }],
+  })
+  assert.equal(bareRtResp.status, 200)
+  assert.deepEqual(forwarded.at(-1).payload.oauth_account, {
+    refresh_token: '1//06FixtureRtOnly_abc123',
+  })
+  assert.doesNotMatch(JSON.stringify(bareRtResp.body), /1\/\/06FixtureRtOnly_abc123/)
+
+  const cpaResp = await capture('POST', endpoint, {
+    name: 'cpa-ag',
+    proxy_id: record.proxy_id,
+    oauth_account: {
+      type: 'antigravity',
+      access_token: 'ya29.cpa-import-token',
+      refresh_token: '1//06cpa-import-refresh',
+      expired: '2030-01-01T00:00:00Z',
+    },
+  })
+  assert.equal(cpaResp.status, 200)
+  assert.deepEqual(forwarded.at(-1).payload.oauth_account, {
+    refresh_token: '1//06cpa-import-refresh',
+    access_token: 'ya29.cpa-import-token',
+    expiry_timestamp: 1893456000,
+  })
+
+  const sub2apiResp = await capture('POST', endpoint, {
+    name: 'sub2api-gem',
+    proxy_id: record.proxy_id,
+    oauth_account: {
+      exported_at: '2026-11-25T08:00:00Z',
+      proxies: [],
+      accounts: [
+        {
+          name: 'gem-1',
+          platform: 'gemini',
+          type: 'oauth',
+          credentials: {
+            access_token: 'ya29.sub2api-import-token',
+            expires_at: '1893456000',
+          },
+        },
+      ],
+    },
+  })
+  assert.equal(sub2apiResp.status, 200)
+  assert.deepEqual(forwarded.at(-1).payload.oauth_account, {
+    access_token: 'ya29.sub2api-import-token',
+    expiry_timestamp: 1893456000,
+  })
+
+  const wrongProvider = await invalid('POST', endpoint, {
+    name: 'claude-cpa',
+    proxy_id: record.proxy_id,
+    oauth_account: {
+      type: 'claude',
+      access_token: 'sk-ant-oat01-wrong-provider',
+      expired: '2030-01-01T00:00:00Z',
+    },
+  })
+  assert.equal(wrongProvider.status, 400)
+  assert.equal(wrongProvider.body.error.code, 'gemini_oauth_import_invalid')
 })
 
 test('Gemini panel exposes scoped quota windows without inventing missing fractions or exposing raw fields', async () => {
@@ -740,12 +869,25 @@ test('Gemini public routes schedule one plain-text turn and reject other keys', 
     },
   })
   const res = { setHeader() {}, once() {} }
-  for (const group_type of ['all', 'anthropic', 'openai']) {
+  for (const group_type of ['anthropic', 'openai']) {
     const denied = await handle({ apiKeyKind: 'managed', apiKeyRecord: { group_type }, once() {} }, res)
     assert.equal(denied.status, 403)
     assert.equal(denied.body.error.code, 'gemini_key_required')
   }
   assert.equal((await handle({ apiKeyKind: 'master', once() {} }, res)).status, 403)
+  const allBareClaude = await handle(
+    {
+      method: 'POST',
+      url: '/v1/messages',
+      apiKeyKind: 'managed',
+      apiKeyRecord: { group_type: 'all' },
+      body: { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: 'hello' }] },
+      once() {},
+    },
+    res,
+  )
+  assert.equal(allBareClaude.status, 404)
+  assert.equal(allBareClaude.body.error.code, 'gemini_model_unavailable')
   const listed = await handle(
     {
       method: 'GET',
@@ -967,7 +1109,7 @@ test('Gemini gateway uses shared account reservations and each selected environm
   assert.equal(pool.inflight.size, 0)
 })
 
-test('a selected Gemini location rejection stays HTTP 403 and releases the half-open probe', async () => {
+test('a selected Gemini location rejection stays HTTP 403 and counts toward the unit circuit', async () => {
   const account = {
     id: 'gemini-location',
     auth_state: 'authorized',
@@ -1016,7 +1158,12 @@ test('a selected Gemini location rejection stays HTTP 403 and releases the half-
   )
   assert.equal(result.status, 403)
   assert.equal(result.body.error.code, 'gemini_location_unsupported')
-  assert.deepEqual(pool.unitCircuit.inspect(accountId), { ok: true, state: 'half_open', probeAvailable: true })
+  assert.deepEqual(pool.unitCircuit.inspect(accountId), {
+    ok: false,
+    reason: 'circuit_open',
+    until: 3001,
+    state: 'open',
+  })
   assert.equal(pool.unitCircuit.snapshot(accountId).failures, 1)
   assert.equal(pool.inflight.size, 0)
 })
@@ -1481,10 +1628,7 @@ test('Gemini scheduler allows 10 concurrent slots on acc1 with strict per-accoun
       assert.equal(op, 'infer')
       assert.equal(payload.id, 'gemini-acc1')
       assert.equal(payload.proxy_id, 'px-1')
-      assert.equal(
-        payload.proxy_sha256,
-        createHash('sha256').update(proxyMap['px-1']).digest('hex'),
-      )
+      assert.equal(payload.proxy_sha256, createHash('sha256').update(proxyMap['px-1']).digest('hex'))
       inflightPayloads.push(payload)
       if (inflightPayloads.length === 10) resolveAll10()
       const gate = new Promise((resolve) => releases.push(resolve))
@@ -1515,4 +1659,340 @@ test('Gemini scheduler allows 10 concurrent slots on acc1 with strict per-accoun
   const results = await Promise.all(tasks)
   assert.equal(results.length, 10)
   assert.equal(pool.inflight.size, 0)
+})
+
+test('warmGeminiEnvironments proactively warms authorized licensed OAuth envs and skips ineligible ones', async () => {
+  const warmedCalls = []
+  const envReady = {
+    id: 'gemini-aaaaaaaaaaaaaaaaaaaaaaaa',
+    proxy_id: 'px-1',
+    auth_method: 'oauth',
+    auth_state: 'authorized',
+    runtime_ready: true,
+    models_discovered: true,
+    crag_license: { valid: true },
+  }
+  const envNeedModels = {
+    id: 'gemini-eeeeeeeeeeeeeeeeeeeeeeee',
+    proxy_id: 'px-1',
+    auth_method: 'oauth',
+    auth_state: 'authorized',
+    runtime_ready: true,
+    models_discovered: false,
+    crag_license: { valid: true },
+  }
+  const envCold = {
+    id: 'gemini-bbbbbbbbbbbbbbbbbbbbbbbb',
+    proxy_id: 'px-1',
+    auth_method: 'oauth',
+    auth_state: 'authorized',
+    runtime_ready: false,
+    crag_license: { valid: true },
+  }
+  const envUnlicensed = {
+    id: 'gemini-cccccccccccccccccccccccc',
+    proxy_id: 'px-1',
+    auth_method: 'oauth',
+    auth_state: 'authorized',
+    runtime_ready: false,
+    crag_license: { valid: false },
+  }
+  const envApiKey = {
+    id: 'gemini-dddddddddddddddddddddddd',
+    proxy_id: 'px-1',
+    auth_method: 'api_key',
+    auth_state: 'authorized',
+    runtime_ready: false,
+  }
+  const report = await warmGeminiEnvironments({
+    proxyPool: () => ({
+      snapshot: () => ({ proxies: [{ id: 'px-1', enabled: true, status: 'ok', owner_user_id: null }] }),
+      getProxyByIdWithAuth: (id) => (id === 'px-1' ? { url: proxyUrl } : null),
+    }),
+    callHost: async (op, payload) => {
+      if (op === 'list') {
+        return {
+          payload_state: 'installed',
+          payload_mode: 'crag_subscription',
+          environments: [envReady, envNeedModels, envCold, envUnlicensed, envApiKey],
+        }
+      }
+      warmedCalls.push([op, payload])
+      return payload.id === envNeedModels.id
+        ? { warmed: true, runtime_ready: true, warming: false }
+        : { warmed: false, runtime_ready: false, warming: true }
+    },
+  })
+  assert.deepEqual(report, { warmed: 2, warming: 1, skipped: 2 })
+  assert.equal(warmedCalls.length, 2)
+  assert.equal(warmedCalls[0][0], 'warm')
+  assert.equal(warmedCalls[0][1].id, envNeedModels.id)
+  assert.equal(warmedCalls[1][0], 'warm')
+  assert.equal(warmedCalls[1][1].id, envCold.id)
+  assert.equal(warmedCalls[1][1].proxy_id, 'px-1')
+  assert.equal(warmedCalls[1][1].proxy_url, proxyUrl)
+  assert.equal(warmedCalls[1][1].proxy_sha256, createHash('sha256').update(proxyUrl).digest('hex'))
+})
+test('a host error code the control plane knows survives, and only an unknown one collapses (#1622)', async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'gemini-authcode-'))
+  const socketPath = path.join(directory, 'control.sock')
+  const previous = process.env.KIN_GEMINI_HOST_SOCKET
+  process.env.KIN_GEMINI_HOST_SOCKET = socketPath
+  let code = 'gemini_authorization_unavailable'
+  const server = http.createServer(async (request, response) => {
+    for await (const chunk of request) void chunk
+    response.writeHead(503, { 'Content-Type': 'application/json' })
+    response.end(JSON.stringify({ code }))
+  })
+  t.after(async () => {
+    if (previous === undefined) delete process.env.KIN_GEMINI_HOST_SOCKET
+    else process.env.KIN_GEMINI_HOST_SOCKET = previous
+    await new Promise((resolve) => server.close(resolve))
+    await rm(directory, { recursive: true, force: true })
+  })
+  await new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(socketPath, resolve)
+  })
+
+  // The socket answered, so the host service is up and it is the authorization
+  // launch that failed. Reporting 'no host service' instead sent #1622 auditing
+  // the service and its socket while the real fault was on the egress path.
+  await assert.rejects(callGeminiHost('authorization', { id: record.id }), {
+    code: 'gemini_authorization_unavailable',
+    status: 503,
+  })
+
+  // The allow-list itself still holds: a code this version does not know stays
+  // collapsed rather than being forwarded to the panel unvetted.
+  code = 'gemini_not_a_real_code'
+  await assert.rejects(callGeminiHost('authorization', { id: record.id }), { code: 'gemini_host_unavailable' })
+})
+
+test('authorization failing stage survives allowlist and maps to stage-specific panel message (#1622)', async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'gemini-authstage-'))
+  const socketPath = path.join(directory, 'control.sock')
+  const previous = process.env.KIN_GEMINI_HOST_SOCKET
+  process.env.KIN_GEMINI_HOST_SOCKET = socketPath
+  let stage = 'proxy_probe'
+  const server = http.createServer(async (request, response) => {
+    for await (const chunk of request) void chunk
+    response.writeHead(503, { 'Content-Type': 'application/json' })
+    response.end(JSON.stringify({ code: 'gemini_authorization_unavailable', stage }))
+  })
+  t.after(async () => {
+    if (previous === undefined) delete process.env.KIN_GEMINI_HOST_SOCKET
+    else process.env.KIN_GEMINI_HOST_SOCKET = previous
+    await new Promise((resolve) => server.close(resolve))
+    await rm(directory, { recursive: true, force: true })
+  })
+  await new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(socketPath, resolve)
+  })
+
+  await assert.rejects(callGeminiHost('authorize', { id: record.id }), (err) => {
+    assert.equal(err.code, 'gemini_authorization_unavailable')
+    assert.equal(err.status, 503)
+    assert.equal(err.stage, 'proxy_probe')
+    return true
+  })
+
+  // Panel route formats allowlisted stage into stage-specific guidance + error.stage.
+  const panelStage = setup((op) => {
+    if (op === 'get') return record
+    if (op === 'authorize') {
+      throw Object.assign(new Error('gemini_authorization_unavailable'), {
+        code: 'gemini_authorization_unavailable',
+        status: 503,
+        stage: 'proxy_probe',
+      })
+    }
+    throw new Error(`unexpected ${op}`)
+  })
+  const resStage = await panelStage('POST', `/api/panel/gemini/environments/${record.id}/authorization`)
+  assert.equal(resStage.status, 503)
+  assert.equal(resStage.body.error.code, 'gemini_authorization_unavailable')
+  assert.equal(resStage.body.error.stage, 'proxy_probe')
+  assert.match(resStage.body.error.message, /隔离出口无法连通绑定代理/)
+
+  // Unknown stage values are dropped rather than forwarded unvetted.
+  stage = 'raw_secret_exception_text'
+  await assert.rejects(callGeminiHost('authorize', { id: record.id }), (err) => {
+    assert.equal(err.code, 'gemini_authorization_unavailable')
+    assert.equal(err.stage, undefined)
+    return true
+  })
+
+  // #1847 sandbox_denied / cli_early_exit stages and split sandbox error codes survive allowlist.
+  for (const [newStage, pattern] of [
+    ['sandbox_denied', /沙箱策略/],
+    ['cli_early_exit', /异常退出/],
+  ]) {
+    const panelNewStage = setup((op) => {
+      if (op === 'get') return record
+      if (op === 'authorize') {
+        throw Object.assign(new Error('gemini_authorization_unavailable'), {
+          code: 'gemini_authorization_unavailable',
+          status: 503,
+          stage: newStage,
+        })
+      }
+      throw new Error(`unexpected ${op}`)
+    })
+    const res = await panelNewStage('POST', `/api/panel/gemini/environments/${record.id}/authorization`)
+    assert.equal(res.status, 503)
+    assert.equal(res.body.error.code, 'gemini_authorization_unavailable')
+    assert.equal(res.body.error.stage, newStage)
+    assert.match(res.body.error.message, pattern)
+  }
+
+  for (const [sandboxCode, pattern] of [
+    ['gemini_sandbox_apparmor_restricted', /AppArmor/],
+    ['gemini_sandbox_unavailable', /bwrap/],
+  ]) {
+    const panelSandbox = setup((op) => {
+      if (op === 'list') {
+        return {
+          payload_state: 'installed',
+          oauth_runtime_issue: sandboxCode,
+          environments: [],
+        }
+      }
+      if (op === 'get') return record
+      if (op === 'authorize') {
+        throw Object.assign(new Error(sandboxCode), {
+          code: sandboxCode,
+          status: 503,
+          stage: 'sandbox_denied',
+        })
+      }
+      throw new Error(`unexpected ${op}`)
+    })
+    const listRes = await panelSandbox('GET', '/api/panel/gemini')
+    assert.equal(listRes.status, 200)
+    assert.equal(listRes.body.data.oauth_runtime_issue, sandboxCode)
+    const authRes = await panelSandbox('POST', `/api/panel/gemini/environments/${record.id}/authorization`)
+    assert.equal(authRes.status, 503)
+    assert.equal(authRes.body.error.code, sandboxCode)
+    assert.equal(authRes.body.error.stage, 'sandbox_denied')
+    assert.match(authRes.body.error.message, pattern)
+  }
+})
+
+test('synchronous host errors and polled test-chat runs report the same resident-pool copy for native worker/tty faults', async () => {
+  for (const code of ['gemini_native_worker_unavailable', 'gemini_native_tty_unavailable']) {
+    const run = setup((operation) => {
+      if (operation === 'get') {
+        return {
+          ...record,
+          auth_method: 'oauth',
+          auth_state: 'authorized',
+          models_discovered: true,
+          models: [model],
+        }
+      }
+      if (operation === 'test-chat') {
+        throw Object.assign(new Error(code), { code, status: 503 })
+      }
+      if (operation === 'test-chat-status') {
+        return { state: 'failed', text: '', error: { code } }
+      }
+      throw new Error(`unexpected ${operation}`)
+    })
+    const startRes = await run('POST', `${environmentPath}/test-chat`, { model, prompt: 'hello' })
+    const pollRes = await run('GET', `${environmentPath}/test-chat/${runId}`)
+    assert.equal(startRes.status, 503)
+    assert.equal(startRes.body.error.code, code)
+    assert.equal(pollRes.status, 200)
+    assert.equal(pollRes.body.data.error.code, code)
+    assert.equal(startRes.body.error.message, pollRes.body.data.error.message)
+  }
+})
+
+test('geminiProxyFor accepts HTTP and domain proxies, forwards egress_options when set, and maps 503 gemini_oauth_client_not_configured', async () => {
+  const { geminiProxyEgressOptionsFor, geminiProxyFor } = await import('../../src/lib/gemini/routes.mjs')
+  const makePool = (rows, urls) => ({
+    snapshot: () => ({ proxies: rows }),
+    getProxyByIdWithAuth: (id) => urls[id] || null,
+  })
+
+  const pool = makePool(
+    [
+      {
+        id: 'px-http',
+        enabled: true,
+        status: 'ok',
+        kind: 'http',
+        domain_forward: true,
+        dns_disable_svcb_https: true,
+        owner_user_id: null,
+      },
+      { id: 'px-dom', enabled: true, status: 'ok', kind: 'socks5', owner_user_id: null },
+      { id: 'px-http80', enabled: true, status: 'ok', kind: 'http', owner_user_id: null },
+      { id: 'px-local', enabled: true, status: 'ok', kind: 'http', owner_user_id: null },
+      { id: 'px-v6', enabled: true, status: 'ok', kind: 'socks5', owner_user_id: null },
+    ],
+    {
+      'px-http': { url: 'http://alice:pw@192.0.2.30:8080', domain_forward: true, dns_disable_svcb_https: true },
+      'px-dom': { url: 'socks5://u:p@proxy.example.com:1080' },
+      'px-http80': { url: 'http://proxy.example.com' },
+      'px-local': { url: 'http://localhost:8080' },
+      'px-v6': { url: 'socks5h://[2001:db8::1]:1080' },
+    },
+  )
+
+  assert.equal(geminiProxyFor(pool, 'px-http'), 'http://alice:pw@192.0.2.30:8080')
+  assert.equal(geminiProxyFor(pool, 'px-dom'), 'socks5h://u:p@proxy.example.com:1080')
+  assert.equal(geminiProxyFor(pool, 'px-http80'), 'http://proxy.example.com:80')
+  assert.throws(() => geminiProxyFor(pool, 'px-local'), { code: 'gemini_proxy_unavailable' })
+  assert.throws(() => geminiProxyFor(pool, 'px-v6'), { code: 'gemini_proxy_unavailable' })
+
+  assert.deepEqual(geminiProxyEgressOptionsFor(pool, 'px-http'), {
+    domain_forward: true,
+    dns_empty_types: [64, 65],
+  })
+  assert.equal(geminiProxyEgressOptionsFor(pool, 'px-dom'), null)
+
+  // Panel create forwards egress_options only when configured and maps 503 gemini_oauth_client_not_configured.
+  const calls = []
+  const response = { setHeader() {} }
+  const panel = createGeminiPanelHandler({
+    json: (_res, status, body) => ({ status, body }),
+    readBody: async (req) => req.body,
+    proxyPool: () => pool,
+    callHost: (op, payload) => {
+      calls.push([op, payload])
+      if (op === 'create' && payload.name === 'missing-oauth') {
+        throw Object.assign(new Error('gemini_oauth_client_not_configured'), {
+          code: 'gemini_oauth_client_not_configured',
+          status: 503,
+        })
+      }
+      return {
+        ...record,
+        proxy_id: payload.proxy_id,
+        account: { state: 'error', error_message: 'failed via http://alice:pw@192.0.2.30:8080' },
+      }
+    },
+  })
+  const runPanel = (method, pathname, body) => panel({ method, pathname, body }, response, pathname)
+
+  const okCreate = await runPanel('POST', '/api/panel/gemini/environments', {
+    name: 'http-env',
+    proxy_id: 'px-http',
+  })
+  assert.equal(okCreate.status, 200)
+  assert.deepEqual(calls[0][1].egress_options, { domain_forward: true, dns_empty_types: [64, 65] })
+  // HTTP proxy credentials in account error_message must be redacted.
+  assert.ok(!okCreate.body.data.account.error_message.includes('alice:pw'))
+  assert.ok(okCreate.body.data.account.error_message.includes('[redacted proxy URL]'))
+
+  const missingOAuth = await runPanel('POST', '/api/panel/gemini/environments', {
+    name: 'missing-oauth',
+    proxy_id: 'px-dom',
+  })
+  assert.equal(missingOAuth.status, 503)
+  assert.equal(missingOAuth.body.error.code, 'gemini_oauth_client_not_configured')
+  assert.equal('egress_options' in calls[1][1], false)
 })

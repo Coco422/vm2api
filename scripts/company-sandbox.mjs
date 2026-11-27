@@ -85,30 +85,36 @@ export async function startSandbox({ root, sandbox, record, port = 8791, install
   }
   const demoRecovery = path.join(project, 'vms', 'alice-recovery-vm.json')
   if (!fs.existsSync(demoRecovery))
-    fs.writeFileSync(demoRecovery, JSON.stringify({
-      id: 'alice-recovery-vm',
-      name: '内核故障可恢复示例',
-      owner_user_id: 'alice',
-      origin: 'admin_assigned',
-      platform: 'anthropic',
-      status: 'running',
-      schedulable: false,
-      unschedulable: { reason: 'runtime_start_failed' },
-      proxy: { id: 'fixture-proxy-alice-recovery-vm' },
-      claude: { mode: 'oauth', has_access: true, scope: 'user:profile user:inference', account_tier: 'pro' },
-    }))
+    fs.writeFileSync(
+      demoRecovery,
+      JSON.stringify({
+        id: 'alice-recovery-vm',
+        name: '内核故障可恢复示例',
+        owner_user_id: 'alice',
+        origin: 'admin_assigned',
+        platform: 'anthropic',
+        status: 'running',
+        schedulable: false,
+        unschedulable: { reason: 'runtime_start_failed' },
+        proxy: { id: 'fixture-proxy-alice-recovery-vm' },
+        claude: { mode: 'oauth', has_access: true, scope: 'user:profile user:inference', account_tier: 'pro' },
+      }),
+    )
   const recoveredVm = path.join(project, 'vms', 'alice-recovered-vm.json')
   if (!fs.existsSync(recoveredVm))
-    fs.writeFileSync(recoveredVm, JSON.stringify({
-      id: 'alice-recovered-vm',
-      name: '已自动恢复示例',
-      owner_user_id: 'alice',
-      origin: 'admin_assigned',
-      platform: 'anthropic',
-      status: 'running',
-      schedulable: true,
-      claude: { mode: 'oauth', has_access: true, scope: 'user:profile user:inference', account_tier: 'pro' },
-    }))
+    fs.writeFileSync(
+      recoveredVm,
+      JSON.stringify({
+        id: 'alice-recovered-vm',
+        name: '已自动恢复示例',
+        owner_user_id: 'alice',
+        origin: 'admin_assigned',
+        platform: 'anthropic',
+        status: 'running',
+        schedulable: true,
+        claude: { mode: 'oauth', has_access: true, scope: 'user:profile user:inference', account_tier: 'pro' },
+      }),
+    )
   for (const id of ['spare-vm-1', 'spare-vm-2']) {
     const file = path.join(project, 'vms', `${id}.json`)
     if (!fs.existsSync(file))

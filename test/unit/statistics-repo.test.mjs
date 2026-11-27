@@ -476,7 +476,10 @@ test('panel routes expose the global user leaderboard and keep private statistic
 
     db.prepare("INSERT INTO users (id, email, username, password_hash) VALUES ('legacy-id', 'legacy@x', '', 'x')").run()
     seed(db, [{ created_at: at, user_id: 'legacy-id', total_cost: 0.1 }])
-    const legacy = await call('user', '/api/panel/statistics/leaderboard?visibility=global&scope=user')
+    // The fixture inserted a row after the first cached read. Request a fresh ranking.
+    const legacy = await call('user', '/api/panel/statistics/leaderboard?visibility=global&scope=user&refresh=1')
+    assert.equal(legacy.status, 200)
+    assert.equal(legacy.body.data.entries.length, 3)
     assert.equal(legacy.body.data.entries.at(-1).name, '未知')
     assert.doesNotMatch(JSON.stringify(legacy.body), /legacy-id|legacy@x/)
   } finally {

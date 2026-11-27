@@ -10,6 +10,8 @@ import { Download, LifeBuoy, Link2, RefreshCw } from 'lucide-react'
 import { fmtAgo, fmtNum, fmtUsd } from '@/lib/format'
 import {
   geminiAccountStatus,
+  geminiEligibilityNotice,
+  geminiInferenceErrorAction,
   geminiInferenceErrorLabel,
 } from '@/lib/gemini-account-status'
 import { tierVisual } from '@/lib/tier-visual'
@@ -59,6 +61,10 @@ const TIER_VARS: Record<string, CSSProperties> = {
   codex: {
     '--tc': 'var(--tier-codex-solid)',
     '--tf': 'var(--tier-codex-fg)',
+  } as CSSProperties,
+  gemini: {
+    '--tc': 'var(--tier-gemini-solid)',
+    '--tf': 'var(--tier-gemini-fg)',
   } as CSSProperties,
 }
 
@@ -121,57 +127,97 @@ export function BladeControls({
       onClick={(e) => e.stopPropagation()}
       onKeyDown={(e) => e.stopPropagation()}
     >
-      {vm.gemini ? null : <SchedulableSwitch {...vmSchedulableProps(vm)} />}
+      <SchedulableSwitch {...vmSchedulableProps(vm)} />
       <VmActionMenu vm={vm} />
     </div>
   )
 }
 
-export function GeminiSlotStatus({ vm }: { vm: Vm }) {
+/**
+ * Gemini 槽位状态。表格行（`inline`）只占一行，与普通槽的调度列等高；
+ * 卡片里固定两行：总状态 + 模型/授权，最近推理或唯一一条警示。
+ * 完整证据放在悬停提示里，不再逐条铺开。
+ */
+export function GeminiSlotStatus({
+  vm,
+  inline = false,
+}: {
+  vm: Vm
+  inline?: boolean
+}) {
   const environment = vm.gemini
   if (!environment) return null
   const status = geminiAccountStatus(environment, vm.unschedulable_text)
   const { authorization, blocker, inference, lastInference, modelsLabel } =
     status
+  const notice = geminiEligibilityNotice(environment.account, lastInference)
+  const failed =
+    lastInference?.state === 'failed'
+      ? geminiInferenceErrorLabel(lastInference.error_code)
+      : null
+  const failureAction =
+    lastInference?.state === 'failed'
+      ? geminiInferenceErrorAction(lastInference.error_code)
+      : null
   const at = lastInference?.finished_at ?? lastInference?.started_at
-  const age = at ? fmtAgo(at) : ''
-  return (
-    <span className='grid min-w-0 gap-1 text-xs whitespace-normal text-muted-foreground'>
-      <span className='flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1'>
-        <StatusMark variant='pill' tone={authorization} />
-        <span>{modelsLabel}</span>
-      </span>
-      {blocker ? (
-        <span className='text-[color:var(--status-caution)]'>{blocker}</span>
-      ) : environment.auth_state === 'authorized' ? (
-        <span className='flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1'>
-          <span>候选条件已满足</span>
-          {status.tone.key === 'pending' ? (
-            <StatusMark variant='pill' tone={status.tone} />
-          ) : null}
-        </span>
-      ) : null}
+  const age = at ? fmtAgo(at) || at : ''
+  const run = lastInference
+    ? [lastInference.model, age].filter(Boolean).join(' · ')
+    : null
+  // 只露出一条警示：阻断型资格提示优先，其次最近一次失败原因；参考性核验链接不覆盖正常状态。
+  const blockingNotice = notice && !notice.advisory ? notice : null
+  const warn = blockingNotice?.label ?? failed
+  const aside = blocker ? authorization.text : modelsLabel
+  const title = [
+    status.tone.text,
+    authorization.text,
+    modelsLabel,
+    blocker ??
+      (environment.auth_state === 'authorized' ? '候选条件已满足' : null),
+    environment.schedulable === false ? '已手动关闭调度' : null,
+    environment.restriction?.text
+      ? `当前受限：${environment.restriction.text}`
+      : null,
+    notice ? `${notice.label}：${notice.action}` : null,
+    [inference.text, run, failed].filter(Boolean).join(' · '),
+    failureAction,
+    '仅显示最近一次宿主推理，不代表公共 API 端到端验证',
+  ]
+    .filter(Boolean)
+    .join('\n')
+  const note = (text: string, className?: string) => (
+    <span
+      className={cn(
+        'min-w-0 truncate',
+        warn && text === warn && 'text-[color:var(--status-caution)]',
+        className
+      )}
+    >
+      {text}
+    </span>
+  )
+  if (inline) {
+    return (
       <span
-        className='flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1'
-        title='仅显示最近一次宿主推理，不代表公共 API 端到端验证'
+        className='flex min-w-0 items-center gap-[7px] text-[11.5px] text-muted-foreground'
+        title={title}
       >
-        {lastInference ? (
-          <>
-            <StatusMark variant='pill' tone={inference} />
-            <span className='min-w-0 break-all'>{lastInference.model}</span>
-            {at ? (
-              <time dateTime={at} title={at}>
-                {age || at}
-              </time>
-            ) : null}
-            {lastInference.state === 'failed' ? (
-              <span>{geminiInferenceErrorLabel(lastInference.error_code)}</span>
-            ) : null}
-          </>
-        ) : (
-          <span>{inference.text}</span>
-        )}
+        <StatusMark tone={status.tone} className='font-semibold' />
+        {note(warn ?? run ?? aside)}
       </span>
+    )
+  }
+  return (
+    <span
+      className='grid min-w-0 gap-1 text-xs text-muted-foreground'
+      title={title}
+    >
+      {/* 放不下时整段换到被裁掉的第二行，窄卡只留状态，不截成半个字。 */}
+      <span className='flex h-[22px] min-w-0 flex-wrap items-center gap-x-2 overflow-hidden'>
+        <StatusMark variant='pill' tone={status.tone} />
+        {note(aside, 'shrink-0')}
+      </span>
+      {note(warn ?? run ?? inference.text)}
     </span>
   )
 }
@@ -318,6 +364,76 @@ export function BladeCallout({
   const actions = useVmActions()
   const perms = useVmPerms()
   const canCred = perms.credential
+  if (vm.gemini) {
+    const env = vm.gemini
+    const status = geminiAccountStatus(env, vm.unschedulable_text)
+    if (state === 'dead') {
+      const title = status.blocker || status.authorization.text
+      const needsModels =
+        env.auth_state === 'authorized' &&
+        (env.models_discovered !== true || !env.models.length)
+      return (
+        <Callout
+          tone='bad'
+          title={title}
+          action={
+            <CalloutAction
+              icon={needsModels ? <Download /> : <Link2 />}
+              onClick={() => actions.openDetail(vm)}
+            >
+              {env.auth_state === 'reauth_required'
+                ? '重新授权'
+                : needsModels
+                  ? '去拉取模型'
+                  : '管理环境'}
+            </CalloutAction>
+          }
+        >
+          {status.authorization.text !== title ? (
+            <span className='truncate font-mono text-[11.5px] opacity-90'>
+              {status.authorization.text}
+            </span>
+          ) : null}
+          {lifeLine(vm, accounts)}
+        </Callout>
+      )
+    }
+    if (state === 'vacant') {
+      return (
+        <Callout
+          tone='none'
+          title={status.authorization.text}
+          action={
+            <CalloutAction
+              icon={<Link2 />}
+              onClick={() => actions.openDetail(vm)}
+            >
+              {env.auth_method === 'api_key' ? '配置密钥' : '去授权'}
+            </CalloutAction>
+          }
+        >
+          <span>完成授权并拉取模型后即可参与调度。</span>
+        </Callout>
+      )
+    }
+    return (
+      <Callout
+        tone='caution'
+        title='额度未探测'
+        action={
+          <CalloutAction
+            icon={<RefreshCw />}
+            onClick={() => actions.refreshToken(vm)}
+          >
+            刷新并探测
+          </CalloutAction>
+        }
+      >
+        <span>未探测的槽不计入可用余量。</span>
+        {lifeLine(vm, accounts)}
+      </Callout>
+    )
+  }
   if (state === 'dead') {
     const failed = vmFailedAt(vm)
     const ago = failed ? fmtAgo(new Date(failed).toISOString()) : ''
@@ -416,10 +532,20 @@ function BladeUsage({
   accounts?: UsageAccountRow[]
   now: number
 }) {
+  const isGeminiApiKey = vm.gemini?.auth_method === 'api_key'
   return (
     <div className='@container grid min-w-0 content-start gap-1.5'>
       <div className='grid min-w-0 gap-x-3 gap-y-2 @min-[24rem]:grid-cols-[minmax(0,1fr)_auto]'>
-        <VmUsageWindows vm={vm} now={now} quiet />
+        {isGeminiApiKey ? (
+          <div className='grid min-w-0 content-center gap-1 text-xs text-muted-foreground'>
+            <span className='font-medium text-foreground'>
+              API Key 按量计费
+            </span>
+            <span>无 Antigravity 订阅窗口</span>
+          </div>
+        ) : (
+          <VmUsageWindows vm={vm} now={now} quiet />
+        )}
         <VmCostLedger
           vm={vm}
           accounts={accounts}
@@ -476,11 +602,15 @@ export const VmBlade = memo(function VmBlade({
       )}
       {...open}
     >
-      <div className='grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 gap-y-0.5'>
+      <div className='grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 gap-y-1'>
         <div className='col-span-2 min-w-0'>
           <VmAccountIdentity vm={vm} />
         </div>
-        {restricted && state !== 'dead' ? (
+        {vm.gemini ? (
+          <div className='col-span-2 min-w-0'>
+            <GeminiSlotStatus vm={vm} />
+          </div>
+        ) : restricted && state !== 'dead' ? (
           <StatusMark
             variant='pill'
             className='col-span-2 justify-self-start'
@@ -497,9 +627,7 @@ export const VmBlade = memo(function VmBlade({
         ) : null}
       </div>
       <ProxyChip vm={vm} className='min-w-0 justify-self-start' />
-      {vm.gemini ? (
-        <GeminiSlotStatus vm={vm} />
-      ) : state === 'live' ? (
+      {state === 'live' || (vm.gemini && state === 'unprobed') ? (
         <BladeUsage vm={vm} accounts={accounts} now={now} />
       ) : state === 'unprobed' ? (
         <div className='grid min-w-0 content-start gap-1.5'>

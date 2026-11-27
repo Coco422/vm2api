@@ -1,11 +1,20 @@
-export type KeyGroupType = 'all' | 'anthropic' | 'openai' | 'gemini' | 'pool'
+import type { PoolBindingMode } from '@/types/panel-pools'
+
+export type KeyGroupType = 'all' | 'anthropic' | 'openai' | 'gemini'
 
 export const KEY_ALLOWED_MODELS_MAX = 200
 
 export type KeyLimitsDraft = {
   name: string
-  category: 'oauth' | 'api'
+  category: 'oauth' | 'api' | 'all'
   api_endpoint_id?: string
+  permission_tier?: 'platform' | 'tenant' | 'resource'
+  owner_id?: string | null
+  allowed_endpoints?: string[]
+  allowed_gemini_envs?: string[]
+  pool_binding_mode?: PoolBindingMode
+  default_pool_id?: string
+  allowed_pool_ids?: string[]
   max_concurrency: number
   quota_requests: number
   quota_usd: number
@@ -13,6 +22,7 @@ export type KeyLimitsDraft = {
   expires_in_days: number
   group_type: KeyGroupType
   allowed_vms: string[]
+  /** 兼容旧单池字段别名；新表单优先读写 default_pool_id。 */
   vm_pool_id?: string
   /** 逗号、空格或换行分隔；留空不限。 */
   allowed_models: string
@@ -42,6 +52,11 @@ function groupTypeOf(value: string): KeyGroupType {
   return 'all'
 }
 
+function dedupeIds(list: string[] | undefined): string[] {
+  if (!Array.isArray(list)) return []
+  return [...new Set(list.map((id) => String(id || '').trim()).filter(Boolean))]
+}
+
 export function keyLimitsPayload(
   draft: KeyLimitsDraft,
   mode: 'create' | 'edit',
@@ -65,27 +80,73 @@ export function keyLimitsPayload(
     rpm: nonNegative(draft.rpm, 'RPM'),
   }
   const isApi = draft.category === 'api'
-  // API 直连不经过槽位，只有管理员可以设置
+  const allowsEndpoint = isApi || draft.category === 'all'
+  if (draft.permission_tier === 'tenant' || draft.owner_id?.trim()) {
+    throw new Error('仅可管理本人的密钥')
+  }
+
+  const poolBindingMode: PoolBindingMode =
+    isAdmin && draft.pool_binding_mode === 'strict_pool'
+      ? 'strict_pool'
+      : 'legacy_scope'
+  const hasPoolConfig =
+    isAdmin &&
+    (draft.pool_binding_mode !== undefined ||
+      draft.default_pool_id !== undefined ||
+      draft.allowed_pool_ids !== undefined ||
+      draft.vm_pool_id !== undefined)
+
+  // API 直连与混合模式只有管理员可以设置
   if (isAdmin) body.category = draft.category
-  if (isAdmin && isApi && draft.api_endpoint_id !== undefined) {
+
+  // 权限分层、多端点与多 Gemini 环境授权（仅管理员可配）
+  if (isAdmin && draft.permission_tier !== undefined) {
+    body.permission_tier = draft.permission_tier
+  }
+  if (isAdmin && draft.allowed_endpoints !== undefined) {
+    body.allowed_endpoints = dedupeIds(draft.allowed_endpoints)
+  }
+  if (isAdmin && draft.allowed_gemini_envs !== undefined) {
+    body.allowed_gemini_envs = dedupeIds(draft.allowed_gemini_envs)
+  }
+
+  if (
+    isAdmin &&
+    poolBindingMode !== 'strict_pool' &&
+    allowsEndpoint &&
+    draft.api_endpoint_id !== undefined
+  ) {
     const endpointId = draft.api_endpoint_id.trim()
-    if (mode === 'create' && !endpointId) throw new Error('请选择 API 渠道')
+    if (isApi && mode === 'create' && !endpointId)
+      throw new Error('请选择 API 渠道')
     body.api_endpoint_id = endpointId || null
   }
-  if (isAdmin && draft.group_type === 'pool') {
-    const vm_pool_id = String(draft.vm_pool_id || '').trim()
-    if (!vm_pool_id) throw new Error('选择一个账号池')
+
+  if (poolBindingMode === 'strict_pool') {
+    const rawDefault = String(
+      draft.default_pool_id ?? draft.vm_pool_id ?? ''
+    ).trim()
+    const allowed = dedupeIds(draft.allowed_pool_ids)
+    if (rawDefault && !allowed.includes(rawDefault)) allowed.unshift(rawDefault)
+    const effectiveDefault = rawDefault || allowed[0] || ''
+    if (!effectiveDefault) {
+      throw new Error('严格分组池模式下至少选择一个分组池')
+    }
+    body.pool_binding_mode = 'strict_pool'
+    body.default_pool_id = effectiveDefault
+    body.allowed_pool_ids = allowed
+    body.vm_pool_id = effectiveDefault
     body.group_type = 'all'
     body.allowed_vms = []
-    body.vm_pool_id = vm_pool_id
   } else {
     const group_type = groupTypeOf(draft.group_type)
     const allowed_vms =
       group_type === 'all' || group_type === 'gemini'
         ? []
-        : [...new Set(draft.allowed_vms.map((id) => id.trim()).filter(Boolean))]
+        : dedupeIds(draft.allowed_vms)
     if (
       !isApi &&
+      draft.category !== 'all' &&
       group_type !== 'all' &&
       group_type !== 'gemini' &&
       allowed_vms.length === 0
@@ -94,8 +155,20 @@ export function keyLimitsPayload(
     }
     body.group_type = group_type
     body.allowed_vms = allowed_vms
-    if (isAdmin && draft.vm_pool_id !== undefined) body.vm_pool_id = null
+    if (hasPoolConfig) {
+      const rawDefault = String(
+        draft.default_pool_id ?? draft.vm_pool_id ?? ''
+      ).trim()
+      const allowed = dedupeIds(draft.allowed_pool_ids)
+      if (rawDefault && !allowed.includes(rawDefault))
+        allowed.unshift(rawDefault)
+      body.pool_binding_mode = 'legacy_scope'
+      body.default_pool_id = rawDefault || null
+      body.allowed_pool_ids = allowed
+      body.vm_pool_id = rawDefault || null
+    }
   }
+
   const allowed_models = parseModelList(draft.allowed_models)
   if (allowed_models.length > KEY_ALLOWED_MODELS_MAX) {
     throw new Error(`允许的模型最多 ${KEY_ALLOWED_MODELS_MAX} 个`)

@@ -6,6 +6,7 @@ import {
   liftMidConversationSystemMessages,
   mergeConsecutiveAnthropicMessages,
   messageHasTurnControls,
+  stripEmptyEffort,
   stripIllegalContentFields,
   sanitizeAnthropicBody,
 } from './sanitize.mjs'
@@ -25,7 +26,12 @@ import {
   validateBetweenToolsThinking,
 } from './model-policy.mjs'
 import { ensureOutputConfigSchema, rectifyUnofficialRequest } from './request-rectifier.mjs'
-import { DEFAULT_CACHE_TTL, applyCacheBreakpoints, stripCacheScopeFields } from './cache-ttl.mjs'
+import {
+  DEFAULT_CACHE_TTL,
+  applyCacheBreakpoints,
+  repairCacheBreakpointsInPlace,
+  stripCacheScopeFields,
+} from './cache-ttl.mjs'
 import { normalizeImageContentBlocks } from './images.mjs'
 import { normalizeToolInputSchemas } from './tool-input-schema.mjs'
 
@@ -61,48 +67,12 @@ function cleanContent(content, { keepEmptyIdentity = false } = {}) {
     )
 }
 
-function cacheControlLocations(body) {
-  const locations = []
-  const add = (block, section, index) => {
-    if (block?.cache_control) locations.push({ block, section, index })
-  }
-  for (const [index, tool] of (body.tools || []).entries()) add(tool, 'tools', index)
-  for (const [index, block] of (Array.isArray(body.system) ? body.system : []).entries()) add(block, 'system', index)
-  for (const [messageIndex, message] of (body.messages || []).entries()) {
-    if (!Array.isArray(message?.content)) continue
-    for (const [blockIndex, block] of message.content.entries()) {
-      if (block?.cache_control)
-        locations.push({
-          block,
-          section: 'messages',
-          index: messageIndex,
-          blockIndex,
-        })
-    }
-  }
-  return locations
-}
-
 function normalizeCacheTTL(_body) {
   // Official 2.1.241 uses ephemeral 1h. Do not coerce 1h back to 5m.
 }
 
 export function enforceCacheLimit(body, maximum = 4) {
-  const locations = cacheControlLocations(body)
-  // Anthropic rejects the marker on a thinking block regardless of the budget.
-  for (const location of locations) {
-    if (location.block?.type === 'thinking') delete location.block.cache_control
-  }
-  const live = locations.filter((location) => location.block?.cache_control)
-  if (live.length <= maximum) return
-  // Keep the message anchors: they advance the cache prefix on every turn.
-  // Tools are the cheapest to sacrifice, while system breakpoints preserve the
-  // stable persona prefix shared by the whole session.
-  const bySection = (name) => live.filter((location) => location.section === name)
-  const order = [...bySection('tools').reverse(), ...bySection('system').reverse(), ...bySection('messages')]
-  for (const location of order.slice(0, live.length - maximum)) {
-    delete location.block.cache_control
-  }
+  repairCacheBreakpointsInPlace(body, { limit: maximum })
 }
 
 const CLEAR_THINKING_EDIT = Object.freeze({
@@ -251,6 +221,19 @@ export function alignSamplingWithThinking(body = {}, { drop = false } = {}) {
  * block without a usable signature (missing, empty, shorter than 24, dummy)
  * is dropped instead of forwarded with an empty signature.
  */
+function thinkingBlockDedupeKey(block) {
+  if (block?.type === 'thinking') {
+    const signature = typeof block.signature === 'string' ? block.signature.trim() : ''
+    if (!signature) return null
+    return `t\0${signature}\0${typeof block.thinking === 'string' ? block.thinking : ''}`
+  }
+  if (block?.type === 'redacted_thinking') {
+    const data = typeof block.data === 'string' ? block.data.trim() : ''
+    return data ? `r\0${data}` : null
+  }
+  return null
+}
+
 export function stripInvalidThinkingBlocks(body = {}, { preserveThinkingBlocks = false } = {}) {
   if (!Array.isArray(body.messages)) return body
   const betweenTools = body.thinking?.type === 'between_tools'
@@ -261,7 +244,18 @@ export function stripInvalidThinkingBlocks(body = {}, { preserveThinkingBlocks =
   const messages = body.messages.map((message) => {
     if (!Array.isArray(message?.content)) return message
     const content = []
+    const seenThinking = new Set()
     let filteredThis = false
+    const pushUniqueThinking = (block) => {
+      const key = thinkingBlockDedupeKey(block)
+      if (key && seenThinking.has(key)) {
+        changed = true
+        filteredThis = true
+        return
+      }
+      if (key) seenThinking.add(key)
+      content.push(block)
+    }
     for (const block of message.content) {
       const type = block?.type
       if (type === 'thinking' || type === 'redacted_thinking') {
@@ -269,7 +263,7 @@ export function stripInvalidThinkingBlocks(body = {}, { preserveThinkingBlocks =
           // Omitted thinking keeps empty text; redacted thinking keeps encrypted data.
           if (preserveThinkingBlocks) {
             if (type === 'redacted_thinking' || hasUsableThinkingSignature(block.signature)) {
-              content.push(block)
+              pushUniqueThinking(block)
             } else {
               changed = true
               filteredThis = true
@@ -282,14 +276,14 @@ export function stripInvalidThinkingBlocks(body = {}, { preserveThinkingBlocks =
             continue
           }
           if (type === 'redacted_thinking' && chainModel && String(block.data || '').trim()) {
-            content.push(block)
+            pushUniqueThinking(block)
             continue
           }
           const signed = chainModel
             ? hasNonDummyThinkingSignature(block.signature)
             : hasUsableThinkingSignature(block.signature)
           if (signed) {
-            content.push(block)
+            pushUniqueThinking(block)
             continue
           }
           if (chainModel) chainBroken = true
@@ -515,7 +509,10 @@ export function prepareAnthropicRequest(
     out = ensureUnofficialEffortHigh(out)
     validateBetweenToolsThinking(out)
     out = rectifyUnofficialRequest(out)
-  } else out = ensureOutputConfigSchema(out)
+  } else {
+    out = stripEmptyEffort(out)
+    out = ensureOutputConfigSchema(out)
+  }
   if (Array.isArray(out.system)) {
     out.system = cleanContent(out.system, { keepEmptyIdentity: true })
   }

@@ -56,6 +56,7 @@ import { activeHoursOf, evaluateActiveHours } from './active-hours.mjs'
 import { vmNodeDataPath } from '../cluster/placement.mjs'
 import { GATE_DIAL_TIMEOUT_MS } from '../cluster/direct-link.mjs'
 import { ErrorCode } from '../core/errors.mjs'
+import { KernelLeaseStats, kernelCapacityOf, leaseVerdict, normalizeKernelLeaseMode } from './kernel-lease.mjs'
 import { HOST_PRESSURE_CRITICAL, HOST_PRESSURE_OK, hostMemoryLevelForVm } from '../cluster/host-memory-pressure.mjs'
 
 const WAIT_TIMEOUT_MIN_MS = 1000
@@ -67,6 +68,13 @@ export const SEAT_GRACE_MAX_MS = 120000
 export const SEAT_BUDGET_RESERVE_MAX = 0.5
 export const CIRCUIT_THRESHOLD_MAX = 20
 export const CIRCUIT_OPEN_MIN_MS = 1000
+
+const CONTENT_AFFINITY_MAX = 5000
+
+/** Seat keys derived from request content (cache text / fingerprint / batch member), not a client session. */
+function isContentSeatKey(seatKey) {
+  return /^seat:(h|bg):/.test(String(seatKey || ''))
+}
 
 /** A queued request re-reads eligibility this often, so cooldown lifts and new slots reach it. */
 const QUEUE_REFRESH_MS = 2000
@@ -96,6 +104,8 @@ export const DEFAULT_POOL_ROUTING = Object.freeze({
    * the provider. 0 disables the guard (upstream behaviour).
    */
   fresh_account_isolation_ms: 0,
+  /** kernel_lease enforce: kernel queue wait for a leased request (see kernelLeaseWaitDeadline). */
+  kernel_lease_queue_grace_ms: 5000,
 })
 
 const DEFAULT_CONFIG = {
@@ -164,6 +174,14 @@ export function normalizePoolRouting(pool = {}) {
   // Auto schedule level from the weekly reset (closer reset = higher level).
   // On by default; off flattens every auto-level slot so load spreads evenly.
   next.reset_priority = next.reset_priority !== false
+  // Kernel slot lease (kernel-lease.mjs): off | observe | enforce. Off by default.
+  next.kernel_lease = normalizeKernelLeaseMode(next.kernel_lease)
+  next.kernel_lease_queue_grace_ms = clampNumber(
+    next.kernel_lease_queue_grace_ms,
+    DEFAULT_POOL_ROUTING.kernel_lease_queue_grace_ms,
+    0,
+    WAIT_TIMEOUT_MAX_MS,
+  )
   next.queue_max = clampNumber(next.queue_max, DEFAULT_POOL_ROUTING.queue_max, QUEUE_MAX_MIN, QUEUE_MAX_MAX)
   next.seat_grace_ms = clampNumber(next.seat_grace_ms, DEFAULT_POOL_ROUTING.seat_grace_ms, 0, SEAT_GRACE_MAX_MS)
   next.seat_budget_reserve_pct = clampNumber(
@@ -321,6 +339,44 @@ function emptyPoolFailure(candidates, now = Date.now()) {
  */
 export const QUOTA_GUARD_DEFAULTS = { new_session_ratio: 0.85, stop_ratio: 0.95 }
 
+function quotaValidationError(message) {
+  const error = new TypeError(message)
+  error.code = 'invalid_quota_config'
+  return error
+}
+
+/** PUT /api/panel/routing strict check for quota exhaustion guard thresholds. */
+export function validateQuotaRoutingPatch(body = {}, currentQuota = {}) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return
+  if (!Object.prototype.hasOwnProperty.call(body, 'quota')) return
+  const quota = body.quota
+  if (!quota || typeof quota !== 'object' || Array.isArray(quota)) {
+    throw quotaValidationError('quota 必须是对象')
+  }
+  const hasNew = Object.prototype.hasOwnProperty.call(quota, 'exhaustion_guard_new_session')
+  const hasStop = Object.prototype.hasOwnProperty.call(quota, 'exhaustion_guard_stop')
+  if (!hasNew && !hasStop) return
+  const parseRatio = (raw, field) => {
+    if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0 || raw > 1) {
+      throw quotaValidationError(`${field} 必须是 (0, 1] 之间的数字`)
+    }
+    return raw
+  }
+  const fallbackRatio = (raw, fallback) => {
+    const n = Number(raw)
+    return Number.isFinite(n) && n > 0 && n <= 1 ? n : fallback
+  }
+  const newSession = hasNew
+    ? parseRatio(quota.exhaustion_guard_new_session, 'quota.exhaustion_guard_new_session')
+    : fallbackRatio(currentQuota?.exhaustion_guard_new_session, QUOTA_GUARD_DEFAULTS.new_session_ratio)
+  const stop = hasStop
+    ? parseRatio(quota.exhaustion_guard_stop, 'quota.exhaustion_guard_stop')
+    : fallbackRatio(currentQuota?.exhaustion_guard_stop, QUOTA_GUARD_DEFAULTS.stop_ratio)
+  if (newSession > stop) {
+    throw quotaValidationError('quota.exhaustion_guard_new_session 不能大于 quota.exhaustion_guard_stop')
+  }
+}
+
 export function quotaGuardConfigOf(quota = {}) {
   const ratio = (value, fallback) => {
     const n = Number(value)
@@ -403,14 +459,20 @@ function selectionSnapshot(candidates = [], available = [], extras = {}) {
   const waitPool = extras.waitPool || candidates
   const waitReasons = [...new Set((waitPool || []).map((candidate) => candidate.waitReason).filter(Boolean))]
   const soonest = (waitPool || []).map((candidate) => Number(candidate.availableAt) || 0).filter((value) => value > now)
+  const fableLimited =
+    extras.reason === 'all_accounts_busy' &&
+    waitPool.length > 0 &&
+    waitPool.every((candidate) => candidate.waitReason === 'fable_quota')
   const quotaLimited =
     extras.reason === 'all_accounts_busy' &&
     waitPool.length > 0 &&
     waitPool.every(
-      (candidate) => candidate.waitReason === 'account_cooldown' && isQuotaWindowReason(candidate.cooldownReason),
+      (candidate) =>
+        candidate.waitReason === 'fable_quota' ||
+        (candidate.waitReason === 'account_cooldown' && isQuotaWindowReason(candidate.cooldownReason)),
     )
   return {
-    reason: quotaLimited ? 'pool_rate_limited' : extras.reason,
+    reason: fableLimited ? 'pool_fable_rate_limited' : quotaLimited ? 'pool_rate_limited' : extras.reason,
     wait_ms: extras.waitMs ?? 0,
     soonest_available_ms: soonest.length ? Math.min(...soonest) - now : null,
     wait_reasons: waitReasons,
@@ -593,6 +655,9 @@ export class PoolScheduler extends EventEmitter {
     this.inflightFamily = new Map()
     /** vmId → live reservations; mirrors `inflight` (per account) for the panel. */
     this.vmInflight = new Map()
+    this.kernelLeaseStats = new KernelLeaseStats()
+    // kernel_lease enforce: content-derived seat key -> VM it last ran on (ranking only).
+    this.contentAffinity = new Map()
     this.waiters = new Map()
     this.waiterSequence = 0
     this.dueWaiterRefreshes = new Set()
@@ -711,6 +776,13 @@ export class PoolScheduler extends EventEmitter {
       if (args.summarySession) seatKey = `seat:sess:${args.summarySession}`
     }
     if (!seatKey) return this.selectDirect(args)
+    // kernel_lease enforce: a seat derived from request content (no client
+    // session) is affinity, not a conversation. Each request takes its own
+    // kernel lease, preferring the VM the seat last ran on, so one batch
+    // cannot queue on a full kernel while other kernels sit idle.
+    if (this.config.kernel_lease === 'enforce' && !child && !fallback && isContentSeatKey(seatKey)) {
+      return this.selectContentSeat(args, scopedSeatKey(seatKey, args.ownerScope))
+    }
     const selected = await this.selectSeat({
       ...args,
       seatKey: scopedSeatKey(seatKey, args.ownerScope),
@@ -855,6 +927,19 @@ export class PoolScheduler extends EventEmitter {
     }
   }
 
+  async selectContentSeat(args, seatKey) {
+    const home = this.planner.seatOf(seatKey)?.vmId || this.contentAffinity.get(seatKey) || null
+    const selected = await this.selectDirect({ ...args, deviceVmId: home || args.deviceVmId || null })
+    if (selected?.ok && selected.vmId) {
+      this.contentAffinity.delete(seatKey)
+      this.contentAffinity.set(seatKey, selected.vmId)
+      if (this.contentAffinity.size > CONTENT_AFFINITY_MAX) {
+        this.contentAffinity.delete(this.contentAffinity.keys().next().value)
+      }
+    }
+    return selected
+  }
+
   async selectDirect(args = {}) {
     const {
       model,
@@ -921,12 +1006,15 @@ export class PoolScheduler extends EventEmitter {
         sticky: selected.selectionReason === 'sticky',
         allowWait,
       }),
-      slotWaitDeadlineMs: this.slotWaitDeadlineMs({
-        startedAt,
-        loopDeadline: Math.min(loopDeadline, queuedDeadline),
-        sticky: selected.selectionReason === 'sticky',
-        allowWait,
-      }),
+      slotWaitDeadlineMs: this.kernelLeaseWaitDeadline(
+        reservation,
+        this.slotWaitDeadlineMs({
+          startedAt,
+          loopDeadline: Math.min(loopDeadline, queuedDeadline),
+          sticky: selected.selectionReason === 'sticky',
+          allowWait,
+        }),
+      ),
     })
     for (;;) {
       if (signal?.aborted) throw makeAbortError()
@@ -1239,6 +1327,7 @@ export class PoolScheduler extends EventEmitter {
             ? Math.min(failoverDeadline, phaseDeadline)
             : this.slotWaitDeadlineMs({ startedAt, loopDeadline: failoverDeadline, sticky, allowWait }),
       }
+      result.slotWaitDeadlineMs = this.kernelLeaseWaitDeadline(granted.reservation, result.slotWaitDeadlineMs)
       consumed = true
       return result
     }
@@ -1568,7 +1657,7 @@ export class PoolScheduler extends EventEmitter {
     }
     // A machine out of memory opens no seat for a new conversation (queued grants included).
     if (!current && selectionReason !== 'sticky' && candidate.hostPressure === HOST_PRESSURE_CRITICAL) return null
-    const reservation = this.reserve(candidate)
+    const reservation = this.reserve(candidate, { selectionReason })
     if (!reservation) return null
     // Quota/circuit admission can release another request and synchronously grant a queued ticket.
     if (limits.subagents != null) {
@@ -1895,6 +1984,16 @@ export class PoolScheduler extends EventEmitter {
     const snapshots = this.runtimeRepo
       ? this.runtimeRepo.schedulingSnapshot(entries.map((entry) => entry.accountId))
       : new Map()
+    // Only hop slots the scan can reach: the same cheap gates it applies before its own health check.
+    const healthFlights = this.prefetchWorkerHealth(entries, snapshots, {
+      skip: ({ vm, snapshot }) => {
+        if (pin) return false
+        if (vm.schedulable === false) return true
+        if (snapshot?.account && snapshot.account.status !== 'active') return true
+        if (hardBlockOf(snapshot?.state || null, now)) return true
+        return quotaGuardLevel(snapshot?.account?.unified, guardConfig, now).level === 'stop'
+      },
+    })
     for (const { vm, accountId } of entries) {
       if (signal?.aborted) throw makeAbortError()
       const snapshot = snapshots.get(accountId)
@@ -1949,6 +2048,7 @@ export class PoolScheduler extends EventEmitter {
         signal,
         pinned: !!pin,
         quotaRequest,
+        healthFlight: healthFlights.get(vm.id),
       })
       if (!eligibility.ok) {
         const kind = eligibility.reason
@@ -2051,6 +2151,7 @@ export class PoolScheduler extends EventEmitter {
     quotaRequest = null,
     workerStatus: knownHealth = undefined,
     admission = false,
+    healthFlight = null,
   }) {
     // rate_limit_reset_at / overload_until gate scheduling before any
     // passive Extra reading or health hop. Pins are diagnostics and still reach the slot.
@@ -2133,6 +2234,7 @@ export class PoolScheduler extends EventEmitter {
               probe_source: account.unified.source,
             }
           : {}
+        const runtimeWorkerStatus = knownHealth || state?.worker_status || account.worker_status || null
         const ev = evaluateAccount({
           vm,
           account: { ...account, last_used_at: lastUsedAt },
@@ -2142,11 +2244,12 @@ export class PoolScheduler extends EventEmitter {
           scheduleDisabledReason: vm.schedule_disabled_reason || null,
           lastProbe: account.last_probe || account.unified?.last_probe || null,
           probeSource: account.unified?.source || account.last_probe?.source || null,
-          workerLastError: account.worker_status?.last_error || vm.claude?.refresh_error,
+          workerLastError: runtimeWorkerStatus?.last_error || vm.claude?.refresh_error,
           refreshError: vm.claude?.refresh_error,
           expiresAt: vm.claude?.expires_at || vm.expires_at || null,
           refreshedAt: vm.claude?.refreshed_at || vm.refreshed_at || null,
-          workerCredential: account.worker_status?.credential || null,
+          workerCredential:
+            knownHealth?.credential || state?.worker_status?.credential || account.worker_status?.credential || null,
           quota,
           policy,
           cooldownUntil:
@@ -2175,9 +2278,11 @@ export class PoolScheduler extends EventEmitter {
     const workerStatus =
       dataPath === 'offline'
         ? null
-        : knownHealth === undefined
-          ? await this.getWorkerHealth(this.executionContext(vm, accountId), { signal, state, dataPath })
-          : knownHealth
+        : knownHealth !== undefined
+          ? knownHealth
+          : healthFlight?.dataPath === dataPath
+            ? await this.awaitHealth(healthFlight.promise, signal)
+            : await this.getWorkerHealth(this.executionContext(vm, accountId), { signal, state, dataPath })
     if (!pinned && this.cragSeatOverQuota(vm, workerStatus))
       return { ok: false, reason: 'license_crag_host_over_quota' }
     // Health probing is asynchronous. Re-read time before applying cooldown
@@ -2233,7 +2338,13 @@ export class PoolScheduler extends EventEmitter {
     for (const key of modelCooldownKeys(modelKey)) {
       const modelState = state?.model_states?.[key]
       if (modelState && cooldownActive(modelState.cooldown_until, eligibilityNow)) {
-        markWait(key === FABLE_FAMILY_KEY ? 'fable_cooldown' : 'model_cooldown', modelState.cooldown_until)
+        const reason =
+          modelState.reason === 'fable_rate_limited'
+            ? 'fable_quota'
+            : key === FABLE_FAMILY_KEY
+              ? 'fable_cooldown'
+              : 'model_cooldown'
+        markWait(reason, modelState.cooldown_until)
       }
     }
     if (isFableModel(modelKey) && this.accountQuota?.fableWindowLimited?.(accountId, eligibilityNow, account)) {
@@ -2306,6 +2417,51 @@ export class PoolScheduler extends EventEmitter {
       locale: vm.locale || 'en_US.UTF-8',
       kernel: vm.kernel || null,
     }
+  }
+
+  /**
+   * Start every stale health hop at once. The eligibility scan awaits them one slot at a time and joins
+   * these flights (healthFlights), so a cold cache costs one round trip instead of one per slot: on a
+   * freshly started or just-activated controller each hop opens a new relay channel (0.4–1.6s), and a
+   * sequential scan of ~26 slots held the first requests for ~10s. Not tied to one request's signal: an
+   * aborted request must not cancel a hop the next one will use.
+   */
+  prefetchWorkerHealth(entries, snapshots, { skip = null } = {}) {
+    /** vmId → { dataPath, promise }: the scan reuses this answer, even a failed one, instead of hopping again. */
+    const flights = new Map()
+    if (typeof this.workerHealth !== 'function') return flights
+    const now = Date.now()
+    for (const { vm, accountId } of entries) {
+      const dataPath = vmNodeDataPath(vm)
+      if (dataPath === 'offline') continue
+      const snapshot = snapshots?.get?.(accountId)
+      if (skip?.({ vm, accountId, snapshot })) continue
+      const state = snapshot?.state || null
+      const cached = this.healthCache.get(vm.id)
+      if (
+        cached &&
+        cached.dataPath === dataPath &&
+        cached.accountId === accountId &&
+        Number(state?.credential_generation || 0) <= cached.generation &&
+        now - cached.at < this.config.worker_health_ttl_ms
+      )
+        continue
+      const promise = this.getWorkerHealth(this.executionContext(vm, accountId), { state, dataPath })
+      promise.catch(() => {})
+      flights.set(vm.id, { dataPath, promise })
+    }
+    return flights
+  }
+
+  /** Await a shared health flight without letting one request's abort cancel it for the others. */
+  async awaitHealth(promise, signal) {
+    if (signal?.aborted) throw makeAbortError()
+    if (!signal) return await promise
+    return await new Promise((resolve, reject) => {
+      const onAbort = () => reject(makeAbortError())
+      signal.addEventListener('abort', onAbort, { once: true })
+      promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort))
+    })
   }
 
   async getWorkerHealth(exec, { signal = undefined, state = null, dataPath = vmNodeDataPath(exec.vm) } = {}) {
@@ -2459,12 +2615,15 @@ export class PoolScheduler extends EventEmitter {
       .map((summary) => getVm(this.projectRoot, summary.id))
       .filter((vm) => vm && vm.schedulable !== false && vm.status === 'running' && !isCodexVm(vm))
     const snapshots = await this.runtimeRepo.schedulingSnapshot(vms.map((vm) => accountIdOf(vm, this.projectRoot)))
-    for (const vm of vms) {
-      if (this.maintenanceStopped) return
-      if (vmNodeDataPath(vm) === 'offline') continue
-      const accountId = accountIdOf(vm, this.projectRoot)
-      await this.getWorkerHealth(this.executionContext(vm, accountId), { state: snapshots.get(accountId)?.state })
-    }
+    // In parallel: one sequential round over a cold relay outlasts worker_health_ttl_ms.
+    await Promise.allSettled(
+      vms.map((vm) => {
+        if (this.maintenanceStopped || vmNodeDataPath(vm) === 'offline') return null
+        const accountId = accountIdOf(vm, this.projectRoot)
+        return this.getWorkerHealth(this.executionContext(vm, accountId), { state: snapshots.get(accountId)?.state })
+      }),
+    )
+    if (this.maintenanceStopped) return
     await this.flushHealthWrites()
   }
 
@@ -2793,7 +2952,7 @@ export class PoolScheduler extends EventEmitter {
   }
 
   /** Synchronous request permit; affinity seats and transport workers never own the counters. */
-  reserve(candidate, { skipQuota = false, pinned = false } = {}) {
+  reserve(candidate, { skipQuota = false, pinned = false, selectionReason = null } = {}) {
     const { accountId, vmId } = candidate
     const snapshot = candidate.exec ? this.admissionSnapshot(candidate, { pinned }) : {}
     if (!snapshot) return null
@@ -2809,6 +2968,8 @@ export class PoolScheduler extends EventEmitter {
     if (physicalFull()) return null
     const requestInflight = this.inflight.get(candidate.accountId) || 0
     if (!candidate.maxConcurrency || requestInflight >= candidate.maxConcurrency) return null
+    const lease = this.kernelLeaseCheck(candidate)
+    if (lease?.deny) return null
     const family = isFableModel(candidate.model) ? FABLE_FAMILY_KEY : null
     const fableCap = Number(this.config.fable_max_per_account)
     if (
@@ -2848,11 +3009,19 @@ export class PoolScheduler extends EventEmitter {
     this.inflight.set(accountId, (this.inflight.get(accountId) || 0) + 1)
     this.bumpFamily(accountId, family, 1)
     this.bumpVmInflight(vmId, 1)
+    if (lease)
+      this.kernelLeaseStats.noteGrant({
+        ...lease,
+        selectionReason: selectionReason || candidate.selectionReason || null,
+      })
     let released = false
     return {
       reserved: true,
       slotIndex: null,
       quotaToken: quotaReservation?.token,
+      kernelLease: lease
+        ? { verdict: lease.verdict, capacity: lease.capacity, inflight: lease.inflight, mode: lease.mode }
+        : null,
       release: (releaseSeat) => {
         if (released) return
         released = true
@@ -2868,6 +3037,49 @@ export class PoolScheduler extends EventEmitter {
         this.notifyCapacity(accountId)
       },
     }
+  }
+
+  /**
+   * Kernel slot lease ledger check for one more request on candidate's VM
+   * (see kernel-lease.mjs). null when the lease is off.
+   */
+  kernelLeaseCheck(candidate) {
+    const mode = this.config.kernel_lease
+    if (!mode || mode === 'off' || candidate.external) return null
+    const vmId = String(candidate.vmId || '')
+    const health = this.healthCache.get(vmId)?.value || candidate.workerStatus
+    const capacity = kernelCapacityOf(health)
+    const inflight = this.vmInflight.get(vmId) || 0
+    const verdict = leaseVerdict({ capacity, inflight })
+    const deny = mode === 'enforce' && verdict === 'over'
+    if (deny) this.kernelLeaseStats.bump('denied', vmId)
+    return { mode, vmId, capacity, inflight, verdict, deny }
+  }
+
+  /** The kernel answered slot_busy for a reservation; counts ledger desyncs. */
+  noteKernelSlotBusy(selected) {
+    const lease = selected?.kernelLease
+    if (!lease) return
+    this.kernelLeaseStats.noteSlotBusy({ ...lease, vmId: selected.vmId })
+  }
+
+  /**
+   * enforce: the ledger holds a free slot for this request, so the kernel
+   * queue wait (gateway_policy.queue_wait_ms) only has to cover a slot that is
+   * still being released (a native process exiting after the previous
+   * request): kernel_lease_queue_grace_ms, not the whole sticky wait. A kernel
+   * still full after that is a desync and answers instead of eating the budget.
+   * 0 means do not queue at all.
+   */
+  kernelLeaseWaitDeadline(reservation, deadline) {
+    const lease = reservation?.kernelLease
+    if (lease?.mode !== 'enforce' || lease.verdict !== 'ok') return deadline
+    const graceEnd = Date.now() + this.config.kernel_lease_queue_grace_ms
+    return Number.isFinite(deadline) ? Math.min(deadline, graceEnd) : graceEnd
+  }
+
+  kernelLeaseSnapshot() {
+    return { mode: this.config.kernel_lease || 'off', ...this.kernelLeaseStats.snapshot() }
   }
 
   /** Live request count per VM for the panel seat stream; every change pushes a frame. */
@@ -3154,6 +3366,7 @@ export class PoolScheduler extends EventEmitter {
     if (!account) return { action: 'keep', reason: null }
     const now = Date.now()
     const lastUsedAt = this.lastUsed.get(accountId) || account.last_used_at || 0
+    const runtimeWorkerStatus = state?.worker_status || account.worker_status || null
     const ev = evaluateAccount({
       vm: {
         ...vm,
@@ -3172,11 +3385,11 @@ export class PoolScheduler extends EventEmitter {
       scheduleDisabledReason: null,
       lastProbe: account.last_probe || account.unified?.last_probe || null,
       probeSource: account.unified?.source || account.last_probe?.source || null,
-      workerLastError: account.worker_status?.last_error || vm.claude?.refresh_error,
+      workerLastError: runtimeWorkerStatus?.last_error || vm.claude?.refresh_error,
       refreshError: vm.claude?.refresh_error,
       expiresAt: vm.claude?.expires_at || vm.expires_at || null,
       refreshedAt: vm.claude?.refreshed_at || vm.refreshed_at || null,
-      workerCredential: account.worker_status?.credential || null,
+      workerCredential: state?.worker_status?.credential || account.worker_status?.credential || null,
       quota: account.unified
         ? {
             ...listQuotaFromHeaders(account.unified, { now }),

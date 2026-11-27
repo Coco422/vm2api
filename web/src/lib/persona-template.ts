@@ -419,11 +419,13 @@ export type PresetFlagField =
   | 'agent_standing_presets'
   | 'agent_standing_hide_presets'
   | 'persona_env_presets'
+  | 'usage_passthrough_presets'
   | 'model_env_extra_presets'
 
 function presetFlagDefault(field: PresetFlagField): boolean {
   return field === 'agent_standing_presets' ||
-    field === 'model_env_extra_presets'
+    field === 'model_env_extra_presets' ||
+    field === 'usage_passthrough_presets'
     ? false
     : true
 }
@@ -437,7 +439,11 @@ export function presetFlagEnabled(
   const map = compat?.[field]
   if (!map || typeof map !== 'object' || Array.isArray(map)) return defaultValue
   const value = (map as Record<string, unknown>)[preset]
-  if (field === 'agent_standing_presets' || field === 'model_env_extra_presets')
+  if (
+    field === 'agent_standing_presets' ||
+    field === 'model_env_extra_presets' ||
+    field === 'usage_passthrough_presets'
+  )
     return value === true
   return value !== false
 }
@@ -1084,7 +1090,6 @@ export function personaPresetLabel(preset: PersonaPreset): string {
 /** system提示词页保存提示。文案必须对应服务端已写入的 preset。 */
 export function protocolPersonaSaveToast(
   compat: Record<string, unknown> | undefined,
-  inherited: number,
   kernel?: { updated?: number } | null
 ): string {
   const label = personaPresetLabel(personaPresetFromCompat(compat))
@@ -1094,8 +1099,7 @@ export function protocolPersonaSaveToast(
         ? `system 提示词已热更新 ${kernel.updated} 个槽`
         : 'system 提示词的 kernel 配置已一致'
       : '已写入'
-  if (!inherited) return `已保存 · ${label} · ${hot}`
-  return `已保存 · ${label} · ${inherited} 个槽位改为跟随全局 · ${hot}`
+  return `已保存 · ${label} · ${hot}`
 }
 
 export function overlayPresetLabel(preset: OverlayPreset): string {

@@ -2,51 +2,45 @@ import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useParams } from '@tanstack/react-router'
 import { VIEW_TITLES } from '@/config/nav'
-import type { Dashboard } from '@/types/panel-overview'
 import type { NotifyConfig } from '@/types/panel-routing'
 import type { QuotaTierPolicy } from '@/types/panel-vm'
 import { toast } from 'sonner'
-import { api, patchVm } from '@/lib/api'
-import {
-  cacheBreakpointsFromCompat,
-  cacheTtlFromCompat,
-  detectProxiedOfficialCcFromCompat,
-} from '@/lib/cache-breakpoints'
-import {
-  personaInjectFromPreset,
-  personaPresetFromCompat,
-} from '@/lib/persona-template'
+import { api } from '@/lib/api'
 import { cn } from '@/lib/utils'
-import { isCodexVm } from '@/lib/vm-kind'
 import { PageHeader } from '@/components/page-header'
 import { QueryGate } from '@/components/query-gate'
 import { dashboardQueryOptions } from '@/features/overview/queries'
 import { AboutPane } from '@/features/settings/about-pane'
 import { BackupPane } from '@/features/settings/backup-pane'
+import { GeminiConfigPane } from '@/features/settings/gemini-config-pane'
 import { GeminiInstallPane } from '@/features/settings/gemini-install-pane'
 import { HealthPane } from '@/features/settings/health-pane'
 import { LogsPane } from '@/features/settings/logs-pane'
 import {
   SETTINGS_TAB_LABELS,
   settingsTabId,
-  type SettingsTabId,
 } from '@/features/settings/navigation'
 import { NotifyPane } from '@/features/settings/notify-pane'
 import { OfficialCcSettingsPane } from '@/features/settings/official-cc-pane'
 import { OpenaiPane } from '@/features/settings/openai-pane'
 import { PoolPane } from '@/features/settings/pool-pane'
 import {
-  cchEnabledFromCompat,
-  inheritProtocolOnSlots,
-  sessionIdleTtlFromInference,
-  thinkingDisplayFromCompat,
-} from '@/features/settings/protocol-authority'
-import {
+  geminiDaemonStatusQueryOptions,
+  healthProbeQueryOptions,
   notifyQueryOptions,
   outboundProfileQueryOptions,
   routingQueryOptions,
 } from '@/features/settings/queries'
 import { QuotaTierPane } from '@/features/settings/quota-tier-pane'
+import {
+  buildRoutingSavePayload,
+  changedRoutingSections,
+  computePendingCards,
+  computeSettingsBlockedReason,
+  dirtySettingsTabLabels,
+  settingsSaveToast,
+  type RoutingSaveResult,
+} from '@/features/settings/routing-draft'
 import { SaveBar } from '@/features/settings/save-bar'
 import { SettingsNav } from '@/features/settings/settings-nav'
 import { SettingsSkeleton } from '@/features/settings/settings-skeleton'
@@ -77,7 +71,7 @@ export function SettingsPage() {
     setDraft((current) => {
       const clean =
         previousSnapshot === null ||
-        JSON.stringify(current) === JSON.stringify(previousSnapshot)
+        changedRoutingSections(current, previousSnapshot).size === 0
       if (!wasHydrated || clean || shouldAccept) return next
       return current
     })
@@ -86,93 +80,27 @@ export function SettingsPage() {
   }, [routing.data])
 
   const save = useMutation({
-    mutationFn: () => {
-      const body = { ...draft }
-      delete body.redaction_runtime
-      const compat = (body.compatibility as Record<string, unknown>) || {}
-      if (tab === 'protocol') {
-        const preset = personaPresetFromCompat(compat)
-        const breakpoints = cacheBreakpointsFromCompat(compat)
-        body.compatibility = {
-          ...compat,
-          persona_preset: preset,
-          overlay_preset: 'off',
-          persona_standing: String(compat.persona_standing ?? ''),
-          persona_inject: personaInjectFromPreset(
-            preset,
-            compat.persona_inject
-          ),
-          persona_park: false,
-          cache_ttl: cacheTtlFromCompat(compat),
-          cache_breakpoints: {
-            ...breakpoints,
-            system_tail: false,
-            tools_tail: false,
-            messages: 'cli-hop',
-          },
-          detect_proxied_official_cc: detectProxiedOfficialCcFromCompat(compat),
-          claude_code_only: compat.claude_code_only === true,
-          official_cc_passthrough: compat.official_cc_passthrough === true,
-          cch_enabled: cchEnabledFromCompat(compat),
-          thinking_display: thinkingDisplayFromCompat(compat),
-        }
-      }
-      if (tab === 'init') {
-        const official = (body.official_cc as Record<string, unknown>) || {}
-        body.official_cc = { ...official, inference: 'cli-hop' }
-      }
-      if (tab === 'protocol') {
-        const inference = (body.inference as Record<string, unknown>) || {}
-        body.inference = {
-          ...inference,
-          engine: 'rust',
-          fallback_to_go: false,
-          session_idle_ttl_seconds: sessionIdleTtlFromInference(inference),
-        }
-      }
-      return api<RoutingSaveResult>('/api/panel/routing', {
+    mutationFn: async () => {
+      const { body, changedSections, telemetryOptIn } = buildRoutingSavePayload(
+        draft,
+        routing.data
+      )
+      const saved = await api<RoutingSaveResult>('/api/panel/routing', {
         method: 'PUT',
         body: JSON.stringify(body),
       })
+      return { saved, changedSections, telemetryOptIn }
     },
-    onSuccess: async (saved) => {
-      let inherited = 0
-      if (tab === 'protocol') {
-        try {
-          const dash = await api<Dashboard>('/api/panel/dashboard')
-          const follow = await inheritProtocolOnSlots(
-            (dash.vms || []).filter((vm) => !isCodexVm(vm)),
-            patchVm
-          )
-          inherited = follow.changed
-          if (follow.errors.length) {
-            toast.error(
-              `协议已保存，${follow.errors.length} 个槽位未跟随：${follow.errors
-                .slice(0, 3)
-                .map(
-                  (item) => `${item.id} ${protocolFollowError(item.message)}`
-                )
-                .join('；')}`
-            )
-          }
-        } catch (error) {
-          toast.error(
-            `协议已保存，槽位未跟随全局：${protocolFollowError(
-              error instanceof Error ? error.message : String(error)
-            )}`
-          )
-        }
-      }
-      const message = settingsSaveToast(
-        tab,
-        inherited,
-        saved?.kernel_persona,
-        saved?.telemetry_sync
-      )
-      if (tab === 'telemetry' && saved?.telemetry_sync?.failed?.length) {
-        toast.warning(message)
+    onSuccess: async ({ saved, changedSections, telemetryOptIn }) => {
+      const notice = settingsSaveToast({
+        changedSections,
+        telemetryOptIn,
+        saved,
+      })
+      if (notice.level === 'warning') {
+        toast.warning(notice.message)
       } else {
-        toast.success(message)
+        toast.success(notice.message)
       }
       acceptNextServer.current = true
       await Promise.all([
@@ -181,8 +109,22 @@ export function SettingsPage() {
         qc.invalidateQueries({
           queryKey: outboundProfileQueryOptions().queryKey,
         }),
-        ...(tab === 'notify'
+        ...(changedSections.has('notify')
           ? [qc.invalidateQueries({ queryKey: notifyQueryOptions().queryKey })]
+          : []),
+        ...(changedSections.has('gemini')
+          ? [
+              qc.invalidateQueries({
+                queryKey: geminiDaemonStatusQueryOptions().queryKey,
+              }),
+            ]
+          : []),
+        ...(changedSections.has('health_probe')
+          ? [
+              qc.invalidateQueries({
+                queryKey: healthProbeQueryOptions().queryKey,
+              }),
+            ]
           : []),
       ])
     },
@@ -195,14 +137,32 @@ export function SettingsPage() {
   const logging = (draft.logging as Record<string, unknown> | undefined) || {}
   const inference =
     (draft.inference as Record<string, unknown> | undefined) || {}
-  const serverJson = routing.data ? JSON.stringify(routing.data) : null
+  const changedSections = changedRoutingSections(draft, routing.data)
   const dirty =
-    serverJson !== null &&
+    routing.data != null &&
     Object.keys(draft).length > 0 &&
-    JSON.stringify(draft) !== serverJson
-  const hideSave =
+    changedSections.size > 0
+  const pendingCards = computePendingCards(draft, routing.data)
+  const saveBlockedReason = dirty
+    ? computeSettingsBlockedReason(draft, changedSections)
+    : undefined
+  const isNonRoutingTab =
     tab === 'socks5' || tab === 'backup' || tab === 'about' || tab === 'gemini'
-  const showSaveBar = dirty && !hideSave
+  const dirtyLabels = dirty ? dirtySettingsTabLabels(draft, routing.data) : []
+  const saveBarSummary = dirty
+    ? isNonRoutingTab ||
+      dirtyLabels.length > 1 ||
+      (dirtyLabels.length === 1 && dirtyLabels[0] !== SETTINGS_TAB_LABELS[tab])
+      ? `有未保存的设置更改（${dirtyLabels.join('、')}）`
+      : '有未保存的更改'
+    : undefined
+  const showSaveBar = dirty
+  const maxBodyMib =
+    typeof routing.data?.max_body_mib === 'number'
+      ? routing.data.max_body_mib
+      : typeof routing.data?.max_body_bytes === 'number'
+        ? Math.floor(routing.data.max_body_bytes / (1024 * 1024))
+        : undefined
 
   const discard = () => {
     const next = routing.data ?? {}
@@ -217,7 +177,7 @@ export function SettingsPage() {
     const onKey = (e: KeyboardEvent) => {
       if (!(e.metaKey || e.ctrlKey) || e.key !== 's') return
       e.preventDefault()
-      if (!dirty || hideSave || save.isPending) return
+      if (!dirty || save.isPending || !!saveBlockedReason) return
       save.mutate()
     }
     window.addEventListener('keydown', onKey)
@@ -232,9 +192,11 @@ export function SettingsPage() {
           ? 'Claude 配额闸线、并发、RPM，以及请求体上限。GPT 配额在 OpenAI 页。个人自用引导会把闸关掉并拉到上限；这里仍可再改。'
           : tab === 'openai'
             ? 'GPT 传输、准入、配额与客户端画像。全局 WebSocket 只作用于推理，不影响终端或集群。'
-            : tab === 'logs'
-              ? '设置请求日志的记录模式、保留时间和存储上限。逐条记录在日志页查看。'
-              : undefined
+            : tab === 'gemini-config'
+              ? 'Gemini 入口准入、CRAGGemini 单进程分片接管、并发调度、性能配置与故障保护。宿主安装与升级在「Gemini 维护」页。'
+              : tab === 'logs'
+                ? '设置请求日志的记录模式、保留天数与 Debug 载荷上限。逐条记录在日志页查看。'
+                : undefined
       }
     >
       <div className='@2xl/content:grid @2xl/content:grid-cols-[10.5rem_1fr] @2xl/content:gap-8'>
@@ -259,6 +221,7 @@ export function SettingsPage() {
                   value={sticky}
                   saving={save.isPending}
                   pending={dirty}
+                  pendingCards={pendingCards.sticky}
                   onChange={(patch) =>
                     setDraft((current) => ({
                       ...current,
@@ -278,6 +241,7 @@ export function SettingsPage() {
                     inference={inference}
                     saving={save.isPending}
                     pending={dirty}
+                    pendingCards={pendingCards.pool}
                     onPoolChange={(patch) =>
                       setDraft((current) => ({
                         ...current,
@@ -318,6 +282,7 @@ export function SettingsPage() {
                   }
                   quota={quota}
                   failover={failover}
+                  maxBodyMib={maxBodyMib}
                   onChange={(tier, next) =>
                     setDraft((current) => {
                       const currentTiers =
@@ -374,6 +339,7 @@ export function SettingsPage() {
                   }
                   saving={save.isPending}
                   pending={dirty}
+                  pendingCards={pendingCards.quota}
                 />
               ) : null}
               {tab === 'openai' ? (
@@ -393,6 +359,18 @@ export function SettingsPage() {
                   }
                   saving={save.isPending}
                   pending={dirty}
+                  pendingQuotaCards={pendingCards.openai}
+                />
+              ) : null}
+              {tab === 'gemini-config' ? (
+                <GeminiConfigPane
+                  value={
+                    (draft.gemini as Record<string, unknown> | undefined) || {}
+                  }
+                  onChange={(next) =>
+                    setDraft((current) => ({ ...current, gemini: next }))
+                  }
+                  saving={save.isPending}
                 />
               ) : null}
               {tab === 'logs' ? (
@@ -540,6 +518,8 @@ export function SettingsPage() {
       </div>
       {showSaveBar ? (
         <SaveBar
+          blockedReason={saveBlockedReason}
+          summary={saveBarSummary}
           saving={save.isPending}
           onSave={() => save.mutate()}
           onDiscard={discard}
@@ -549,44 +529,9 @@ export function SettingsPage() {
   )
 }
 
-function settingsSaveToast(
-  tab: SettingsTabId,
-  inherited: number,
-  kernel?: { updated?: number } | null,
-  telemetry?: RoutingSaveResult['telemetry_sync']
-) {
-  if (tab === 'protocol') {
-    const hot =
-      kernel && typeof kernel.updated === 'number'
-        ? kernel.updated > 0
-          ? `kernel 配置已热更新 ${kernel.updated} 个槽`
-          : 'kernel 配置已一致'
-        : '已写入'
-    if (!inherited) return `已保存 · ${hot}`
-    return `已保存 · ${inherited} 个槽位改为跟随全局 · ${hot}`
-  }
-  if (tab === 'openai') return '已保存 · GPT 配置'
-  if (tab === 'telemetry' && telemetry) {
-    const failed = telemetry.failed?.length
-      ? ` · ${telemetry.failed.length} 个未生效：${telemetry.failed.slice(0, 3).join('、')}`
-      : ''
-    return `已保存 · ${telemetry.updated ?? 0} 个 VM 配置已确认发布${failed}`
-  }
-  return '已保存'
-}
-
 function protocolFollowError(message: string) {
   if (/config_missing|kernel_start_failed|wrap_cli_missing/i.test(message)) {
     return '内核文件缺失，先到内核页拉取 wrap/crag 二进制再同步'
   }
   return message
-}
-
-type RoutingSaveResult = {
-  kernel_persona?: { updated?: number; skipped?: number } | null
-  telemetry_sync?: {
-    updated?: number
-    skipped?: number
-    failed?: string[]
-  } | null
 }

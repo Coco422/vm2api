@@ -35,7 +35,14 @@ import {
   geminiInventoryOptions,
   geminiPayloadIssue,
 } from '@/features/import/gemini-environments'
+import {
+  GEMINI_INVENTORY_KEY,
+  geminiResource,
+} from '@/features/import/gemini-operations'
 import { usageQueryOptions } from '@/features/overview/queries'
+import { buildNodePoolsIndex } from '@/features/pools/node-pool-badges'
+import { schedulerPoolsQueryOptions } from '@/features/pools/queries'
+import { proxiesQueryOptions } from '@/features/proxies/queries'
 import { GeminiMaintenanceLink } from '@/features/settings/gemini-maintenance-link'
 import { planDeleteActiveVm } from '@/features/vm/active-vm'
 import { CreateVmDialog } from '@/features/vm/create-vm-dialog'
@@ -127,6 +134,12 @@ export function VmListPage() {
   const vmsQ = useQuery(vmsListQueryOptions(5000))
   const isAdmin = me.data?.role === 'admin'
   const gemini = useQuery({ ...geminiInventoryOptions(), enabled: isAdmin })
+  const proxies = useQuery({ ...proxiesQueryOptions(), enabled: isAdmin })
+  const schedulerPools = useQuery({
+    ...schedulerPoolsQueryOptions(),
+    enabled: isAdmin,
+    retry: false,
+  })
   usePoolSeatStream()
   const usage = useQuery({
     ...usageQueryOptions(5000),
@@ -188,13 +201,20 @@ export function VmListPage() {
   const deleteVm = useMutation({
     mutationFn: async ({
       id,
+      gemini,
       switchTo,
       force,
     }: {
       id: string
+      gemini?: boolean
       switchTo?: string
       force?: boolean
     }) => {
+      if (gemini) {
+        return api<VmDeleteResult>(geminiResource(id), {
+          method: 'DELETE',
+        })
+      }
       if (switchTo) {
         await api(`/api/panel/vms/${encodeURIComponent(switchTo)}/activate`, {
           method: 'POST',
@@ -204,10 +224,15 @@ export function VmListPage() {
         method: 'DELETE',
       })
     },
-    onSuccess: async (data, { id, switchTo }) => {
+    onSuccess: async (data, { id, gemini, switchTo }) => {
       setDeleteTarget(null)
       setDeleteInput('')
       setForceDelete(false)
+      if (gemini) {
+        toast.success(`已删除 ${id}`)
+        await qc.invalidateQueries({ queryKey: GEMINI_INVENTORY_KEY })
+        return
+      }
       await completeVmDeletion(
         qc,
         data,
@@ -224,14 +249,23 @@ export function VmListPage() {
       (!geminiInventory.available ||
         !!geminiPayloadIssue(geminiInventory) ||
         !!geminiInventory.oauth_runtime_issue))
-  const slots = geminiInventory?.available
+  const poolsByNode = buildNodePoolsIndex(
+    isAdmin ? schedulerPools.data : undefined
+  )
+  const rawSlots = geminiInventory?.available
     ? [
         ...vms,
         ...geminiInventory.environments.map((environment) =>
-          geminiSlot(environment, geminiInventory)
+          geminiSlot(environment, geminiInventory, proxies.data?.proxies)
         ),
       ]
     : vms
+  const slots = poolsByNode.size
+    ? rawSlots.map((slot) => {
+        const pools = poolsByNode.get(slot.id)
+        return pools?.length ? { ...slot, pools } : slot
+      })
+    : rawSlots
   const poolQueue = vmsQ.data?.pool_queue
   const accounts = usage.data?.accounts
   const canCreate = me.data?.role === 'admin'
@@ -422,6 +456,7 @@ export function VmListPage() {
           </div>
         </div>
         <VmActionsProvider
+          slots={slots}
           accounts={accounts}
           onReset={
             perms.admin
@@ -574,6 +609,7 @@ export function VmListPage() {
           if (deleteTarget && !deleteBlocked) {
             deleteVm.mutate({
               id: deleteTarget.id,
+              gemini: Boolean(deleteTarget.gemini),
               switchTo: deleteSwitchId,
               force: forceDelete && !!nodeGone,
             })
@@ -602,6 +638,7 @@ export function VmListPage() {
             ) {
               deleteVm.mutate({
                 id: deleteTarget.id,
+                gemini: Boolean(deleteTarget.gemini),
                 switchTo: deleteSwitchId,
                 force: forceDelete && !!nodeGone,
               })

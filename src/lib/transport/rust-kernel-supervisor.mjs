@@ -4,6 +4,7 @@
  */
 
 import { spawn, spawnSync } from 'node:child_process'
+import { isOverlap } from '../core/handover.mjs'
 import fs from 'node:fs'
 import path from 'node:path'
 import {
@@ -1008,7 +1009,9 @@ async function startRustKernel(
   if (!paths.socketPath) return { ok: false, reason: 'socket_missing' }
   const existing = await rustKernelHealth(exec, { timeoutMs: healthTimeoutMs })
   if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
-  const staleWrap = wrapNewerThanKernel(exec)
+  // Blue/green overlap: a newer wrap must not restart a kernel the draining controller may be using.
+  // The deploy syncs wraps once that controller exits (handover exclusive pass).
+  const staleWrap = !isOverlap() && wrapNewerThanKernel(exec)
   const currentVm = kernelVm(exec)
   const expectedSlots = wrapSlotCount(currentVm)
   const slotMismatch = !!paths.configPath && kernelSlotsDiffer(paths.configPath, existing, expectedSlots)
@@ -1411,22 +1414,26 @@ export function writeKernelConfig(
         })
       }
       acceptNativeClaudeSetup(homeDir, '/run/kin/work', vm)
-      if (config.telemetry && isTelemetryEnabled(defaultSeedPolicy(record.seed_policy || {}))) {
-        const workstation = resolveWorkstationProfile(record)
-        config.telemetry = {
-          ...config.telemetry,
+    }
+    if (
+      config.telemetry &&
+      isTelemetryEnabled(defaultSeedPolicy(target.seed_policy || {})) &&
+      (!host.bakedKernel || kind !== 'kvm')
+    ) {
+      const workstation = resolveWorkstationProfile(target)
+      config.telemetry = {
+        ...config.telemetry,
+        enabled: true,
+        dmi_dir: '/etc/kin-dmi',
+        identity: {
           enabled: true,
-          dmi_dir: '/etc/kin-dmi',
-          identity: {
-            enabled: true,
-            linux_kernel: workstation.linux_kernel,
-            linux_distro_id: workstation.linux_distro_id,
-            linux_distro_version: workstation.linux_distro_version,
-            shell: workstation.shell,
-            terminal: workstation.terminal,
-            package_managers: workstation.package_managers,
-          },
-        }
+          linux_kernel: workstation.linux_kernel,
+          linux_distro_id: workstation.linux_distro_id,
+          linux_distro_version: workstation.linux_distro_version,
+          shell: workstation.shell,
+          terminal: workstation.terminal,
+          package_managers: workstation.package_managers,
+        },
       }
     }
   }

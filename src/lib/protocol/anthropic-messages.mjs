@@ -7,15 +7,20 @@ import {
   canonicalizeClaudeMessagesShape,
   copyOfficialAnthropicFields,
   normalizeAnthropicMessages,
+  stripEmptyEffort,
   stripIllegalBodyContentFields,
 } from './sanitize.mjs'
 import { sanitizeAnthropicTools } from './web-search.mjs'
 import { defaultMaxTokensForModel } from './model-policy.mjs'
 
-export function officialMessagesBody(body = {}, { stream = undefined, preserveContentShape = false } = {}) {
-  const out = copyOfficialAnthropicFields(body)
+export function officialMessagesBody(
+  body = {},
+  { stream = undefined, preserveContentShape = false, preserveConsecutiveUser = false } = {},
+) {
+  let out = copyOfficialAnthropicFields(body)
   applyStructuredOutput(out, body)
-  normalizeAnthropicMessages(out)
+  out = stripEmptyEffort(out)
+  normalizeAnthropicMessages(out, { preserveConsecutiveUser })
   stripIllegalBodyContentFields(out)
   if (Array.isArray(out.tools)) out.tools = sanitizeAnthropicTools(out.tools)
   if (stream !== undefined) out.stream = !!stream

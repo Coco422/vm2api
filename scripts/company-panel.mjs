@@ -38,9 +38,8 @@ export function createSandboxPanel({ db, project, accountQuota, apiKeyStore, jso
     snapshot: () => ({ proxies: [], config: {}, total: 0 }),
     panelSnapshot: () => ({ proxies: [], config: {}, totals: { total: 0 } }),
     publicProxy: (proxy) => ({ id: proxy.id }),
-    getProxyForVm: (id) => ['alice-vm', 'bob-vm', 'alice-recovery-vm'].includes(id)
-      ? { id: `fixture-proxy-${id}` }
-      : null,
+    getProxyForVm: (id) =>
+      ['alice-vm', 'bob-vm', 'alice-recovery-vm'].includes(id) ? { id: `fixture-proxy-${id}` } : null,
   }
   const requestLog = new RequestLogStore({ db, dataDir: path.join(project, 'data') })
   const bodies = new WeakMap()
@@ -82,13 +81,15 @@ export function createSandboxPanel({ db, project, accountQuota, apiKeyStore, jso
         engine: 'rust',
         placement: 'local',
         first_failure: fault ? 'kernel' : null,
-        checks: [{
-          id: 'kernel',
-          label: '推理内核',
-          status: fault ? 'error' : 'ok',
-          code: fault ? 'kernel_down' : null,
-          message: fault ? '合成示例：槽内运行时异常' : '合成示例：推理内核已就绪',
-        }],
+        checks: [
+          {
+            id: 'kernel',
+            label: '推理内核',
+            status: fault ? 'error' : 'ok',
+            code: fault ? 'kernel_down' : null,
+            message: fault ? '合成示例：槽内运行时异常' : '合成示例：推理内核已就绪',
+          },
+        ],
       }
     },
   }
@@ -136,7 +137,10 @@ export function createSandboxPanel({ db, project, accountQuota, apiKeyStore, jso
     '/api/panel/usage-logs/overview',
   ])
   const originalAllowed = (method, p) =>
-    (method === 'GET' && (exactRead.has(p) || /^\/api\/panel\/api-keys\/[^/]+\/stats$/.test(p) || /^\/api\/panel\/vms\/[^/]+\/diagnose$/.test(p))) ||
+    (method === 'GET' &&
+      (exactRead.has(p) ||
+        /^\/api\/panel\/api-keys\/[^/]+\/stats$/.test(p) ||
+        /^\/api\/panel\/vms\/[^/]+\/diagnose$/.test(p))) ||
     (method === 'POST' &&
       (p === '/api/panel/login' ||
         p === '/api/panel/logout' ||
@@ -144,7 +148,8 @@ export function createSandboxPanel({ db, project, accountQuota, apiKeyStore, jso
         p === '/api/panel/api-keys' ||
         /^\/api\/panel\/vms\/[^/]+\/(?:schedulable|recover)$/.test(p) ||
         /^\/api\/panel\/api-keys\/[^/]+\/(reveal|rotate|reset-quota)$/.test(p))) ||
-    (method === 'PATCH' && /^\/api\/panel\/(me|users\/[^/]+|api-keys\/[^/]+|vms\/[^/]+\/(owner|quota-thresholds))$/.test(p)) ||
+    (method === 'PATCH' &&
+      /^\/api\/panel\/(me|users\/[^/]+|api-keys\/[^/]+|vms\/[^/]+\/(owner|quota-thresholds))$/.test(p)) ||
     (method === 'PUT' && p === '/api/panel/onboarding')
 
   return async (req, res, url) => {

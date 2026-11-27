@@ -42,6 +42,20 @@ HOST_ARCH=""
 REQUESTED_ARCH=""
 GEMINI_PAYLOAD_SOURCE=""
 PREV_IMAGE_TAG=""
+DB_DRIVER_ARG=""
+DATABASE_URL_ARG=""
+REDIS_URL_ARG=""
+NO_REDIS=0
+PG_PORT_ARG=""
+REDIS_PORT_ARG=""
+LOCAL_DATA=0
+PG_DATA_DIR_ARG=""
+REDIS_DATA_DIR_ARG=""
+AUTO_MIGRATE=0
+AUTO_INSTALL_DEPS=1
+PG_PORT_EXPLICIT=0
+REDIS_PORT_EXPLICIT=0
+APT_UPDATED=0
 
 info() { echo -e "${BLUE}[信息]${NC} $*"; }
 ok() { echo -e "${GREEN}[成功]${NC} $*"; }
@@ -70,9 +84,13 @@ usage() {
   prepare-native       仅准备 Docker CRAG 的宿主 AppArmor userns 权限
   prepare-crag-host    仅准备 CRAG 订阅宿主 ID，不重启服务
   prepare-gemini       启用宿主 Gemini 服务并安装签名载荷（amd64 默认自动获取）
+  prepare-deps         检查并自动补装宿主基础/Docker/PostgreSQL 客户端依赖
   check                对比当前版本与最新 Release，打印 changelog
   changelog            打印本地 CHANGELOG.md
-  status               当前版本、容器、探活
+  status               当前版本、容器、数据库引擎、探活
+  db-migrate           将现有 SQLite 数据库平滑迁移替换为 PostgreSQL（调用 replace-db-to-pg.sh）
+  db-status            查看当前数据库引擎、PG/Redis 容器与迁移状态
+  db-rollback          一键回滚回原 SQLite 配置并重启控制面
   uninstall            停控制面（默认保留 .env / vms / data）
 
 选项:
@@ -80,6 +98,17 @@ usage() {
   --crag-version TAG   指定 CRAG Release：vX.Y.Z 或 payload-YYYY.MM.DD-crag-X.Y.Z[-legacy]（省略为最新正式版）
   --gemini-payload-source DIR  已解包的 Gemini 签名载荷目录（Linux amd64，需独立配置发行公钥）
   --dir PATH           安装目录（默认 ${INSTALL_DIR}）
+  --db postgres|sqlite 指定数据库引擎（全新安装默认 postgres；升级存量 SQLite 默认保留 sqlite）
+  --database-url URL   使用外部/云端 PostgreSQL 连接串（自动跳过本地 PG 容器）
+  --redis-url URL      使用外部/云端 Redis 连接串（自动跳过本地 Redis 容器）
+  --no-redis           禁用 Redis L2 缓存，仅用 L1 + PG LISTEN/NOTIFY（不启本地 Redis 容器）
+  --pg-port PORT       本地 PostgreSQL 监听端口（仅 127.0.0.1，默认 5432，冲突自动顺延）
+  --redis-port PORT    本地 Redis 监听端口（仅 127.0.0.1，默认 6379，冲突自动顺延）
+  --local-data         启用 docker-compose.local.yml 将 PG/Redis 持久化到宿主机目录
+  --pg-data-dir DIR    指定本地 PG 数据目录（隐含 --local-data）
+  --redis-data-dir DIR 指定本地 Redis 数据目录（隐含 --local-data）
+  --auto-migrate       升级存量 SQLite 部署后，自动执行无缝迁移切换至 PostgreSQL
+  --no-install-deps    不自动安装缺失的系统依赖，仅检查并报错
   --yes                非交互
   --no-start           只拉代码，不启动控制面或准备 Gemini
   --no-sync-wrap       跳过 CRAG 获取及槽内 kernel 检查、调度与同步
@@ -174,14 +203,152 @@ compose() {
   fi
 }
 
+detect_pkg_mgr() {
+  if command -v apt-get >/dev/null 2>&1; then
+    echo "apt"
+  elif command -v dnf >/dev/null 2>&1; then
+    echo "dnf"
+  elif command -v yum >/dev/null 2>&1; then
+    echo "yum"
+  elif command -v apk >/dev/null 2>&1; then
+    echo "apk"
+  else
+    echo ""
+  fi
+}
+
+install_host_pkgs() {
+  local mgr
+  mgr="$(detect_pkg_mgr)"
+  [ $# -gt 0 ] || return 0
+  if [ "$AUTO_INSTALL_DEPS" != 1 ]; then
+    err "缺少宿主依赖软件包: $*（已启用 --no-install-deps，请手动安装后重试）"
+    return 1
+  fi
+  if [ "$(id -u)" -ne 0 ]; then
+    err "自动安装依赖需要 root 权限: $*"
+    return 1
+  fi
+  case "$mgr" in
+    apt)
+      if [ "$APT_UPDATED" = 0 ]; then
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq
+        APT_UPDATED=1
+      fi
+      info "自动安装宿主依赖 (apt): $*"
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@"
+      ;;
+    dnf)
+      info "自动安装宿主依赖 (dnf): $*"
+      dnf install -y "$@"
+      ;;
+    yum)
+      info "自动安装宿主依赖 (yum): $*"
+      yum install -y "$@"
+      ;;
+    apk)
+      info "自动安装宿主依赖 (apk): $*"
+      apk add --no-cache "$@"
+      ;;
+    *)
+      err "未识别系统包管理器，请手动安装: $*"
+      return 1
+      ;;
+  esac
+}
+
+ensure_host_dependencies() {
+  local mgr
+  mgr="$(detect_pkg_mgr)"
+  local -a missing_pkgs=()
+
+  command -v git >/dev/null 2>&1 || missing_pkgs+=(git)
+  command -v curl >/dev/null 2>&1 || missing_pkgs+=(curl)
+  command -v python3 >/dev/null 2>&1 || missing_pkgs+=(python3)
+  command -v openssl >/dev/null 2>&1 || missing_pkgs+=(openssl)
+  if ! command -v psql >/dev/null 2>&1 || ! command -v pg_dump >/dev/null 2>&1 || ! command -v pg_isready >/dev/null 2>&1; then
+    case "$mgr" in
+      apt|apk) missing_pkgs+=(postgresql-client) ;;
+      dnf|yum) missing_pkgs+=(postgresql) ;;
+      *) missing_pkgs+=(postgresql-client) ;;
+    esac
+  fi
+
+  if [ "${#missing_pkgs[@]}" -gt 0 ]; then
+    if [ "$AUTO_INSTALL_DEPS" = 1 ] && [ "$(id -u)" -eq 0 ] && [ -n "$mgr" ]; then
+      install_host_pkgs "${missing_pkgs[@]}" || exit 1
+    else
+      err "缺少依赖: ${missing_pkgs[*]}"
+      info "Ubuntu/Debian: apt-get update && apt-get install -y git curl ca-certificates python3 openssl postgresql-client"
+      exit 1
+    fi
+  fi
+
+  # Optional redis-cli for Redis diagnostics (best-effort, non-fatal)
+  if [ "$NO_REDIS" = 0 ] && ! command -v redis-cli >/dev/null 2>&1 && [ "$AUTO_INSTALL_DEPS" = 1 ] && [ "$(id -u)" -eq 0 ]; then
+    case "$mgr" in
+      apt)
+        [ "$APT_UPDATED" = 1 ] || { DEBIAN_FRONTEND=noninteractive apt-get update -qq || true; APT_UPDATED=1; }
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends redis-tools >/dev/null 2>&1 || true
+        ;;
+      dnf) dnf install -y redis >/dev/null 2>&1 || true ;;
+      yum) yum install -y redis >/dev/null 2>&1 || true ;;
+      apk) apk add --no-cache redis >/dev/null 2>&1 || true ;;
+    esac
+  fi
+
+  if ! command -v docker >/dev/null 2>&1; then
+    if [ "$AUTO_INSTALL_DEPS" = 1 ] && [ "$(id -u)" -eq 0 ] && [ -n "$mgr" ]; then
+      info "未检测到 Docker，正在自动安装 Docker Engine 与 Compose 插件..."
+      case "$mgr" in
+        apt)
+          install_host_pkgs ca-certificates curl gnupg || exit 1
+          if ! (curl -fsSL https://get.docker.com | sh); then
+            install_host_pkgs docker.io docker-compose-v2 || install_host_pkgs docker.io docker-compose || exit 1
+          fi
+          ;;
+        dnf|yum)
+          install_host_pkgs ca-certificates curl || exit 1
+          if ! (curl -fsSL https://get.docker.com | sh); then
+            install_host_pkgs docker docker-compose-plugin || exit 1
+          fi
+          ;;
+        apk)
+          install_host_pkgs docker docker-cli-compose || exit 1
+          ;;
+      esac
+    else
+      err "缺少依赖: docker"
+      info "Ubuntu: apt-get update && apt-get install -y git curl ca-certificates docker.io"
+      exit 1
+    fi
+  fi
+
+  if ! docker compose version >/dev/null 2>&1 && ! command -v docker-compose >/dev/null 2>&1; then
+    if [ "$AUTO_INSTALL_DEPS" = 1 ] && [ "$(id -u)" -eq 0 ] && [ -n "$mgr" ]; then
+      info "未检测到 Docker Compose 插件，正在自动安装..."
+      case "$mgr" in
+        apt) install_host_pkgs docker-compose-plugin || install_host_pkgs docker-compose-v2 || install_host_pkgs docker-compose || exit 1 ;;
+        dnf|yum) install_host_pkgs docker-compose-plugin || install_host_pkgs docker-compose || exit 1 ;;
+        apk) install_host_pkgs docker-cli-compose || exit 1 ;;
+      esac
+    fi
+  fi
+
+  if ! docker info >/dev/null 2>&1 && command -v systemctl >/dev/null 2>&1 && [ "$(id -u)" -eq 0 ]; then
+    systemctl enable --now docker >/dev/null 2>&1 || systemctl start docker >/dev/null 2>&1 || true
+  fi
+}
+
 require_cmds() {
+  ensure_host_dependencies
   local missing=()
   for c in git curl docker; do
     command -v "$c" >/dev/null 2>&1 || missing+=("$c")
   done
   if [ ${#missing[@]} -gt 0 ]; then
     err "缺少依赖: ${missing[*]}"
-    info "Ubuntu: apt-get update && apt-get install -y git curl ca-certificates docker.io"
+    info "Ubuntu: apt-get update && apt-get install -y git curl ca-certificates docker.io postgresql-client"
     exit 1
   fi
   if ! docker info >/dev/null 2>&1; then
@@ -307,12 +474,34 @@ env_get() {
 env_set() {
   local name="$1"
   local value="$2"
-  local envf="${INSTALL_DIR}/.env"
-  if grep -qE "^${name}=" "$envf" 2>/dev/null; then
-    sed -i.bak "s|^${name}=.*|${name}=${value}|" "$envf"
-    rm -f "${envf}.bak"
-  else
-    printf '%s=%s\n' "$name" "$value" >>"$envf"
+  local envf="${3:-${INSTALL_DIR}/.env}"
+  local tmp
+  touch "$envf"
+  tmp="$(mktemp "${envf}.XXXXXX")"
+  _VM2API_ENV_KEY="$name" _VM2API_ENV_VAL="$value" awk '
+    BEGIN { key = ENVIRON["_VM2API_ENV_KEY"]; val = ENVIRON["_VM2API_ENV_VAL"]; done = 0 }
+    {
+      idx = index($0, "=")
+      if (idx > 0 && substr($0, 1, idx - 1) == key) {
+        print key "=" val
+        done = 1
+        next
+      }
+      print
+    }
+    END { if (!done) print key "=" val }
+  ' "$envf" >"$tmp"
+  mv -f "$tmp" "$envf"
+}
+
+ensure_compose_file_includes() {
+  local extra="$1" cur
+  [ -f "${INSTALL_DIR}/${extra}" ] || return 0
+  cur="$(env_get COMPOSE_FILE)"
+  if [ -z "$cur" ]; then
+    env_set COMPOSE_FILE "docker-compose.yml:${extra}"
+  elif ! printf ':%s:' "$cur" | grep -Fq ":${extra}:"; then
+    env_set COMPOSE_FILE "${cur}:${extra}"
   fi
 }
 
@@ -434,6 +623,69 @@ ensure_env() {
   fi
   env_set_if_empty VM2API_API_KEY "$(gen_secret)" || true
   env_set_if_empty VM2API_DB_SECRET "$(gen_secret)" || true
+  env_set_if_empty POSTGRES_USER "vm2api" || true
+  env_set_if_empty POSTGRES_DB "vm2api" || true
+  env_set_if_empty POSTGRES_PASSWORD "$(gen_secret)" || true
+  env_set_if_empty VM2API_PG_PORT "5432" || true
+  env_set_if_empty REDIS_PASSWORD "$(gen_secret)" || true
+  env_set_if_empty VM2API_REDIS_PORT "6379" || true
+
+  # Apply explicit PostgreSQL / Redis CLI overrides when provided.
+  # When upgrading an existing unmigrated SQLite install with --auto-migrate, defer writing
+  # DATABASE_URL / REDIS_URL until replace-db-to-pg.sh backs up .env and completes data cutover.
+  local defer_pg_cutover=0
+  if [ "$AUTO_MIGRATE" = 1 ] && [ -f "${INSTALL_DIR}/data/kin.db" ] && [ "$(env_get VM2API_DB_DRIVER)" != "postgres" ]; then
+    defer_pg_cutover=1
+  fi
+
+  if [ "$defer_pg_cutover" = 0 ]; then
+    if [ -n "$PG_PORT_ARG" ]; then
+      env_set VM2API_PG_PORT "$PG_PORT_ARG"
+    fi
+    if [ -n "$REDIS_PORT_ARG" ]; then
+      env_set VM2API_REDIS_PORT "$REDIS_PORT_ARG"
+    fi
+    if [ -n "$DATABASE_URL_ARG" ]; then
+      env_set DATABASE_URL "$DATABASE_URL_ARG"
+      if [ -z "$DB_DRIVER_ARG" ] && [ ! -f "${INSTALL_DIR}/data/kin.db" ]; then
+        DB_DRIVER_ARG="postgres"
+      fi
+    fi
+    if [ "$NO_REDIS" = 1 ]; then
+      env_set VM2API_REDIS_DISABLED "1"
+    elif [ -n "$REDIS_URL_ARG" ]; then
+      env_set REDIS_URL "$REDIS_URL_ARG"
+      env_set VM2API_REDIS_DISABLED "0"
+    fi
+    if [ "$LOCAL_DATA" = 1 ]; then
+      [ -n "$PG_DATA_DIR_ARG" ] && env_set VM2API_PG_DATA_DIR "$PG_DATA_DIR_ARG"
+      [ -n "$REDIS_DATA_DIR_ARG" ] && env_set VM2API_REDIS_DATA_DIR "$REDIS_DATA_DIR_ARG"
+      ensure_compose_file_includes "docker-compose.local.yml"
+    fi
+  fi
+
+  # 升级保护：若检测到既有 SQLite (data/kin.db) 且 .env 尚未声明 VM2API_DB_DRIVER / DATABASE_URL，
+  # 先保持 sqlite 防止误启空 PG 库，待运维执行 db-migrate / --auto-migrate 完成迁移切换。
+  if [ "$defer_pg_cutover" = 1 ]; then
+    env_set VM2API_DB_DRIVER "sqlite"
+    info "检测到既有 SQLite (${INSTALL_DIR}/data/kin.db)，升级控制面完成后将自动执行无缝迁移切换至 PostgreSQL"
+  elif [ -n "$DB_DRIVER_ARG" ]; then
+    if [ "$DB_DRIVER_ARG" = "postgres" ] && [ -f "${INSTALL_DIR}/data/kin.db" ] && [ "$(env_get VM2API_DB_DRIVER)" != "postgres" ]; then
+      env_set VM2API_DB_DRIVER "sqlite"
+      warn "检测到既有 SQLite (${INSTALL_DIR}/data/kin.db)，暂保持 sqlite 防止误启空 PG 库；请加 --auto-migrate 或运行 replace-db-to-pg.sh 完成迁移"
+    else
+      env_set VM2API_DB_DRIVER "$DB_DRIVER_ARG"
+    fi
+  elif [ -z "$(env_get VM2API_DB_DRIVER)" ]; then
+    if [ -f "${INSTALL_DIR}/data/kin.db" ] && [ -z "$(env_get DATABASE_URL)" ] && [ -z "$(env_get VM2API_DATABASE_URL)" ]; then
+      env_set VM2API_DB_DRIVER "sqlite"
+      warn "检测到已有 SQLite 数据库 (${INSTALL_DIR}/data/kin.db)，暂保持 VM2API_DB_DRIVER=sqlite 以防数据切换丢失"
+      info "请运行以下命令平滑迁移并切换至 PostgreSQL："
+      info "  sudo bash ${INSTALL_DIR}/deploy/replace-db-to-pg.sh"
+    else
+      env_set VM2API_DB_DRIVER "postgres"
+    fi
+  fi
   chmod 600 "$envf" || true
 }
 
@@ -565,14 +817,18 @@ fetch_file() {
 # 镜像安装：只落部署文件，不 clone 仓库，不在本机构建。
 fetch_release_files() {
   local tag="$1"
-  mkdir -p "${INSTALL_DIR}/deploy"
+  mkdir -p "${INSTALL_DIR}/deploy" "${INSTALL_DIR}/scripts"
   info "下载部署文件 ${tag} → ${INSTALL_DIR}"
   fetch_file "$tag" docker-compose.yml "${INSTALL_DIR}/docker-compose.yml"
+  fetch_file "$tag" docker-compose.local.yml "${INSTALL_DIR}/docker-compose.local.yml" 1
   fetch_file "$tag" .env.example "${INSTALL_DIR}/.env.example"
   fetch_file "$tag" VERSION "${INSTALL_DIR}/VERSION"
   fetch_file "$tag" CHANGELOG.md "${INSTALL_DIR}/CHANGELOG.md" 1
   fetch_file "$tag" deploy/install.sh "${INSTALL_DIR}/deploy/install.sh" 1
-  chmod +x "${INSTALL_DIR}/deploy/install.sh" 2>/dev/null || true
+  fetch_file "$tag" deploy/install-pg.sh "${INSTALL_DIR}/deploy/install-pg.sh" 1
+  fetch_file "$tag" deploy/replace-db-to-pg.sh "${INSTALL_DIR}/deploy/replace-db-to-pg.sh" 1
+  fetch_file "$tag" scripts/migrate-sqlite-to-pg.mjs "${INSTALL_DIR}/scripts/migrate-sqlite-to-pg.mjs" 1
+  chmod +x "${INSTALL_DIR}/deploy/install.sh" "${INSTALL_DIR}/deploy/install-pg.sh" "${INSTALL_DIR}/deploy/replace-db-to-pg.sh" 2>/dev/null || true
   if [ "$HOST_ARCH" = arm64 ]; then
     fetch_file "$tag" deploy/prepare-arm64.py "${INSTALL_DIR}/deploy/prepare-arm64.py" 1
     if [ ! -f "${INSTALL_DIR}/deploy/prepare-arm64.py" ]; then
@@ -629,6 +885,242 @@ prepare_gemini_dependencies() {
   fi
 }
 
+gemini_apparmor_userns_restricted() {
+  local root="${1:-/}" enabled restricted enabled_val restricted_val
+  enabled="${root%/}/sys/module/apparmor/parameters/enabled"
+  restricted="${root%/}/proc/sys/kernel/apparmor_restrict_unprivileged_userns"
+  [ -f "$enabled" ] && [ -f "$restricted" ] || return 1
+  enabled_val="$(tr -d '[:space:]' < "$enabled" 2>/dev/null)" || return 1
+  restricted_val="$(tr -d '[:space:]' < "$restricted" 2>/dev/null)" || return 1
+  case "$enabled_val" in
+    Y|1|yes) ;;
+    *) return 1 ;;
+  esac
+  [ "$restricted_val" = "1" ]
+}
+
+check_gemini_unit_apparmor_profile() {
+  local unit_path="${1:-/etc/systemd/system/vm2api-gemini.service}"
+  local line trimmed val live_profile
+  if [ -L "$unit_path" ]; then
+    err "拒绝覆盖符号链接形式的 Gemini unit 文件: $unit_path"
+    return 1
+  fi
+  if [ -e "$unit_path" ]; then
+    if [ ! -f "$unit_path" ]; then
+      err "拒绝覆盖非常规文件的 Gemini unit: $unit_path"
+      return 1
+    fi
+    while IFS= read -r line || [ -n "$line" ]; do
+      trimmed="${line#"${line%%[![:space:]]*}"}"
+      trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+      case "$trimmed" in
+        ""|\#*|";"*) continue ;;
+        AppArmorProfile=*)
+          val="${trimmed#AppArmorProfile=}"
+          val="${val#"${val%%[![:space:]]*}"}"
+          val="${val%"${val##*[![:space:]]}"}"
+          if [ "$val" != "vm2api-gemini" ]; then
+            err "检测到管理员自定义的 AppArmorProfile=${val}，拒绝覆盖: $unit_path"
+            return 1
+          fi
+          ;;
+      esac
+    done < "$unit_path"
+  fi
+  if command -v systemctl >/dev/null; then
+    live_profile="$(systemctl show --property=AppArmorProfile --value vm2api-gemini.service 2>/dev/null || true)"
+    live_profile="${live_profile#"${live_profile%%[![:space:]]*}"}"
+    live_profile="${live_profile%"${live_profile##*[![:space:]]}"}"
+    if [ -n "$live_profile" ] && [ "$live_profile" != "vm2api-gemini" ]; then
+      err "检测到管理员自定义的 AppArmorProfile=${live_profile}，拒绝覆盖"
+      return 1
+    fi
+  fi
+  return 0
+}
+
+render_gemini_unit_apparmor() {
+  local unit_file="$1" tmp line trimmed section="" has_unit=0 has_service=0
+  local has_after=0 has_requires=0 has_profile=0 val
+  [ -f "$unit_file" ] && [ ! -L "$unit_file" ] || { err "Gemini unit 模板文件无效: $unit_file"; return 1; }
+  while IFS= read -r line || [ -n "$line" ]; do
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    case "$trimmed" in
+      \[Unit\]) section="Unit"; has_unit=1; continue ;;
+      \[Service\]) section="Service"; has_service=1; continue ;;
+      \[*\]) section="Other"; continue ;;
+      ""|\#*|";"*) continue ;;
+    esac
+    if [ "$section" = "Unit" ]; then
+      case "$trimmed" in
+        After=*)
+          case " ${trimmed#After=} " in *" apparmor.service "*) has_after=1 ;; esac
+          ;;
+        Requires=*)
+          case " ${trimmed#Requires=} " in *" apparmor.service "*) has_requires=1 ;; esac
+          ;;
+      esac
+    elif [ "$section" = "Service" ]; then
+      case "$trimmed" in
+        AppArmorProfile=*)
+          val="${trimmed#AppArmorProfile=}"
+          val="${val#"${val%%[![:space:]]*}"}"
+          val="${val%"${val##*[![:space:]]}"}"
+          if [ "$val" != "vm2api-gemini" ]; then
+            err "检测到自定义 AppArmorProfile=${val}，拒绝覆盖: $unit_file"
+            return 1
+          fi
+          has_profile=1
+          ;;
+      esac
+    elif [[ "$trimmed" == AppArmorProfile=* ]]; then
+      err "检测到非常规位置的 AppArmorProfile 配置，拒绝覆盖: $unit_file"
+      return 1
+    fi
+  done < "$unit_file"
+  if [ "$has_unit" != 1 ] || [ "$has_service" != 1 ]; then
+    err "Gemini unit 缺少 [Unit] 或 [Service] 段: $unit_file"
+    return 1
+  fi
+  if [ "$has_after" = 1 ] && [ "$has_requires" = 1 ] && [ "$has_profile" = 1 ]; then
+    return 0
+  fi
+  tmp="$(mktemp "${unit_file}.XXXXXX")" || return 1
+  section=""
+  local emitted_unit=0 emitted_service=0 blanks=0
+  {
+    while IFS= read -r line || [ -n "$line" ]; do
+      trimmed="${line#"${line%%[![:space:]]*}"}"
+      trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+      if [ -z "$trimmed" ]; then
+        blanks=$((blanks + 1))
+        continue
+      fi
+      case "$trimmed" in
+        \[*\])
+          if [ "$section" = "Unit" ] && [ "$emitted_unit" = 0 ]; then
+            [ "$has_after" = 1 ] || printf '%s\n' 'After=apparmor.service'
+            [ "$has_requires" = 1 ] || printf '%s\n' 'Requires=apparmor.service'
+            emitted_unit=1
+          elif [ "$section" = "Service" ] && [ "$emitted_service" = 0 ]; then
+            [ "$has_profile" = 1 ] || printf '%s\n' 'AppArmorProfile=vm2api-gemini'
+            emitted_service=1
+          fi
+          while [ "$blanks" -gt 0 ]; do
+            printf '\n'
+            blanks=$((blanks - 1))
+          done
+          case "$trimmed" in
+            \[Unit\]) section="Unit" ;;
+            \[Service\]) section="Service" ;;
+            *) section="Other" ;;
+          esac
+          printf '%s\n' "$line"
+          continue
+          ;;
+      esac
+      while [ "$blanks" -gt 0 ]; do
+        printf '\n'
+        blanks=$((blanks - 1))
+      done
+      printf '%s\n' "$line"
+    done < "$unit_file"
+    if [ "$section" = "Unit" ] && [ "$emitted_unit" = 0 ]; then
+      [ "$has_after" = 1 ] || printf '%s\n' 'After=apparmor.service'
+      [ "$has_requires" = 1 ] || printf '%s\n' 'Requires=apparmor.service'
+    elif [ "$section" = "Service" ] && [ "$emitted_service" = 0 ]; then
+      [ "$has_profile" = 1 ] || printf '%s\n' 'AppArmorProfile=vm2api-gemini'
+    fi
+    while [ "$blanks" -gt 0 ]; do
+      printf '\n'
+      blanks=$((blanks - 1))
+    done
+  } > "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f "$tmp" "$unit_file" || { rm -f -- "$tmp"; return 1; }
+}
+
+gemini_bwrap_userns_mediated() {
+  local root="${1:-/}" staged profiles
+  staged="${root%/}/etc/apparmor.d/bwrap-userns-restrict"
+  [ -f "$staged" ] || return 1
+  profiles="${root%/}/sys/kernel/security/apparmor/profiles"
+  if [ -f "$profiles" ] && ! grep -Fq bwrap "$profiles" 2>/dev/null; then
+    return 1
+  fi
+  return 0
+}
+
+install_gemini_managed_bwrap() {
+  local root="${1:-/}" host_dir="${root%/}/usr/local/lib/vm2api-gemini"
+  local entry="${host_dir}/exec/bwrap" source
+  command -v install >/dev/null || { err "Gemini 沙箱需要 install(1)"; return 1; }
+  source="$(command -v bwrap)" || { err "Gemini 沙箱需要 bubblewrap（bwrap）"; return 1; }
+  install -d -m 755 "${host_dir}/exec" || return 1
+  if ! install -m 755 -- "$source" "$entry"; then
+    err "无法安装 Gemini 受管 bwrap 入口: $entry"
+    return 1
+  fi
+  ok "Gemini 受管 bwrap 入口已同步: $entry"
+  return 0
+}
+
+# Prepare a scoped, unattached AppArmor profile for vm2api-gemini.service when
+# the host restricts unprivileged user namespaces (e.g. Ubuntu 24.04).
+# Never modifies kernel sysctls or attaches globally to /usr/bin/bwrap.
+prepare_gemini_apparmor() {
+  local root="${1:-/}" unit_path="${2:-}" directory profile candidate marker load_state
+  [ -n "$unit_path" ] || unit_path="${root%/}/etc/systemd/system/vm2api-gemini.service"
+  gemini_apparmor_userns_restricted "$root" || return 0
+  command -v apparmor_parser >/dev/null || { err "Gemini 沙箱需要 apparmor_parser（请安装 apparmor 后重试）"; return 1; }
+  directory="${root%/}/etc/apparmor.d"
+  [ -f "$directory/abi/4.0" ] || { err "Gemini 沙箱 userns 需要 AppArmor ABI 4.0（缺少 $directory/abi/4.0）"; return 1; }
+  command -v systemctl >/dev/null || { err "Gemini AppArmor 准备需要 systemctl"; return 1; }
+  load_state="$(systemctl show --property=LoadState --value apparmor.service 2>/dev/null || true)"
+  load_state="${load_state#"${load_state%%[![:space:]]*}"}"
+  load_state="${load_state%"${load_state##*[![:space:]]}"}"
+  [ "$load_state" = loaded ] || { err "apparmor.service 未加载（LoadState=${load_state:-unknown}），无法持久化 vm2api-gemini profile"; return 1; }
+  check_gemini_unit_apparmor_profile "$unit_path" || return 1
+  profile="$directory/vm2api-gemini"
+  marker='# Managed by vm2api Gemini host userns preparation.'
+  if [ -L "$profile" ] || { [ -e "$profile" ] && { [ ! -f "$profile" ] || [ "$(head -n 1 "$profile")" != "$marker" ]; }; }; then
+    err "拒绝覆盖非 vm2api 管理的 AppArmor profile: $profile"
+    return 1
+  fi
+  local bwrap_rule=""
+  if gemini_bwrap_userns_mediated "$root"; then
+    install_gemini_managed_bwrap "$root" || return 1
+    bwrap_rule='  /usr/local/lib/vm2api-gemini/exec/bwrap ix,'
+  fi
+  candidate="$(mktemp "$directory/.vm2api-gemini.XXXXXX")" || return 1
+  if ! printf '%s\n' \
+    "$marker" \
+    'abi <abi/4.0>,' \
+    'profile vm2api-gemini flags=(unconfined) {' \
+    '  userns,' \
+    ${bwrap_rule:+"$bwrap_rule"} \
+    '}' > "$candidate" || ! chmod 644 "$candidate"; then
+    rm -f -- "$candidate"
+    return 1
+  fi
+  if ! apparmor_parser -Q -K "$candidate"; then
+    rm -f -- "$candidate"
+    err "Gemini AppArmor profile 检查失败: $profile"
+    return 1
+  fi
+  if ! apparmor_parser -r -K "$candidate"; then
+    rm -f -- "$candidate"
+    err "Gemini AppArmor profile 加载失败: $profile"
+    return 1
+  fi
+  if ! mv -f "$candidate" "$profile"; then
+    rm -f -- "$candidate"
+    return 1
+  fi
+  ok "Gemini AppArmor userns profile 已加载并保存: $profile"
+}
+
 prepare_gemini_maintenance() (
   local tag="$1" mode="$2" root=/usr/local/lib/vm2api-gemini-maintenance
   local state=/var/lib/vm2api-gemini config=/etc/vm2api/gemini-maintenance.json
@@ -663,7 +1155,7 @@ PY
     return 1
   fi
   bundle="$(mktemp -d "${root}/bundles/bundle-${tag}.XXXXXX")" || return 1
-  local -a files=(scripts/gemini-maintenance.py deploy/gemini-maintenance.service.example
+  local -a files=(scripts/gemini-maintenance.py scripts/gemini_host_apparmor.py scripts/gemini_agy_patch.py deploy/gemini-maintenance.service.example
     scripts/gemini-host.py scripts/gemini_host_account.py scripts/gemini_host_inference.py
     scripts/gemini_host_native.py scripts/gemini-host-egress.sh scripts/fetch-default-gemini.py
     scripts/install-gemini-payload.mjs src/lib/gemini/payload.mjs deploy/payload.json deploy/gemini-host.service.example)
@@ -699,7 +1191,7 @@ if not match:
 (bundle / 'catalog.json').write_text(json.dumps([{'id': tag, 'version': match[1], 'cli_version': '1.5.9'}]) + '\n')
 (bundle / 'maintenance-config.json').write_text(json.dumps({'install_dir': str(install), 'bundle_dir': str(bundle)}) + '\n')
 PY
-  for file in "$config" "$root/scripts/gemini-maintenance.py" "$unit"; do
+  for file in "$config" "$root/scripts/gemini-maintenance.py" "$root/scripts/gemini_host_apparmor.py" "$root/scripts/gemini_agy_patch.py" "$unit"; do
     if [ -e "$file" ] || [ -L "$file" ]; then
       [ ! -L "$file" ] && [ -f "$file" ] && [ "$(stat -c '%u:%h' "$file")" = 0:1 ] || { err "拒绝覆盖不受信的维护文件"; return 1; }
       local permissions
@@ -736,17 +1228,23 @@ PY
   systemctl is-enabled --quiet vm2api-gemini-maintenance.service && was_enabled=1
   [ ! -f "$config" ] || install -m 600 "$config" "$backup/config.json" || return 1
   [ ! -f "$root/scripts/gemini-maintenance.py" ] || install -m 644 "$root/scripts/gemini-maintenance.py" "$backup/daemon.py" || return 1
+  [ ! -f "$root/scripts/gemini_host_apparmor.py" ] || install -m 644 "$root/scripts/gemini_host_apparmor.py" "$backup/apparmor.py" || return 1
+  [ ! -f "$root/scripts/gemini_agy_patch.py" ] || install -m 644 "$root/scripts/gemini_agy_patch.py" "$backup/agy_patch.py" || return 1
   [ ! -f "$unit" ] || install -m 644 "$unit" "$backup/service" || return 1
   if atomic_maintenance_file "$bundle/maintenance-config.json" "$config" 600 &&
     atomic_maintenance_file "$bundle/scripts/gemini-maintenance.py" "$root/scripts/gemini-maintenance.py" 644 &&
+    atomic_maintenance_file "$bundle/scripts/gemini_host_apparmor.py" "$root/scripts/gemini_host_apparmor.py" 644 &&
+    atomic_maintenance_file "$bundle/scripts/gemini_agy_patch.py" "$root/scripts/gemini_agy_patch.py" 644 &&
     atomic_maintenance_file "$bundle/deploy/gemini-maintenance.service.example" "$unit" 644 &&
     systemctl daemon-reload && systemctl enable vm2api-gemini-maintenance.service && systemctl restart vm2api-gemini-maintenance.service; then
-    ok "Gemini 维护服务已就绪，可在设置 → Gemini 操作"
+    ok "Gemini 维护服务已就绪，可在设置 → Gemini 维护 操作"
     return 0
   fi
   systemctl stop vm2api-gemini-maintenance.service || warn "无法停止未就绪的维护服务"
   if [ -f "$backup/config.json" ]; then atomic_maintenance_file "$backup/config.json" "$config" 600 || restored=0; else rm -f -- "$config" || restored=0; fi
   if [ -f "$backup/daemon.py" ]; then atomic_maintenance_file "$backup/daemon.py" "$root/scripts/gemini-maintenance.py" 644 || restored=0; else rm -f -- "$root/scripts/gemini-maintenance.py" || restored=0; fi
+  if [ -f "$backup/apparmor.py" ]; then atomic_maintenance_file "$backup/apparmor.py" "$root/scripts/gemini_host_apparmor.py" 644 || restored=0; else rm -f -- "$root/scripts/gemini_host_apparmor.py" || restored=0; fi
+  if [ -f "$backup/agy_patch.py" ]; then atomic_maintenance_file "$backup/agy_patch.py" "$root/scripts/gemini_agy_patch.py" 644 || restored=0; else rm -f -- "$root/scripts/gemini_agy_patch.py" || restored=0; fi
   if [ -f "$backup/service" ]; then atomic_maintenance_file "$backup/service" "$unit" 644 || restored=0; else rm -f -- "$unit" || restored=0; fi
   systemctl daemon-reload || restored=0
   [ "$was_enabled" = 1 ] || systemctl disable vm2api-gemini-maintenance.service || warn "无法恢复维护服务的启用状态"
@@ -779,15 +1277,32 @@ prepare_gemini_host() (
   prepare_gemini_maintenance "$tag" "$mode" || return 1
 
   local host_dir=/usr/local/lib/vm2api-gemini
-  local default_source="${host_dir}/defaults/0.3.0"
+  local defaults_dir="${host_dir}/defaults"
+  local legacy_default_source="${defaults_dir}/0.3.0"
+  local default_source="$legacy_default_source"
   local unit=/etc/systemd/system/vm2api-gemini.service
   local current="${INSTALL_DIR}/share/gemini/current"
-  if [ -z "$source" ] && command -v systemctl >/dev/null; then
-    # Keep a source supplied by an existing unit/drop-in without copying it into .env.
-    local exec_start source_pattern='(^|[[:space:]])--payload-source(=|[[:space:]]+)(/[A-Za-z0-9._/-]+)([[:space:]]|$)'
-    exec_start="$(systemctl show --property=ExecStart --value vm2api-gemini.service 2>/dev/null)" || exec_start=""
-    if [[ "$exec_start" =~ $source_pattern ]] && [ "${BASH_REMATCH[3]}" != "$default_source" ]; then
+  local existing_exec_start="" existing_public_key="" existing_egress=""
+  if command -v systemctl >/dev/null; then
+    existing_exec_start="$(systemctl show --property=ExecStart --value vm2api-gemini.service 2>/dev/null)" || existing_exec_start=""
+  fi
+  if [ -z "$existing_exec_start" ] && [ -f "$unit" ]; then
+    existing_exec_start="$(grep -m1 -E '^[[:space:]]*ExecStart=' "$unit" 2>/dev/null | sed 's/^[[:space:]]*ExecStart=//')" || existing_exec_start=""
+  fi
+  if [ -n "$existing_exec_start" ]; then
+    local source_pattern='(^|[[:space:]])--payload-source(=|[[:space:]]+)(/[A-Za-z0-9._/-]+)([[:space:]]|$)'
+    local pubkey_pattern='(^|[[:space:]])--public-key(=|[[:space:]]+)(/[A-Za-z0-9._/-]+)([[:space:]]|$)'
+    local egress_pattern='(^|[[:space:]])--egress(=|[[:space:]]+)(/[A-Za-z0-9._/-]+)([[:space:]]|$)'
+    if [ -z "$source" ] && [[ "$existing_exec_start" =~ $source_pattern ]] &&
+      [[ "${BASH_REMATCH[3]}" != "${defaults_dir}/"* ]]; then
+      # Keep an external manual source supplied by an existing unit/drop-in without copying it into .env.
       source="${BASH_REMATCH[3]}"
+    fi
+    if [[ "$existing_exec_start" =~ $pubkey_pattern ]]; then
+      existing_public_key="${BASH_REMATCH[3]}"
+    fi
+    if [[ "$existing_exec_start" =~ $egress_pattern ]]; then
+      existing_egress="${BASH_REMATCH[3]}"
     fi
   fi
   if [ "$mode" != source ] && ! command -v curl >/dev/null; then
@@ -795,14 +1310,23 @@ prepare_gemini_host() (
     return 1
   fi
   local installed=0 want_default=0 use_default=0 default_args="" staging file dependency status host_mode
+  local has_manual_verifier=0
+  if [ -e /etc/vm2api/gemini-release.json ] || [[ "$existing_exec_start" == *"--release-verifier"* ]]; then
+    has_manual_verifier=1
+  fi
   if [ -e "$current" ] || [ -L "$current" ]; then
     installed=1
-    # Retain the trust inputs of an installed default payload, never replace current.
-    if { [ -f "${current}/manifest.json" ] &&
-      cmp -s -- "${current}/manifest.json" "${default_source}/manifest.json"; } ||
-      { [ -f "$unit" ] && grep -Fq -- "${default_source}/crag-license-public.pem" "$unit"; } ||
-      { [ -f "$unit" ] && grep -Fq -- "--default-public-key ${default_source}/gemini-ed25519.pub" "$unit"; }; then
-      want_default=1
+    if [ -z "$source" ] && [ "$has_manual_verifier" = 0 ]; then
+      # Recognize default installs created either by install.sh (defaults/0.3.0 or defaults/<digest>)
+      # or by vm2api-gemini-maintenance (which writes defaults/<digest>/crag-license-public.pem).
+      if { [ -f "${current}/manifest.json" ] && [ -f "${legacy_default_source}/manifest.json" ] &&
+        cmp -s -- "${current}/manifest.json" "${legacy_default_source}/manifest.json"; } ||
+        [[ "$existing_public_key" == "${defaults_dir}/"*"/crag-license-public.pem" ]] ||
+        { [ -f "$unit" ] && grep -Eq -- "--default-public-key(=|[[:space:]]+)${defaults_dir}/[^[:space:]]+/gemini-ed25519\.pub([[:space:]]|\$)" "$unit"; } ||
+        { [ -f "${current}/manifest.json" ] && grep -Fq '"family"' "${current}/manifest.json" &&
+          grep -Fq '"crag"' "${current}/manifest.json" && grep -Fq '"encrypted"' "${current}/manifest.json"; }; then
+        want_default=1
+      fi
     fi
   elif [ -z "$source" ]; then
     want_default=1
@@ -858,9 +1382,14 @@ prepare_gemini_host() (
     err "Gemini 需要 python3 和支持 parseArgs 的 Node.js（Ubuntu 24.04：python3、nodejs）"
     return 1
   fi
+  local use_apparmor=0
+  if gemini_apparmor_userns_restricted /; then
+    prepare_gemini_apparmor / "$unit" || return 1
+    use_apparmor=1
+  fi
 
-  local -a files=(deploy/gemini-host.service.example scripts/gemini-host.py scripts/gemini_host_account.py
-    scripts/gemini_host_inference.py scripts/gemini_host_native.py
+  local -a files=(deploy/gemini-host.service.example scripts/gemini-host.py scripts/gemini_host_apparmor.py scripts/gemini_agy_patch.py
+    scripts/gemini_host_account.py scripts/gemini_host_inference.py scripts/gemini_host_native.py
     scripts/gemini-host-egress.sh scripts/install-gemini-payload.mjs src/lib/gemini/payload.mjs)
   for file in "${files[@]}"; do
     if ! fetch_gemini_host_file "$tag" "$mode" "$file" "${staging}/${file}"; then
@@ -877,6 +1406,7 @@ prepare_gemini_host() (
     err "Gemini 宿主目录必须由 root 拥有且不可由其他用户写入: ${host_dir}"
     return 1
   fi
+  local default_manifest_sha="" default_pubkey_sha="" pinned_egress_sha=""
   if [ "$use_default" = 1 ]; then
     file=scripts/fetch-default-gemini.py
     if ! fetch_gemini_host_file "$tag" "$mode" "$file" "${staging}/${file}" ||
@@ -884,10 +1414,65 @@ prepare_gemini_host() (
       err "${tag} 缺少 Gemini 默认载荷下载脚本或服务模板配置"
       return 1
     fi
-    if [ ! -e "${default_source%/*}" ] && [ ! -L "${default_source%/*}" ]; then
-      install -d -m 700 "${default_source%/*}" || return 1
+    local pin_meta
+    pin_meta="$(python3 - "${staging}/deploy/payload.json" <<'PY'
+import json, re, sys
+data = json.loads(open(sys.argv[1], encoding="utf-8").read())
+d = data.get("geminiDefaultLinuxAmd64") or {}
+assets = d.get("assets") or {}
+m = (assets.get("manifest.json") or {}).get("sha256") or ""
+p = (assets.get("crag-license-public.pem") or {}).get("sha256") or ""
+e = ""
+for f in data.get("files") or []:
+    if isinstance(f, dict) and f.get("path") == "bin/kin-egress" and f.get("asset") == "kin-egress":
+        e = f.get("sha256") or ""
+        break
+hex64 = lambda v: v if isinstance(v, str) and re.fullmatch(r"[0-9a-f]{64}", v) else ""
+print(hex64(m), hex64(p), hex64(e))
+PY
+    )" || pin_meta=""
+    read -r default_manifest_sha default_pubkey_sha pinned_egress_sha <<< "$pin_meta"
+    # Verify that an existing CRAG installation actually trusts the pinned default issuer key
+    # before treating it as default-managed; custom-signed payloads must never be overwritten.
+    if [ "$installed" = 1 ] && [ -n "$default_pubkey_sha" ] &&
+      [[ "$existing_public_key" != "${defaults_dir}/"*"/crag-license-public.pem" ]]; then
+      local key_to_check=""
+      if [ -n "$existing_public_key" ] && [ -f "$existing_public_key" ]; then
+        key_to_check="$existing_public_key"
+      elif [ -f "${current}/crag-license-public.pem" ]; then
+        key_to_check="${current}/crag-license-public.pem"
+      fi
+      if [ -n "$key_to_check" ] && ! python3 - "$key_to_check" "$default_pubkey_sha" <<'PY'
+import hashlib, sys
+raise SystemExit(0 if hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest() == sys.argv[2] else 1)
+PY
+      then
+        use_default=0
+      fi
     fi
-    if ! python3 -I "${staging}/${file}" --manifest "${staging}/deploy/payload.json" --dest "$default_source"; then
+  fi
+  if [ "$use_default" = 1 ]; then
+    # Use a content-addressed cache directory matching gemini-maintenance.py so upgrading to
+    # a newer CRAGGemini release never collides with an earlier defaults/0.3.0 cache.
+    if [ -n "$default_manifest_sha" ]; then
+      default_source="${defaults_dir}/${default_manifest_sha}"
+    fi
+    if [ ! -e "${defaults_dir}" ] && [ ! -L "${defaults_dir}" ]; then
+      install -d -m 700 "${defaults_dir}" || return 1
+    fi
+    local -a fetch_args=(--manifest "${staging}/deploy/payload.json" --dest "$default_source")
+    if grep -Fq -- '--reuse-agy' "${staging}/scripts/fetch-default-gemini.py"; then
+      local reuse_agy_candidate=""
+      if [ -f "${current}/agy" ] && [ ! -L "${current}/agy" ]; then
+        reuse_agy_candidate="${current}/agy"
+      elif [ -f "${legacy_default_source}/agy" ] && [ ! -L "${legacy_default_source}/agy" ]; then
+        reuse_agy_candidate="${legacy_default_source}/agy"
+      fi
+      if [ -n "$reuse_agy_candidate" ]; then
+        fetch_args+=(--reuse-agy "$reuse_agy_candidate")
+      fi
+    fi
+    if ! python3 -I "${staging}/scripts/fetch-default-gemini.py" "${fetch_args[@]}"; then
       err "无法准备 Gemini 默认签名载荷；请检查上述错误后重新执行 prepare-gemini"
       return 1
     fi
@@ -910,6 +1495,20 @@ prepare_gemini_host() (
   local public_key_path=/etc/vm2api/gemini-ed25519.pub
   if [ "$use_default" = 1 ] && [ -f "${default_source}/crag-license-public.pem" ]; then
     public_key_path="${default_source}/crag-license-public.pem"
+  elif [ -n "$existing_public_key" ] && [ -f "$existing_public_key" ]; then
+    public_key_path="$existing_public_key"
+  fi
+  local egress_path="${INSTALL_DIR}/bin/kin-egress"
+  if [ "$existing_egress" = "${host_dir}/bin/kin-egress" ] && [ -x "${host_dir}/bin/kin-egress" ] && [ ! -L "${host_dir}/bin/kin-egress" ]; then
+    if [ ! -x "$egress_path" ] || [ -L "$egress_path" ] ||
+      { [ -n "$pinned_egress_sha" ] && python3 - "${host_dir}/bin/kin-egress" "$egress_path" "$pinned_egress_sha" <<'PY'
+import hashlib, sys
+h = lambda p: hashlib.sha256(open(p, "rb").read()).hexdigest()
+raise SystemExit(0 if h(sys.argv[1]) == sys.argv[3] and h(sys.argv[2]) != sys.argv[3] else 1)
+PY
+      }; then
+      egress_path="${host_dir}/bin/kin-egress"
+    fi
   fi
   local crag_data_dir="${INSTALL_DIR}/data"
   if [ ! -d "$crag_data_dir" ] && [ -d "${INSTALL_DIR}/src/data/crag-gemini-subscription" ]; then
@@ -919,20 +1518,122 @@ prepare_gemini_host() (
     local env_data_dir
     env_data_dir="$(grep -m1 '^KIN_DATA_DIR=' "${INSTALL_DIR}/.env" | cut -d= -f2- | tr -d '\r' | sed -e "s/^['\"]//" -e "s/['\"]$//")" || true
     if [[ "$env_data_dir" == /* && "$env_data_dir" != *[[:space:]\|]* ]]; then
-      crag_data_dir="${env_data_dir%/}"
+      local env_data_clean="${env_data_dir%/}"
+      if { [ "$env_data_clean" != "/opt/vm2api/data" ] || [ "$INSTALL_DIR" = "/opt/vm2api" ] || [ -d "/opt/vm2api/data/crag-gemini-subscription" ]; } &&
+        { [ -d "$env_data_clean" ] || [ -d "$(dirname "$env_data_clean")" ]; }; then
+        crag_data_dir="$env_data_clean"
+      fi
     fi
   fi
   local crag_host_dir="${crag_data_dir}/crag-gemini-subscription/public"
   sed -e "s|@INSTALL_DIR@/data/crag-gemini-subscription/public|${crag_host_dir}|g" \
     -e "s|@INSTALL_DIR@/src/data/crag-gemini-subscription/public|${crag_host_dir}|g" \
+    -e "s|--egress @INSTALL_DIR@/bin/kin-egress|--egress ${egress_path}|g" \
     -e "s|@INSTALL_DIR@|${INSTALL_DIR}|g" -e "s|@PAYLOAD_SOURCE_ARG@|${source_arg}|g" \
     -e "s|@DEFAULT_PAYLOAD_ARGS@|${default_args}|g" \
     -e "s|--public-key /etc/vm2api/gemini-ed25519.pub|--public-key ${public_key_path}|g" \
     "${staging}/${files[0]}" > "${staging}/vm2api-gemini.service" || return 1
+  if [ "$use_apparmor" = 1 ]; then
+    render_gemini_unit_apparmor "${staging}/vm2api-gemini.service" || return 1
+  fi
+
+  # When an older default payload is already installed in share/gemini/current, /install-payload
+  # does not overwrite current. Stage-verify and atomically swap current so prepare-gemini and
+  # install.sh upgrade actually advance CRAGGemini to the latest pinned version.
+  local swapped_old=""
+  if [ "$use_default" = 1 ] && [ "$installed" = 1 ] && [ ! -L "$current" ] && [ -d "$current" ] &&
+    { [ ! -f "${current}/manifest.json" ] || ! cmp -s -- "${current}/manifest.json" "${default_source}/manifest.json" ||
+      ! python3 -I "${staging}/scripts/gemini_agy_patch.py" status --require-patched --path "${current}/agy" >/dev/null 2>&1; }; then
+    if [ -e /var/lib/vm2api-gemini/maintenance.pending ] || [ -L /var/lib/vm2api-gemini/maintenance.pending ]; then
+      err "Gemini 上次维护未完成；请先在面板恢复后再升级载荷"
+      return 1
+    fi
+    local staged_payload
+    staged_payload="$(mktemp -d "${INSTALL_DIR}/share/gemini/.prepare-payload.XXXXXX")" || return 1
+    rmdir "$staged_payload" || return 1
+    if ! node "${staging}/scripts/install-gemini-payload.mjs" \
+      --source "$default_source" --public-key "$public_key_path" --dest "$staged_payload"; then
+      rm -rf -- "$staged_payload"
+      err "新版本 CRAGGemini 签名载荷校验失败，已保留现有版本"
+      return 1
+    fi
+    systemctl stop vm2api-gemini.service 2>/dev/null || true
+    if ! python3 - "$staged_payload" "$current" <<'PY'
+import ctypes, os, sys
+from pathlib import Path
+src, dst = Path(sys.argv[1]), Path(sys.argv[2])
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+AT_FDCWD = -100
+RENAME_EXCHANGE = 2
+rc = libc.renameat2(AT_FDCWD, os.fsencode(src), AT_FDCWD, os.fsencode(dst), RENAME_EXCHANGE)
+if rc != 0:
+    bak = dst.parent / f".prepare-prev.{os.getpid()}"
+    os.rename(dst, bak)
+    try:
+        os.rename(src, dst)
+    except BaseException:
+        os.rename(bak, dst)
+        raise
+    os.rename(bak, src)
+PY
+    then
+      rm -rf -- "$staged_payload"
+      err "无法原子切换 CRAGGemini 签名载荷，已保留现有版本"
+      return 1
+    fi
+    swapped_old="$staged_payload"
+  elif [ "$installed" = 1 ] && [ ! -L "$current" ] && [ -f "${current}/agy" ] && [ ! -L "${current}/agy" ]; then
+    local agy_patch_rc=0
+    python3 -I "${staging}/scripts/gemini_agy_patch.py" status --require-patched --path "${current}/agy" >/dev/null 2>&1 || agy_patch_rc=$?
+    if [ "$agy_patch_rc" -eq 1 ]; then
+      local staged_agy
+      staged_agy="$(mktemp "${current}/.agy-patch.XXXXXX")" || return 1
+      if ! cp -p -- "${current}/agy" "$staged_agy" ||
+        ! python3 -I "${staging}/scripts/gemini_agy_patch.py" patch --no-backup --path "$staged_agy" >/dev/null; then
+        rm -f -- "$staged_agy"
+        err "无法为已安装的 Antigravity CLI (agy) 自动应用资格补丁，已保留原文件"
+        return 1
+      fi
+      systemctl stop vm2api-gemini.service 2>/dev/null || true
+      if ! chmod 755 "$staged_agy" || ! mv -f -- "$staged_agy" "${current}/agy"; then
+        rm -f -- "$staged_agy"
+        err "无法原子替换已打补丁的 Antigravity CLI (agy)"
+        return 1
+      fi
+    fi
+  fi
+
+  local unit_backup=""
+  if [ -n "$swapped_old" ] && [ -f "$unit" ]; then
+    unit_backup="${staging}/vm2api-gemini.service.prev"
+    cp -p -- "$unit" "$unit_backup" || unit_backup=""
+  fi
   install -m 644 "${staging}/vm2api-gemini.service" "$unit" || return 1
   if ! (systemctl daemon-reload && systemctl enable vm2api-gemini.service && systemctl restart vm2api-gemini.service); then
+    if [ -n "$swapped_old" ] && [ -d "$swapped_old" ]; then
+      python3 - "$swapped_old" "$current" <<'PY' || true
+import ctypes, os, sys
+from pathlib import Path
+old_dir, cur_dir = Path(sys.argv[1]), Path(sys.argv[2])
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+if libc.renameat2(-100, os.fsencode(old_dir), -100, os.fsencode(cur_dir), 2) != 0:
+    bak = cur_dir.parent / f".prepare-rollback.{os.getpid()}"
+    os.rename(cur_dir, bak)
+    os.rename(old_dir, cur_dir)
+    os.rename(bak, old_dir)
+PY
+      rm -rf -- "$swapped_old"
+      if [ -n "$unit_backup" ] && [ -f "$unit_backup" ]; then
+        install -m 644 "$unit_backup" "$unit" || true
+        systemctl daemon-reload || true
+        systemctl restart vm2api-gemini.service || true
+      fi
+    fi
     err "Gemini 宿主服务未就绪，请检查 journalctl -u vm2api-gemini.service"
     return 1
+  fi
+  if [ -n "$swapped_old" ] && [ -d "$swapped_old" ]; then
+    rm -rf -- "$swapped_old"
   fi
 
   if [ -n "$source" ] || [ "$installed" = 1 ]; then
@@ -959,6 +1660,14 @@ prepare_gemini_host() (
       ok "Gemini 签名载荷 ${version} 已安装，尚待兑换；请在管理面板输入兑换码激活"
     else
       ok "Gemini 签名载荷 ${version} 已安装；CLI 出口状态请在面板检查"
+    fi
+    if [ -f "${current}/agy" ] && [ ! -L "${current}/agy" ]; then
+      if python3 -I "${host_dir}/scripts/gemini_agy_patch.py" status --require-patched --path "${current}/agy" >/dev/null 2>&1; then
+        ok "Antigravity CLI (agy) 资格补丁已验证生效"
+      else
+        err "Antigravity CLI (agy) 资格补丁校验未通过，请检查 ${current}/agy 后重试 prepare-gemini"
+        return 1
+      fi
     fi
   else
     ok "Gemini 控制 socket 已就绪；签名载荷与 CLI 出口状态请在面板检查"
@@ -1178,8 +1887,211 @@ prepare_docker_crag_apparmor() {
   ok "Docker CRAG userns profile 已加载并保存: $profile"
 }
 
+url_points_to_local_host() {
+  local raw="${1:-}" rest host
+  [ -n "$raw" ] || return 1
+  # Strip scheme://, optional userinfo@, and path/query
+  rest="${raw#*://}"
+  rest="${rest%%/*}"
+  rest="${rest%%\?*}"
+  rest="${rest##*@}"
+  if [[ "$rest" == \[*\]:* ]]; then
+    host="${rest#\[}"
+    host="${host%%\]*}"
+  elif [[ "$rest" == \[*\] ]]; then
+    host="${rest#\[}"
+    host="${host%\]}"
+  else
+    host="${rest%%:*}"
+  fi
+  host="$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')"
+  case "$host" in
+    127.0.0.1|localhost|::1) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+need_local_pg() {
+  local driver db_url db_host
+  driver="$(env_get VM2API_DB_DRIVER)"
+  if [ "$driver" = "sqlite" ] || [ "$driver" = "sqlite3" ]; then
+    return 1
+  fi
+  db_url="$(env_get DATABASE_URL)"
+  db_url="${db_url:-$(env_get VM2API_DATABASE_URL)}"
+  if [ -n "$db_url" ] && ! url_points_to_local_host "$db_url"; then
+    return 1
+  fi
+  db_host="$(env_get DATABASE_HOST)"
+  if [ -n "$db_host" ] && [ "$db_host" != "127.0.0.1" ] && [ "$db_host" != "localhost" ] && [ "$db_host" != "::1" ]; then
+    return 1
+  fi
+  return 0
+}
+
+need_local_redis() {
+  local driver redis_disabled redis_url redis_host
+  driver="$(env_get VM2API_DB_DRIVER)"
+  if [ "$driver" = "sqlite" ] || [ "$driver" = "sqlite3" ]; then
+    return 1
+  fi
+  redis_disabled="$(env_get VM2API_REDIS_DISABLED)"
+  if [ "$redis_disabled" = "1" ] || [ "$redis_disabled" = "true" ]; then
+    return 1
+  fi
+  redis_url="$(env_get REDIS_URL)"
+  redis_url="${redis_url:-$(env_get VM2API_REDIS_URL)}"
+  if [ -n "$redis_url" ] && ! url_points_to_local_host "$redis_url"; then
+    return 1
+  fi
+  redis_host="$(env_get REDIS_HOST)"
+  if [ -n "$redis_host" ] && [ "$redis_host" != "127.0.0.1" ] && [ "$redis_host" != "localhost" ] && [ "$redis_host" != "::1" ]; then
+    return 1
+  fi
+  return 0
+}
+
+is_local_port_busy() {
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltnH "sport = :${port}" 2>/dev/null | grep -q . && return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import socket,sys
+s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+s.settimeout(0.3)
+rc=s.connect_ex(("127.0.0.1",int(sys.argv[1])))
+s.close()
+sys.exit(0 if rc==0 else 1)' "$port" 2>/dev/null && return 0
+  fi
+  return 1
+}
+
+container_owns_port() {
+  local cname="$1" port="$2"
+  command -v docker >/dev/null 2>&1 || return 1
+  docker ps --filter "name=^/${cname}$" --format '{{.Ports}}' 2>/dev/null | grep -qE "127\.0\.0\.1:${port}->|:${port}->"
+}
+
+resolve_local_db_ports() {
+  local want_pg="$1" want_redis="$2"
+  # Only check real host ports when docker-compose.yml exists and Docker daemon is reachable.
+  [ -f "${INSTALL_DIR}/docker-compose.yml" ] || return 0
+  command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 || return 0
+
+  if [ "$want_pg" = 1 ]; then
+    local pg_port pg_cname p found=0
+    pg_port="$(env_get VM2API_PG_PORT)"
+    pg_port="${pg_port:-5432}"
+    pg_cname="$(env_get VM2API_PG_CONTAINER_NAME)"
+    pg_cname="${pg_cname:-vm2api-postgres}"
+    if is_local_port_busy "$pg_port" && ! container_owns_port "$pg_cname" "$pg_port"; then
+      if [ "$PG_PORT_EXPLICIT" = 1 ]; then
+        err "PostgreSQL 指定端口 127.0.0.1:${pg_port} 已被本机其他服务占用，请更换 --pg-port"
+        exit 1
+      fi
+      for p in $(seq 5433 5460); do
+        if ! is_local_port_busy "$p"; then
+          warn "PostgreSQL 默认端口 127.0.0.1:${pg_port} 已被其他服务占用，自动改用空闲端口 ${p}"
+          env_set VM2API_PG_PORT "$p"
+          found=1
+          break
+        fi
+      done
+      if [ "$found" != 1 ]; then
+        err "PostgreSQL 端口 ${pg_port} 及 5433-5460 均被占用，请用 --pg-port 指定空闲端口"
+        exit 1
+      fi
+    fi
+  fi
+
+  if [ "$want_redis" = 1 ]; then
+    local r_port r_cname p found=0
+    r_port="$(env_get VM2API_REDIS_PORT)"
+    r_port="${r_port:-6379}"
+    r_cname="$(env_get VM2API_REDIS_CONTAINER_NAME)"
+    r_cname="${r_cname:-vm2api-redis}"
+    if is_local_port_busy "$r_port" && ! container_owns_port "$r_cname" "$r_port"; then
+      if [ "$REDIS_PORT_EXPLICIT" = 1 ]; then
+        err "Redis 指定端口 127.0.0.1:${r_port} 已被本机其他服务占用，请更换 --redis-port"
+        exit 1
+      fi
+      for p in $(seq 6380 6409); do
+        if ! is_local_port_busy "$p"; then
+          warn "Redis 默认端口 127.0.0.1:${r_port} 已被其他服务占用，自动改用空闲端口 ${p}"
+          env_set VM2API_REDIS_PORT "$p"
+          found=1
+          break
+        fi
+      done
+      if [ "$found" != 1 ]; then
+        err "Redis 端口 ${r_port} 及 6380-6409 均被占用，请用 --redis-port 指定空闲端口"
+        exit 1
+      fi
+    fi
+  fi
+}
+
+wait_local_service_ready() {
+  local svc="$1" cname cid i
+  if [ "$svc" = "postgres" ]; then
+    cname="$(env_get VM2API_PG_CONTAINER_NAME)"
+    cname="${cname:-vm2api-postgres}"
+    local pg_user pg_db
+    pg_user="$(env_get POSTGRES_USER)"; pg_user="${pg_user:-vm2api}"
+    pg_db="$(env_get POSTGRES_DB)"; pg_db="${pg_db:-vm2api}"
+    for i in $(seq 1 45); do
+      cid="$(compose ps -q postgres 2>/dev/null | head -n1 || true)"
+      [ -n "$cid" ] || cid="$(docker ps -q --filter "name=^/${cname}$" 2>/dev/null | head -n1 || true)"
+      if [ -n "$cid" ] && docker exec "$cid" pg_isready -U "$pg_user" -d "$pg_db" >/dev/null 2>&1; then
+        ok "本地 PostgreSQL 容器已就绪"
+        return 0
+      fi
+      sleep 2
+    done
+    err "本地 PostgreSQL 容器启动超时，请检查 docker logs ${cname}"
+    return 1
+  elif [ "$svc" = "redis" ]; then
+    cname="$(env_get VM2API_REDIS_CONTAINER_NAME)"
+    cname="${cname:-vm2api-redis}"
+    local r_pass
+    r_pass="$(env_get REDIS_PASSWORD)"
+    for i in $(seq 1 25); do
+      cid="$(compose ps -q redis 2>/dev/null | head -n1 || true)"
+      [ -n "$cid" ] || cid="$(docker ps -q --filter "name=^/${cname}$" 2>/dev/null | head -n1 || true)"
+      if [ -n "$cid" ] && docker exec "$cid" redis-cli -a "$r_pass" --no-auth-warning ping 2>/dev/null | grep -qx PONG; then
+        ok "本地 Redis 容器已就绪"
+        return 0
+      fi
+      sleep 1
+    done
+    warn "本地 Redis 容器探活超时（vm2api 将自动降级至 L1 + PG LISTEN/NOTIFY）"
+    return 0
+  fi
+}
+
+verify_db_runtime() {
+  local key port metrics
+  key="$(env_get VM2API_API_KEY)"
+  key="${key:-$(env_get KIN_API_KEY)}"
+  [ -n "$key" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  port="$(env_get PORT)"
+  port="${port:-$DEFAULT_PORT}"
+  metrics="$(curl -fsS --noproxy '*' -H "Authorization: Bearer ${key}" "http://127.0.0.1:${port}/api/panel/database/metrics" 2>/dev/null || true)"
+  [ -n "$metrics" ] || return 0
+  printf '%s' "$metrics" | python3 -c 'import json, sys
+try:
+    d = json.load(sys.stdin).get("data") or {}
+    db = d.get("database") or {}
+    cache = d.get("cache") or {}
+    print("数据库状态: engine=%s ok=%s pg_version=%s cache_mode=%s" % (db.get("engine"), db.get("ok"), db.get("pg_version"), cache.get("mode")))
+except Exception:
+    pass' || true
+}
+
 start_stack() {
-  local mode auto_sync_wrap log
+  local mode auto_sync_wrap log local_pg=0 local_redis=0
   mode="$(install_mode)"
   if [ "$NO_START" = 1 ]; then
     warn "--no-start：跳过 compose up"
@@ -1188,10 +2100,28 @@ start_stack() {
   prepare_crag_host || return 1
   prepare_docker_crag_apparmor || return 1
   cd "${INSTALL_DIR}"
+  # Blue/green install: files are updated, but the controller is switched by bg-deploy.sh, not compose up.
+  if [ -f bluegreen/active ]; then
+    warn "蓝绿部署（bluegreen/active=$(cat bluegreen/active)）：文件已更新，跳过 compose up"
+    info "切换到新版本：deploy/bluegreen/bg-deploy.sh（带新迁移时用 --restart），见 docs/BLUEGREEN.md"
+    return
+  fi
+  need_local_pg && local_pg=1 || local_pg=0
+  need_local_redis && local_redis=1 || local_redis=0
+  resolve_local_db_ports "$local_pg" "$local_redis"
+
   auto_sync_wrap="${KIN_AUTO_SYNC_WRAP:-0}"
   if [ "$mode" = image ]; then
-    info "docker compose pull && up -d（拉预构建镜像，本机不构建）"
-    if ! compose pull; then
+    local -a pull_services=()
+    if [ "$local_pg" = 1 ] && [ "$local_redis" = 1 ]; then
+      info "docker compose pull && up -d（拉预构建镜像 + 本地 PG/Redis，本机不构建）"
+    else
+      [ "$local_pg" = 1 ] && pull_services+=(postgres)
+      [ "$local_redis" = 1 ] && pull_services+=(redis)
+      pull_services+=("$SERVICE_NAME")
+      info "docker compose pull ${pull_services[*]} && up -d（按需拉取镜像，跳过未启用的本地数据库/缓存服务）"
+    fi
+    if ! compose pull "${pull_services[@]}"; then
       if [ "$HOST_ARCH" = arm64 ]; then
         err "拉取 ARM64 控制面镜像失败：检查网络，并确认该版本已发布 $(env_get VM2API_IMAGE_TAG) 镜像。"
       else
@@ -1200,10 +2130,26 @@ start_stack() {
       restore_image_tag
       exit 1
     fi
-    if KIN_AUTO_SYNC_WRAP="$auto_sync_wrap" compose up -d; then
-      wait_health || true
-      refresh_slot_services
-      return
+    if [ "$local_pg" = 1 ] && [ "$local_redis" = 1 ]; then
+      if KIN_AUTO_SYNC_WRAP="$auto_sync_wrap" compose up -d; then
+        wait_health || true
+        verify_db_runtime || true
+        refresh_slot_services
+        return
+      fi
+    else
+      if [ "$local_pg" = 1 ]; then
+        compose up -d postgres && wait_local_service_ready postgres
+      fi
+      if [ "$local_redis" = 1 ]; then
+        compose up -d redis && wait_local_service_ready redis
+      fi
+      if KIN_AUTO_SYNC_WRAP="$auto_sync_wrap" compose up -d --no-deps "$SERVICE_NAME"; then
+        wait_health || true
+        verify_db_runtime || true
+        refresh_slot_services
+        return
+      fi
     fi
     err "docker compose 失败。日志: docker logs ${SERVICE_NAME}"
     exit 1
@@ -1211,10 +2157,23 @@ start_stack() {
   ensure_build_context
   info "docker compose up -d --build（源码模式；只重建控制面，不 docker rm 槽）"
   log="$(mktemp)"
-  if KIN_AUTO_SYNC_WRAP="$auto_sync_wrap" compose up -d --build >"$log" 2>&1; then
+  local -a build_up_args=()
+  if [ "$local_pg" = 1 ] && [ "$local_redis" = 1 ]; then
+    build_up_args=(up -d --build)
+  else
+    if [ "$local_pg" = 1 ]; then
+      compose up -d postgres && wait_local_service_ready postgres
+    fi
+    if [ "$local_redis" = 1 ]; then
+      compose up -d redis && wait_local_service_ready redis
+    fi
+    build_up_args=(up -d --no-deps --build "$SERVICE_NAME")
+  fi
+  if KIN_AUTO_SYNC_WRAP="$auto_sync_wrap" compose "${build_up_args[@]}" >"$log" 2>&1; then
     cat "$log"
     rm -f "$log"
     wait_health || true
+    verify_db_runtime || true
     refresh_slot_services
     return
   fi
@@ -1222,9 +2181,10 @@ start_stack() {
   if grep -qE 'CHANGELOG\.md|"/CHANGELOG\.md": not found' "$log"; then
     warn "compose 因 CHANGELOG.md 失败，补 .dockerignore 后重试一次"
     ensure_build_context
-    if KIN_AUTO_SYNC_WRAP="$auto_sync_wrap" compose up -d --build; then
+    if KIN_AUTO_SYNC_WRAP="$auto_sync_wrap" compose "${build_up_args[@]}"; then
       rm -f "$log"
       wait_health || true
+      verify_db_runtime || true
       refresh_slot_services
       return
     fi
@@ -1371,6 +2331,21 @@ cmd_upgrade() {
   else
     warn "--no-sync-wrap：已跳过槽内 CLI / kernel 同步"
   fi
+  if [ "$AUTO_MIGRATE" = 1 ] && [ "$NO_START" = 0 ] && [ -f "${INSTALL_DIR}/data/kin.db" ] && [ "$(env_get VM2API_DB_DRIVER)" != "postgres" ]; then
+    info "升级已完成，开始执行 --auto-migrate（SQLite → PostgreSQL 无缝迁移）..."
+    local -a margs=()
+    [ -n "$DATABASE_URL_ARG" ] && margs+=(--database-url "$DATABASE_URL_ARG")
+    [ -n "$REDIS_URL_ARG" ] && margs+=(--redis-url "$REDIS_URL_ARG")
+    [ "$NO_REDIS" = 1 ] && margs+=(--no-redis)
+    [ -n "$PG_PORT_ARG" ] && margs+=(--pg-port "$PG_PORT_ARG")
+    [ -n "$REDIS_PORT_ARG" ] && margs+=(--redis-port "$REDIS_PORT_ARG")
+    [ "$LOCAL_DATA" = 1 ] && margs+=(--local-data)
+    [ -n "$PG_DATA_DIR_ARG" ] && margs+=(--pg-data-dir "$PG_DATA_DIR_ARG")
+    [ -n "$REDIS_DATA_DIR_ARG" ] && margs+=(--redis-data-dir "$REDIS_DATA_DIR_ARG")
+    [ "$AUTO_INSTALL_DEPS" = 0 ] && margs+=(--no-install-deps)
+    [ "$ASSUME_YES" = 1 ] && margs+=(--yes)
+    cmd_db_migrate "${margs[@]}"
+  fi
   ok "已更新到 $(local_version)"
   print_login_banner
 }
@@ -1425,6 +2400,9 @@ cmd_status() {
   if [ -d "${INSTALL_DIR}/.git" ]; then
     echo "git:     $(git -C "${INSTALL_DIR}" describe --tags --always 2>/dev/null || echo unknown)"
   fi
+  if [ -f "${INSTALL_DIR}/.env" ] && [ -n "$(env_get VM2API_DB_DRIVER)" ]; then
+    echo "数据库:  $(env_get VM2API_DB_DRIVER)"
+  fi
   if command -v docker >/dev/null 2>&1; then
     docker ps --filter "name=${SERVICE_NAME}" --format '容器:    {{.Names}}  {{.Status}}' || true
   fi
@@ -1460,12 +2438,81 @@ cmd_uninstall() {
   info "若要整目录删除: rm -rf ${INSTALL_DIR}"
 }
 
+ensure_migrate_script() {
+  local script="${INSTALL_DIR}/deploy/replace-db-to-pg.sh"
+  local self_dir=""
+  if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+    self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if [ -f "${self_dir}/replace-db-to-pg.sh" ]; then
+      if [ "${self_dir}/replace-db-to-pg.sh" != "$script" ]; then
+        mkdir -p "${INSTALL_DIR}/deploy"
+        cp -f "${self_dir}/replace-db-to-pg.sh" "$script"
+        chmod +x "$script" 2>/dev/null || true
+      fi
+      echo "$script"
+      return 0
+    fi
+  fi
+  if [ -f "$script" ] && grep -q 'verify_pg_sync_rpc_safety' "$script" 2>/dev/null; then
+    echo "$script"
+    return 0
+  fi
+  local ref="${TARGET_VERSION:-main}"
+  mkdir -p "${INSTALL_DIR}/deploy"
+  info "未检测到最新版迁移脚本，正在自动获取 ${ref}/deploy/replace-db-to-pg.sh ..."
+  fetch_file "$ref" deploy/replace-db-to-pg.sh "$script" 0
+  chmod +x "$script" 2>/dev/null || true
+  echo "$script"
+}
+
+cmd_db_migrate() {
+  need_root
+  local has_dir=0 i=1
+  while [ $i -le $# ]; do
+    if [ "${!i}" = "--dir" ] && [ $((i + 1)) -le $# ]; then
+      local next=$((i + 1))
+      INSTALL_DIR="${!next}"
+      has_dir=1
+      break
+    fi
+    i=$((i + 1))
+  done
+  local script
+  script="$(ensure_migrate_script)"
+  if [ "$has_dir" = 1 ]; then
+    bash "$script" "$@"
+  else
+    bash "$script" --dir "$INSTALL_DIR" "$@"
+  fi
+}
+
+cmd_db_status() {
+  local script="${INSTALL_DIR}/deploy/replace-db-to-pg.sh"
+  if [ -f "$script" ]; then
+    bash "$script" --dir "$INSTALL_DIR" --status
+  else
+    cmd_status
+  fi
+}
+
+cmd_db_rollback() {
+  need_root
+  local script
+  script="$(ensure_migrate_script)"
+  bash "$script" --dir "$INSTALL_DIR" --rollback
+}
+
 COMMAND="install"
+EXTRA_ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    install|upgrade|update|crag-update|prepare-native|prepare-crag-host|prepare-gemini|check|changelog|status|uninstall)
+    install|upgrade|update|crag-update|prepare-native|prepare-crag-host|prepare-gemini|prepare-deps|check|changelog|status|db-migrate|db-status|db-rollback|uninstall)
       COMMAND="$1"
       shift
+      if [ "$COMMAND" = "db-migrate" ]; then
+        EXTRA_ARGS=("$@")
+        break
+      fi
       ;;
     --version)
       if [ $# -lt 2 ]; then
@@ -1491,6 +2538,64 @@ while [ $# -gt 0 ]; do
     --dir)
       INSTALL_DIR="$2"
       shift 2
+      ;;
+    --db)
+      if [ $# -lt 2 ] || ! [[ "$2" =~ ^(postgres|sqlite)$ ]]; then
+        err "--db 仅支持 postgres 或 sqlite"
+        exit 1
+      fi
+      DB_DRIVER_ARG="$2"
+      shift 2
+      ;;
+    --database-url)
+      [ $# -ge 2 ] || { err "--database-url 需要 PostgreSQL 连接串"; exit 1; }
+      DATABASE_URL_ARG="$2"
+      shift 2
+      ;;
+    --redis-url)
+      [ $# -ge 2 ] || { err "--redis-url 需要 Redis 连接串"; exit 1; }
+      REDIS_URL_ARG="$2"
+      shift 2
+      ;;
+    --no-redis)
+      NO_REDIS=1
+      shift
+      ;;
+    --pg-port)
+      [ $# -ge 2 ] || { err "--pg-port 需要端口号"; exit 1; }
+      PG_PORT_ARG="$2"
+      PG_PORT_EXPLICIT=1
+      shift 2
+      ;;
+    --redis-port)
+      [ $# -ge 2 ] || { err "--redis-port 需要端口号"; exit 1; }
+      REDIS_PORT_ARG="$2"
+      REDIS_PORT_EXPLICIT=1
+      shift 2
+      ;;
+    --local-data)
+      LOCAL_DATA=1
+      shift
+      ;;
+    --pg-data-dir)
+      [ $# -ge 2 ] || { err "--pg-data-dir 需要路径"; exit 1; }
+      PG_DATA_DIR_ARG="$2"
+      LOCAL_DATA=1
+      shift 2
+      ;;
+    --redis-data-dir)
+      [ $# -ge 2 ] || { err "--redis-data-dir 需要路径"; exit 1; }
+      REDIS_DATA_DIR_ARG="$2"
+      LOCAL_DATA=1
+      shift 2
+      ;;
+    --auto-migrate)
+      AUTO_MIGRATE=1
+      shift
+      ;;
+    --no-install-deps)
+      AUTO_INSTALL_DEPS=0
+      shift
       ;;
     --gemini-payload-source)
       if [ "$#" -lt 2 ]; then
@@ -1551,9 +2656,13 @@ case "$COMMAND" in
     fi
     prepare_gemini_host "$(normalize_tag "$(local_version)")" "$(install_mode)" required
     ;;
+  prepare-deps) need_root; require_cmds; ok "全部宿主基础、Docker 与 PostgreSQL 客户端依赖已就绪" ;;
   check) cmd_check ;;
   changelog) cmd_changelog ;;
   status) cmd_status ;;
+  db-migrate) cmd_db_migrate "${EXTRA_ARGS[@]}" ;;
+  db-status) cmd_db_status ;;
+  db-rollback) cmd_db_rollback ;;
   uninstall) cmd_uninstall ;;
   *) usage; exit 1 ;;
 esac

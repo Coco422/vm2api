@@ -466,10 +466,12 @@ test('only the CRAG seat outside the signed quota leaves the pool, including a l
   const hostId = 'a'.repeat(64)
   const publicDir = cragSubscriptionPublicDirectory(root)
   fs.mkdirSync(publicDir, { recursive: true, mode: 0o755 })
-  fs.writeFileSync(path.join(publicDir, 'host_id'), hostId)
+  // Explicit modes: crag-license rejects group-writable public files, and a
+  // developer umask of 0002 would otherwise create them that way.
+  fs.writeFileSync(path.join(publicDir, 'host_id'), hostId, { mode: 0o644 })
   const publish = (revision, slotLimit) => {
     const { code } = issueHostEntitlement(root, hostId, { revision, slot_limit: slotLimit })
-    fs.writeFileSync(path.join(publicDir, 'entitlement.code'), code)
+    fs.writeFileSync(path.join(publicDir, 'entitlement.code'), code, { mode: 0o644 })
   }
   publish(1, 2)
   for (const [index, id] of ['vm-01', 'vm-02'].entries()) {
@@ -785,6 +787,67 @@ test('fable family cooldown still allows sonnet on the same account', async (t) 
   sonnet.release()
 })
 
+for (const source of ['usage', 'model-cooldown']) {
+  test(`Fable quota from ${source} returns 429 without dispatch and leaves Opus available`, async (t) => {
+    const root = project()
+    const repo = new RuntimeRepo()
+    const resetAt = Date.now() + 109005_000
+    const pool = scheduler(root, {
+      runtimeRepo: repo,
+      accountQuota: {
+        canAccept: () => ({ ok: true }),
+        fableWindowLimited: () => source === 'usage',
+        fableWindowResetAt: () => resetAt,
+      },
+    })
+    t.after(() => cleanupProject(root, pool))
+    if (source === 'model-cooldown') {
+      pool.markCooldown(
+        { accountId: 'account-1', vmId: 'vm-01' },
+        { model: 'fable', until: resetAt, reason: 'fable_rate_limited' },
+      )
+    }
+    const result = await new FailoverRunner({ scheduler: pool }).run({
+      requestId: `fable-quota-${source}`,
+      model: 'claude-fable-5-2',
+      pinVmId: 'vm-01',
+      callAttempt: () => assert.fail('known exhausted Fable quota must not reach the upstream'),
+    })
+    assert.equal(result.status, 429)
+    assert.equal(result.body.error.code, 'pool_fable_rate_limited')
+    assert.match(result.body.error.message, /Fable/)
+    assert.ok(result.retryAfterSec > 109000)
+    const opus = await pool.selectAndReserve({
+      model: 'claude-opus-5-5',
+      pinVmId: 'vm-01',
+      allowWait: false,
+    })
+    assert.equal(opus.ok, true)
+    assert.equal(opus.accountId, 'account-1')
+    opus.release()
+  })
+}
+
+test('a pool split between Fable and shared quota exhaustion still returns 429', async (t) => {
+  const root = project()
+  const repo = new RuntimeRepo()
+  const resetAt = Date.now() + 60_000
+  const pool = scheduler(root, { runtimeRepo: repo })
+  t.after(() => cleanupProject(root, pool))
+  pool.markCooldown(
+    { accountId: 'account-1', vmId: 'vm-01' },
+    { model: 'fable', until: resetAt, reason: 'fable_rate_limited' },
+  )
+  repo.markCooldown('account-2', { vmId: 'vm-02', until: resetAt, reason: 'quota_5h_header' })
+  const result = await new FailoverRunner({ scheduler: pool }).run({
+    requestId: 'mixed-quota',
+    model: 'claude-fable-5-2',
+    callAttempt: () => assert.fail('all candidates have known quota exhaustion'),
+  })
+  assert.equal(result.status, 429)
+  assert.equal(result.body.error.code, 'pool_rate_limited')
+})
+
 test('fable concurrency cap leaves room for other models', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
@@ -915,6 +978,97 @@ test('scheduler hard-excludes worker refresh failure', async (t) => {
   assert.equal(selected.ok, true)
   assert.equal(selected.vmId, 'vm-02')
   selected.release()
+})
+
+test('scheduler consults live state.worker_status.credential before ejecting stale refresh_failed vm record', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const expiredSec = Math.floor((Date.now() - 2 * 86400_000) / 1000)
+  const freshMs = Date.now() + 3600_000
+  const file = path.join(root, 'vms', 'vm-01.json')
+  const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+  vm.claude = {
+    ...vm.claude,
+    has_access: true,
+    has_refresh: true,
+    expires_at: expiredSec,
+    refresh_error: 'refresh_failed',
+  }
+  fs.writeFileSync(file, JSON.stringify(vm))
+
+  const account = { account_id: 'account-1', status: 'active', unified: { status_5h: 'allowed', utilization_5h: 0.1 } }
+  const runtimeRepo = new RuntimeRepo(new Map([['account-1', account]]))
+  const freshStatus = {
+    ok: true,
+    credential: { generation: 2, has_access: true, has_refresh: true, needs_refresh: false, expires_at: freshMs },
+  }
+  runtimeRepo.upsert({
+    account_id: 'account-1',
+    vm_id: 'vm-01',
+    status: 'ready',
+    worker_status: freshStatus,
+  })
+  let liveHealth = freshStatus
+  const pool = new PoolScheduler({
+    projectRoot: root,
+    runtimeRepo,
+    accountQuota: {
+      canAccept: () => ({ ok: true }),
+      repo: { get: (id) => (id === 'account-1' ? account : null) },
+    },
+    workerHealth: async () => liveHealth,
+    config: { fallback_wait_timeout_ms: 5, sticky_wait_timeout_ms: 5 },
+  })
+  // Direct checkEligibility without knownHealth exercises state.worker_status.credential.
+  const directCheck = await pool.checkEligibility({
+    vm,
+    account,
+    state: runtimeRepo.get('account-1'),
+    model: 'claude-test',
+  })
+  assert.equal(directCheck.ok, true)
+
+  const selected = await pool.selectAndReserve({
+    model: 'claude-test',
+    excluded: new Set(['account-2']),
+    allowWait: false,
+  })
+  assert.equal(selected.ok, true)
+  assert.equal(selected.vmId, 'vm-01')
+  selected.release()
+
+  const staleStatus = {
+    ok: true,
+    credential: {
+      generation: 1,
+      has_access: true,
+      has_refresh: true,
+      needs_refresh: true,
+      expires_at: expiredSec * 1000,
+    },
+  }
+  liveHealth = staleStatus
+  runtimeRepo.upsert({
+    account_id: 'account-1',
+    vm_id: 'vm-01',
+    status: 'ready',
+    worker_status: staleStatus,
+  })
+  pool.healthCache.clear()
+  const directRejected = await pool.checkEligibility({
+    vm,
+    account,
+    state: runtimeRepo.get('account-1'),
+    model: 'claude-test',
+  })
+  assert.equal(directRejected.ok, false)
+  assert.equal(directRejected.reason, 'credential_refresh_failed')
+  const rejected = await pool.selectAndReserve({
+    model: 'claude-test',
+    excluded: new Set(['account-2']),
+    allowWait: false,
+  })
+  assert.equal(rejected.ok, false)
 })
 
 test('maxConcurrency 0 does not fall back to 20', async (t) => {
@@ -3829,4 +3983,29 @@ test('fresh_account_isolation_ms: bootstrap escape releases a continuing convers
   assert.equal(served.ok, true, 'a brand-new pool must stay schedulable even for continuing conversations')
   assert.ok(served.vmId === 'vm-01' || served.vmId === 'vm-02')
   served.release()
+})
+
+test('a cold health cache is probed for every slot at once, not one slot after another', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  let inflight = 0
+  let peak = 0
+  const calls = []
+  const pool = scheduler(root, {
+    workerHealth: async ({ vmId }) => {
+      calls.push(vmId)
+      inflight++
+      peak = Math.max(peak, inflight)
+      await new Promise((resolve) => setTimeout(resolve, 30))
+      inflight--
+      return { ok: true, credential: { generation: 1, has_access: true } }
+    },
+  })
+  const candidates = await pool.eligibleCandidates({ model: 'claude-test' })
+  assert.ok(candidates.length >= 2)
+  assert.ok(peak >= 2, `health hops overlapped (peak ${peak})`)
+  assert.equal(new Set(calls).size, calls.length, 'each slot is probed once per scan')
+  // Warm cache: no further hops.
+  await pool.eligibleCandidates({ model: 'claude-test' })
+  assert.equal(calls.length, candidates.length)
 })

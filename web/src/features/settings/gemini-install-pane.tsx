@@ -31,6 +31,13 @@ import { geminiInventoryOptions } from '@/features/import/gemini-environments'
 import { useGeminiBusy } from '@/features/import/gemini-operations'
 import { GeminiTestPanel } from '@/features/import/gemini-test-panel'
 import {
+  classifyMaintenanceSubmitError,
+  GEMINI_INSTALL_COMMAND,
+  GEMINI_LOCAL_PREPARE_COMMAND,
+  geminiCheckLabels,
+  geminiMaintenanceCodeLabel,
+  geminiPayloadLabels,
+  geminiPhaseLabels,
   type MaintenanceRelease,
   type MaintenanceRequest,
   type MaintenanceSnapshot,
@@ -39,18 +46,12 @@ import {
   startMaintenance,
 } from './gemini-maintenance'
 
-const COMMAND =
-  'curl -fsSL https://raw.githubusercontent.com/dofastted/vm2api/main/deploy/install-gemini.sh | sudo bash -s -- --dir /opt/vm2api'
+const LOCAL_COMMAND = GEMINI_LOCAL_PREPARE_COMMAND
+const REMOTE_COMMAND = GEMINI_INSTALL_COMMAND
 
 const payloadLabels: Record<string, string> = {
-  installed: '已安装',
-  invalid: '校验失败',
-  missing: '未安装',
-  not_installed: '未安装',
+  ...geminiPayloadLabels,
   not_configured: '未配置',
-  awaiting_redemption: '等待兑换',
-  unknown: '未知',
-  unverified: '正在验证',
 }
 
 const checkStates = { pass: '通过', fail: '失败', warning: '警告' } as const
@@ -59,23 +60,7 @@ const jobStates = {
   completed: '已完成',
   failed: '失败',
 } as const
-const phaseLabels: Record<string, string> = {
-  queued: '等待执行',
-  checking: '检查宿主',
-  dependencies: '准备宿主依赖',
-  diagnosing: '诊断宿主',
-  fetching: '下载签名载荷',
-  preparing_runtime: '准备运行文件',
-  restoring: '恢复未完成的维护',
-  downloading: '下载签名载荷',
-  verifying: '验证载荷',
-  applying: '应用变更',
-  starting: '启动 Gemini 服务',
-  installing: '安装运行环境',
-  restarting: '重启 Gemini 服务',
-  completed: '执行完成',
-  failed: '执行失败',
-}
+const phaseLabels = geminiPhaseLabels
 
 const restartCopy =
   '此操作可能启动或重启 Gemini 服务，使该服务短暂不可用；不会重启控制面。宿主仍有授权、终端或推理任务时，会拒绝变更，不会强制停止任务。'
@@ -86,16 +71,32 @@ type Confirmation = {
 }
 
 function Code({ value }: { value: string }) {
-  return <code className='text-xs [overflow-wrap:anywhere]'>{value}</code>
+  return (
+    <code className='font-mono text-xs [overflow-wrap:anywhere] text-muted-foreground'>
+      {value}
+    </code>
+  )
+}
+
+function LocalizedCode({ code }: { code: string }) {
+  const label = geminiMaintenanceCodeLabel(code)
+  if (!label) return <Code value={code} />
+  return (
+    <span>
+      {label}（<Code value={code} />）
+    </span>
+  )
 }
 
 function BootstrapNotice({ endpointMissing }: { endpointMissing: boolean }) {
-  const [clipboard, setClipboard] = useState<'copied' | 'failed' | null>(null)
+  const [clipboard, setClipboard] = useState<
+    'local' | 'remote' | 'failed' | null
+  >(null)
 
-  async function copy() {
+  async function copy(kind: 'local' | 'remote', text: string) {
     try {
-      await navigator.clipboard.writeText(COMMAND)
-      setClipboard('copied')
+      await navigator.clipboard.writeText(text)
+      setClipboard(kind)
     } catch {
       setClipboard('failed')
     }
@@ -108,32 +109,56 @@ function BootstrapNotice({ endpointMissing }: { endpointMissing: boolean }) {
         <AlertDescription>
           {endpointMissing
             ? '控制面没有 Gemini 维护接口。请先升级控制面；若宿主的维护服务尚未初始化，再运行下方命令。'
-            : '控制面无法连接 Gemini 维护服务，面板不能代为初始化。请在 Linux amd64 宿主机运行以下命令，完成后刷新状态。'}
+            : '控制面无法连接 Gemini 维护服务，面板不能代为初始化。请在 Linux amd64 宿主机运行以下命令之一，完成后刷新状态。'}
         </AlertDescription>
       </Alert>
       <p className='text-sm text-muted-foreground'>
         如果安装目录不是 <code>/opt/vm2api</code>，请先替换为宿主机现有 vm2api
         安装目录的绝对路径。
       </p>
-      <pre className='rounded-md border bg-muted/40 p-3 text-xs [overflow-wrap:anywhere] whitespace-pre-wrap'>
-        {COMMAND}
-      </pre>
-      <div className='flex flex-wrap items-center gap-2'>
+      <div className='space-y-2'>
+        <p className='text-xs font-medium text-foreground'>
+          方式一：使用宿主机已有安装脚本（推荐，无需重新下载）
+        </p>
+        <pre className='rounded-md border bg-muted/40 p-3 text-xs [overflow-wrap:anywhere] whitespace-pre-wrap'>
+          {LOCAL_COMMAND}
+        </pre>
         <Button
           type='button'
           size='sm'
           variant='outline'
-          onClick={() => void copy()}
+          onClick={() => void copy('local', LOCAL_COMMAND)}
         >
-          {clipboard === 'copied' ? <Check /> : <Copy />}
-          复制安装命令
+          {clipboard === 'local' ? <Check /> : <Copy />}
+          复制本地命令
         </Button>
-        <span role='status' className='text-sm text-muted-foreground'>
-          {clipboard === 'copied' ? '已复制。' : null}
-          {clipboard === 'failed'
-            ? '无法访问剪贴板，请手动选择并复制命令。'
-            : null}
-        </span>
+      </div>
+      <div className='space-y-2'>
+        <p className='text-xs font-medium text-foreground'>
+          方式二：远程下载引导脚本
+        </p>
+        <pre className='rounded-md border bg-muted/40 p-3 text-xs [overflow-wrap:anywhere] whitespace-pre-wrap'>
+          {REMOTE_COMMAND}
+        </pre>
+        <div className='flex flex-wrap items-center gap-2'>
+          <Button
+            type='button'
+            size='sm'
+            variant='outline'
+            onClick={() => void copy('remote', REMOTE_COMMAND)}
+          >
+            {clipboard === 'remote' ? <Check /> : <Copy />}
+            复制远程命令
+          </Button>
+          <span role='status' className='text-sm text-muted-foreground'>
+            {clipboard === 'local' || clipboard === 'remote'
+              ? '已复制。'
+              : null}
+            {clipboard === 'failed'
+              ? '无法访问剪贴板，请手动选择并复制命令。'
+              : null}
+          </span>
+        </div>
       </div>
     </div>
   )
@@ -163,7 +188,7 @@ function HostStatus({ snapshot }: { snapshot: MaintenanceSnapshot }) {
             {payload.issue ? (
               <>
                 {' '}
-                · <Code value={payload.issue} />
+                · <LocalizedCode code={payload.issue} />
               </>
             ) : null}
           </dd>
@@ -221,11 +246,11 @@ function MaintenanceActivity({ snapshot }: { snapshot: MaintenanceSnapshot }) {
                 <p className='text-destructive'>
                   {job.error_code ? (
                     <>
-                      错误代码：
-                      <Code value={job.error_code} />
+                      失败原因：
+                      <LocalizedCode code={job.error_code} />。
                     </>
                   ) : (
-                    '宿主未返回错误代码。'
+                    '宿主未返回错误原因。'
                   )}{' '}
                   请查看下方诊断结果，再决定是否重试或恢复环境。
                 </p>
@@ -240,20 +265,40 @@ function MaintenanceActivity({ snapshot }: { snapshot: MaintenanceSnapshot }) {
         <h3 className='text-sm font-medium'>诊断结果</h3>
         {checks.length ? (
           <ul className='divide-y rounded-md border'>
-            {checks.map(({ id, state, code }) => (
-              <li
-                key={id}
-                className='flex flex-wrap items-baseline gap-x-3 gap-y-1 px-3 py-2'
-              >
-                <span className='mr-auto text-sm [overflow-wrap:anywhere]'>
-                  {id}
-                </span>
-                <Badge variant={state === 'fail' ? 'destructive' : 'outline'}>
-                  {checkStates[state]}
-                </Badge>
-                {code ? <Code value={code} /> : null}
-              </li>
-            ))}
+            {checks.map(({ id, state, code }) => {
+              const checkName = geminiCheckLabels[id]
+              const codeText = code ? geminiMaintenanceCodeLabel(code) : null
+              return (
+                <li key={id} className='flex flex-col gap-1 px-3 py-2 text-sm'>
+                  <div className='flex flex-wrap items-baseline gap-x-3 gap-y-1'>
+                    <span className='mr-auto [overflow-wrap:anywhere]'>
+                      {checkName || id}
+                      {checkName ? (
+                        <span className='ms-1.5 font-mono text-xs text-muted-foreground'>
+                          {id}
+                        </span>
+                      ) : null}
+                    </span>
+                    <Badge
+                      variant={state === 'fail' ? 'destructive' : 'outline'}
+                    >
+                      {checkStates[state]}
+                    </Badge>
+                  </div>
+                  {code ? (
+                    <p className='text-xs [overflow-wrap:anywhere] text-muted-foreground'>
+                      {codeText ? (
+                        <>
+                          {codeText}（<Code value={code} />）
+                        </>
+                      ) : (
+                        <Code value={code} />
+                      )}
+                    </p>
+                  ) : null}
+                </li>
+              )
+            })}
           </ul>
         ) : (
           <p className='text-sm text-muted-foreground'>
@@ -440,7 +485,9 @@ export function GeminiInstallPane() {
     !!snapshot?.payload.version &&
     ['installed', 'awaiting_redemption'].includes(snapshot.payload.state)
   const canUpdateCli = !!release?.compatible && hasInstalledPayload
-  const submitCode = isApiError(submit.error) ? submit.error.code : ''
+  const submitError = submit.isError
+    ? classifyMaintenanceSubmitError(submit.error)
+    : null
   const statusCode = isApiError(status.error) ? status.error.code : ''
 
   function start(request: MaintenanceRequest) {
@@ -520,24 +567,24 @@ export function GeminiInstallPane() {
             {statusCode ? (
               <>
                 {' '}
-                错误代码：
-                <Code value={statusCode} />
+                原因：
+                <LocalizedCode code={statusCode} />
               </>
             ) : null}
           </AlertDescription>
         </Alert>
       ) : null}
-      {submit.isError ? (
+      {submitError ? (
         <Alert variant='destructive'>
-          <AlertTitle>未能确认任务已提交</AlertTitle>
+          <AlertTitle>{submitError.title}</AlertTitle>
           <AlertDescription>
-            {submitCode ? (
+            {submitError.detail}
+            {submitError.code ? (
               <>
-                错误代码：
-                <Code value={submitCode} />。{' '}
+                {' '}
+                <Code value={submitError.code} />
               </>
             ) : null}
-            请先查看最新任务状态；若宿主繁忙，等待授权、终端或推理任务退出后再试。
           </AlertDescription>
         </Alert>
       ) : null}
@@ -557,8 +604,8 @@ export function GeminiInstallPane() {
           <Alert variant='destructive'>
             <AlertTitle>维护服务不可访问</AlertTitle>
             <AlertDescription>
-              请在宿主机检查控制面是否有权访问维护服务，然后刷新状态。错误代码：
-              <Code value={unavailable.code} />
+              <LocalizedCode code={unavailable.code} />
+              。请在宿主机核查服务与权限后刷新状态。
             </AlertDescription>
           </Alert>
         )

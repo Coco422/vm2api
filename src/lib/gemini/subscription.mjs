@@ -3,8 +3,9 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { CRAG_GEMINI_PRODUCT, readCragGeminiPackageAuthority, readPinnedCragGeminiPublicKeySha256 } from './payload.mjs'
 
-const DEFAULT_AUTHORITY = 'https://www.vm2api.org'
+const DEFAULT_AUTHORITY = 'https://www.vm2api.org/gemini'
 const HOST_DOMAIN = 'crag-gemini-host-v1:'
+const HOST_ID_MOUNT = '/run/crag-host-machine-id'
 const MAX_HOST_ENTITLEMENT_BYTES = 1536 * 1024
 const MAX_SUBSCRIPTION_TOKEN_BYTES = 8192
 const MAX_HOST_ROSTER_ENTRIES = 10_000
@@ -15,16 +16,37 @@ const VOUCHER_RE = /^CRAGR1\.[A-Za-z0-9_-]{43}$/
 const AUTHORITY_ERRORS = new Map([
   ['redeem_unavailable', 404],
   ['host_redeem_conflict', 409],
+  ['issuer_mismatch', 409],
+  ['payload_key_unknown', 400],
+  ['payload_key_conflict', 409],
   ['host_binding_conflict', 409],
   ['host_subscription_inactive', 403],
   ['auth_forbidden', 403],
   ['not_found', 404],
   ['slot_limit_reached', 409],
+  ['renewal_unavailable', 409],
+  ['host_transfer_cooldown', 409],
   ['request_conflict', 409],
   ['invalid_request', 400],
   ['license_invalid', 400],
   ['license_binding_mismatch', 400],
 ])
+
+export const RECOVERABLE_GEMINI_SEAT_CODES = new Set([
+  'license_required',
+  'license_binding_mismatch',
+  'license_expired',
+  'license_payload_key_mismatch',
+])
+
+export const GEMINI_SANDBOX_ERROR_CODES = new Set(['gemini_sandbox_apparmor_restricted', 'gemini_sandbox_unavailable'])
+
+export const GEMINI_SANDBOX_MESSAGES = {
+  gemini_sandbox_apparmor_restricted:
+    '宿主机 AppArmor 限制了非特权 user namespace，导致 Gemini 沙箱无法启动；请在宿主机执行 prepare-gemini 或前往「设置 → Gemini 维护」执行修复安装',
+  gemini_sandbox_unavailable:
+    '宿主机非特权沙箱（bwrap）不可用，无法启动 Gemini 隔离进程；请前往「设置 → Gemini 维护」诊断宿主并检查宿主服务日志',
+}
 
 export const GEMINI_LICENSE_MESSAGES = {
   license_required: '当前 Gemini OAuth 环境尚未绑定 CRAGGemini 订阅席位，请先绑定席位或激活许可。',
@@ -32,14 +54,17 @@ export const GEMINI_LICENSE_MESSAGES = {
   license_not_yet_valid: 'CRAGGemini 许可尚未生效，请检查系统 UTC 时间。',
   license_invalid: 'CRAGGemini 订阅许可或签名载荷无效。',
   license_binding_mismatch: 'CRAGGemini 许可与当前环境、设备或宿主机订阅名单不匹配。',
+  license_payload_key_mismatch: 'CRAGGemini 席位许可与当前已安装加密载荷密钥不匹配，请重新绑定席位以换签。',
   license_unconfigured: 'CRAGGemini 尚未配置加密载荷或订阅信任根。',
+  gemini_subscription_sync_pending: 'CRAGGemini 宿主订阅正在同步上次变更，请稍候自动恢复或点击「继续同步订阅」。',
   gemini_subscription_oauth_only: '纯 API Key 模式不运行 CRAGGemini，无需绑定 CRAG 订阅席位。',
   gemini_subscription_not_active: '请先为宿主机兑换 CRAGGemini 订阅凭证。',
   gemini_subscription_reclaim_unsupported: '当前宿主机订阅版本不支持 CRAGH2 席位回收，请先升级订阅格式。',
   gemini_subscription_authority_unavailable: '无法连接 CRAGGemini 授权中心，请稍后重试。',
   gemini_subscription_invalid_entitlement: 'CRAGGemini 授权中心返回的宿主权益签名无效。',
   gemini_subscription_invalid_voucher: '请输入有效的 CRAGR1 兑换码。',
-  gemini_subscription_package_unready: '宿主机尚未安装可信的 CRAGGemini 加密载荷。',
+  gemini_subscription_package_unready:
+    '宿主机尚未安装可信的 CRAGGemini 加密载荷，请前往「设置 → Gemini 维护」安装或修复后再试。',
   gemini_subscription_busy: 'CRAGGemini 订阅操作正在进行中，请稍后重试。',
   gemini_subscription_invalid_code: '请输入有效的 CRAGS1 / CRAGL1 / CRAGK1 许可码。',
   slot_limit_reached: 'CRAGGemini 宿主机订阅席位已满，请先删除/释放旧环境或扩容订阅。',
@@ -47,6 +72,13 @@ export const GEMINI_LICENSE_MESSAGES = {
   host_binding_conflict: '该 Gemini 环境已绑定到其他设备密钥，无法覆盖。',
   redeem_unavailable: '该 CRAGR1 兑换码不可用或已被兑换。',
   host_redeem_conflict: '该 CRAGR1 兑换码已绑定到其他宿主机。',
+  issuer_mismatch: 'CRAGGemini 授权中心不认可当前宿主载荷的签发公钥，请核对授权地址与 CRAGGemini 载荷版本。',
+  payload_key_unknown: 'CRAGGemini 授权中心未登记当前宿主载荷密钥，请更新 CRAGGemini 载荷后重试。',
+  payload_key_conflict: 'CRAGGemini 载荷密钥与当前订阅状态冲突，请检查载荷版本后重试。',
+  renewal_unavailable: '当前 CRAGGemini 订阅暂不可续期。',
+  host_transfer_cooldown: '宿主机迁移尚在冷却期内，请稍后重试。',
+  request_conflict: 'CRAGGemini 授权请求存在冲突，请稍后重试。',
+  invalid_request: 'CRAGGemini 授权请求参数无效，请核对版本后重试。',
   auth_forbidden: 'CRAGGemini 授权中心拒绝了宿主机凭据。',
   not_found: '授权中心未找到对应的宿主机订阅或载荷密钥。',
 }
@@ -309,7 +341,7 @@ export function verifyCragGeminiSlotPermit(
     throw fail('license_binding_mismatch', 403)
   }
   if (expectedPayloadKeyId && permit.payload_key_id !== expectedPayloadKeyId) {
-    throw fail('license_invalid', 403)
+    throw fail('license_payload_key_mismatch', 403)
   }
 
   if (entitlementClaims.version === 1) {
@@ -411,7 +443,7 @@ export function createGeminiCragSubscription({
   callHost,
   fetchImpl = globalThis.fetch,
   origin = null,
-  machineIdFile = process.env.KIN_CRAG_HOST_ID_FILE || '/etc/machine-id',
+  machineIdFile = process.env.KIN_CRAG_HOST_ID_FILE || null,
 } = {}) {
   const authorityOrigin = resolveOrigin(origin)
   const publicDir = cragGeminiSubscriptionPublicDirectory(projectRoot, dataDir)
@@ -421,6 +453,9 @@ export function createGeminiCragSubscription({
   const entitlementFile = path.join(publicDir, 'entitlement.code')
   const syncMarkerFile = path.join(publicDir, 'sync-pending')
   const credentialFile = path.join(privateDir, 'credential')
+  const AUTO_BIND_BACKOFF_MS = 30_000
+  const autoBindBackoff = new Map()
+  let lastExpiryRefresh = null
   let busy = false
 
   function ensureStorage() {
@@ -439,10 +474,16 @@ export function createGeminiCragSubscription({
       return saved
     }
     let raw = null
-    try {
-      const text = fs.readFileSync(machineIdFile, 'utf8').trim().toLowerCase().replaceAll('-', '')
-      if (/^[a-f0-9]{32}$/.test(text) && !/^(0{32}|f{32})$/.test(text)) raw = text
-    } catch {}
+    const machineIdCandidates = machineIdFile ? [machineIdFile] : [HOST_ID_MOUNT, '/etc/machine-id']
+    for (const candidate of machineIdCandidates) {
+      try {
+        const text = fs.readFileSync(candidate, 'utf8').trim().toLowerCase().replaceAll('-', '')
+        if (/^[a-f0-9]{32}$/.test(text) && !/^(0{32}|f{32})$/.test(text)) {
+          raw = text
+          break
+        }
+      } catch {}
+    }
     const derived = raw
       ? sha256Hex(`${HOST_DOMAIN}${raw}`)
       : sha256Hex(`${HOST_DOMAIN}${randomBytes(16).toString('hex')}`)
@@ -493,6 +534,22 @@ export function createGeminiCragSubscription({
     }
   }
 
+  async function ensurePackageAuthority() {
+    try {
+      return packageAuthority()
+    } catch (error) {
+      if (error?.code !== 'gemini_subscription_package_unready' || typeof callHost !== 'function') {
+        throw error
+      }
+      try {
+        await callHost('ensure-payload', {})
+      } catch {
+        throw error
+      }
+      return packageAuthority()
+    }
+  }
+
   function readLocalEntitlement(authority) {
     const hostId = readOptionalFile(hostIdFile, 128)?.trim()
     const code = readOptionalFile(entitlementFile, MAX_HOST_ENTITLEMENT_BYTES + 1)?.trim()
@@ -506,16 +563,17 @@ export function createGeminiCragSubscription({
     let code = null
     let requestId = null
     try {
+      const headers = {
+        'content-type': 'application/json',
+        accept: 'application/json',
+      }
+      if (credential) headers.authorization = `Bearer ${credential}`
       const response = await fetchImpl(`${authorityOrigin}/v1/host-subscriptions/${action}`, {
         method: 'POST',
         redirect: 'error',
         cache: 'no-store',
         signal: AbortSignal.timeout(10_000),
-        headers: {
-          authorization: `Bearer ${credential}`,
-          'content-type': 'application/json',
-          accept: 'application/json',
-        },
+        headers,
         body: JSON.stringify({ host_id: hostId, ...body }),
       })
       status = response.status
@@ -542,6 +600,46 @@ export function createGeminiCragSubscription({
     } finally {
       busy = false
     }
+  }
+
+  function canAutoBindLocal() {
+    if (fs.existsSync(syncMarkerFile)) return null
+    let authority
+    try {
+      authority = packageAuthority()
+    } catch {
+      return null
+    }
+    let local
+    try {
+      local = readLocalEntitlement(authority)
+    } catch {
+      return null
+    }
+    if (!local) return null
+    const now = Math.floor(Date.now() / 1000)
+    const { claims } = local
+    if (now < claims.issued_at || now >= claims.expires_at) return null
+    if (claims.version === 2) {
+      const cap = claims.slot_limit === 'unlimited' ? 10_000 : Math.min(claims.slot_limit, 10_000)
+      if (claims.roster.length >= cap) return null
+    } else if (claims.version === 3) {
+      if (!effectiveGrantedSlots(claims.grants, now)) return null
+    }
+    return { authority, local }
+  }
+
+  function needsAutoSeatBind(env, { payloadMode = null } = {}) {
+    if (!env || typeof env.id !== 'string' || !env.id) return false
+    if (env.auth_method === 'api_key' || env.auth_state === 'disabled') return false
+    const isCragSub =
+      payloadMode === 'crag_subscription' ||
+      env.payload_mode === 'crag_subscription' ||
+      env.crag_license?.seat_required === true
+    if (!isCragSub) return false
+    if (env.crag_license?.valid === true) return false
+    if (env.crag_license?.code && !RECOVERABLE_GEMINI_SEAT_CODES.has(env.crag_license.code)) return false
+    return true
   }
 
   function formatStatus({ hostId, authority, local, remote = null }) {
@@ -598,40 +696,211 @@ export function createGeminiCragSubscription({
     }
   }
 
+  async function syncFromAuthorityLocked(authority) {
+    const hostId = resolveHostId(false)
+    let local = null
+    try {
+      local = readLocalEntitlement(authority)
+    } catch {
+      local = null
+    }
+    const pendingSync = fs.existsSync(syncMarkerFile)
+    const rawCred = readOptionalFile(credentialFile, 128)?.trim()
+    let cred = rawCred && validVoucher(`CRAGR1.${rawCred}`) ? rawCred : null
+
+    // Bootstrap path: no local entitlement and no pending sync. Probe Authority by
+    // host_id (with optional credential) so direct-credited or admin-migrated
+    // CRAGGemini hosts automatically pull their signed CRAGH2 entitlement and bind
+    // a random local device credential on first sync.
+    if (!local && !pendingSync) {
+      try {
+        const data = await callAuthority('status', hostId, cred, {})
+        if (typeof data?.entitlement === 'string' && data.entitlement.trim()) {
+          const trimmed = data.entitlement.trim()
+          const nextClaims = verifyCragGeminiHostEntitlement(trimmed, hostId, authority.publicKey, {
+            allowExpired: true,
+          })
+          ensureStorage()
+          resolveHostId(true)
+          publishFile(entitlementFile, `${trimmed}\n`, 0o644)
+          local = { hostId, code: trimmed, claims: nextClaims }
+          if (!cred) {
+            cred = resolveCredential(hostId, true)
+            await callAuthority('recover', hostId, cred, { entitlement: trimmed }).catch(() => {})
+          }
+          return { hostId, local, remote: data, clearedOrphan: false }
+        }
+        return { hostId, local: null, remote: null, clearedOrphan: false }
+      } catch (error) {
+        if (
+          error?.code === 'not_found' ||
+          error?.code === 'auth_forbidden' ||
+          error?.code === 'host_subscription_inactive'
+        ) {
+          return { hostId, local: null, remote: null, clearedOrphan: false }
+        }
+        throw error
+      }
+    }
+
+    if (!cred) {
+      if (pendingSync && !local) {
+        removeFile(syncMarkerFile)
+        autoBindBackoff.clear()
+        return { hostId, local: null, remote: null, clearedOrphan: true }
+      }
+      if (local) {
+        // Local signed entitlement survived without a local credential: self-recover.
+        cred = resolveCredential(hostId, true)
+        try {
+          await callAuthority('recover', hostId, cred, { entitlement: local.code })
+        } catch {
+          return { hostId, local, remote: null, clearedOrphan: false }
+        }
+      } else {
+        return { hostId, local, remote: null, clearedOrphan: false }
+      }
+    }
+
+    try {
+      let data
+      try {
+        data = await callAuthority('status', hostId, cred, {})
+      } catch (error) {
+        if (error?.code === 'auth_forbidden' && local) {
+          await callAuthority('recover', hostId, cred, { entitlement: local.code })
+          data = await callAuthority('status', hostId, cred, {})
+        } else {
+          throw error
+        }
+      }
+      if (typeof data?.entitlement === 'string' && data.entitlement.trim()) {
+        const trimmed = data.entitlement.trim()
+        const nextClaims = verifyCragGeminiHostEntitlement(trimmed, hostId, authority.publicKey, {
+          allowExpired: true,
+        })
+        if (local && nextClaims.revision < local.claims.revision) {
+          throw fail('gemini_subscription_invalid_entitlement', 502)
+        }
+        if (!local || nextClaims.revision > local.claims.revision || trimmed !== local.code) {
+          publishFile(entitlementFile, `${trimmed}\n`, 0o644)
+          local = { hostId, code: trimmed, claims: nextClaims }
+        }
+      }
+      if (pendingSync) {
+        removeFile(syncMarkerFile)
+        autoBindBackoff.clear()
+      }
+      return { hostId, local, remote: data, clearedOrphan: false }
+    } catch (error) {
+      if (
+        pendingSync &&
+        !local &&
+        (error?.code === 'not_found' ||
+          error?.code === 'host_subscription_inactive' ||
+          error?.code === 'auth_forbidden')
+      ) {
+        removeFile(syncMarkerFile)
+        autoBindBackoff.clear()
+        return { hostId, local: null, remote: null, clearedOrphan: true }
+      }
+      throw error
+    }
+  }
+
   return {
     publicDir,
+
+    hasSyncPending() {
+      return fs.existsSync(syncMarkerFile)
+    },
+
+    async recover() {
+      if (!fs.existsSync(syncMarkerFile)) return { recovered: false, pending: false }
+      return withLock(async () => {
+        if (!fs.existsSync(syncMarkerFile)) return { recovered: false, pending: false }
+        let authority
+        try {
+          authority = await ensurePackageAuthority()
+        } catch {
+          return { recovered: false, pending: true }
+        }
+        const synced = await syncFromAuthorityLocked(authority)
+        const status = formatStatus({
+          hostId: synced.hostId,
+          authority,
+          local: synced.local,
+          remote: synced.remote,
+        })
+        if (synced.clearedOrphan) return { recovered: true, cleared_orphan: true, status }
+        return { recovered: true, status }
+      })
+    },
+
+    async refreshExpiredEntitlement() {
+      if (busy || fs.existsSync(syncMarkerFile) || !fs.existsSync(entitlementFile)) {
+        return { refreshed: false }
+      }
+      let authority
+      let local
+      try {
+        authority = packageAuthority()
+        local = readLocalEntitlement(authority)
+      } catch {
+        return { refreshed: false }
+      }
+      const nowMs = Date.now()
+      if (!local || local.claims.expires_at * 1000 > nowMs) return { refreshed: false }
+      if (lastExpiryRefresh?.code === local.code && nowMs < lastExpiryRefresh.retryAfter) {
+        return { refreshed: false }
+      }
+      lastExpiryRefresh = { code: local.code, retryAfter: nowMs + AUTO_BIND_BACKOFF_MS }
+      return withLock(async () => {
+        if (fs.existsSync(syncMarkerFile)) return { refreshed: false }
+        const synced = await syncFromAuthorityLocked(authority)
+        const status = formatStatus({
+          hostId: synced.hostId,
+          authority,
+          local: synced.local,
+          remote: synced.remote,
+        })
+        if (status.active) {
+          lastExpiryRefresh = null
+          autoBindBackoff.clear()
+          return { refreshed: true, status }
+        }
+        return { refreshed: false, status }
+      })
+    },
 
     async status({ sync = false } = {}) {
       let authority = null
       try {
-        authority = packageAuthority()
+        authority = sync ? await ensurePackageAuthority() : packageAuthority()
       } catch {
         return formatStatus({ hostId: readOptionalFile(hostIdFile, 128)?.trim() || null, authority: null, local: null })
       }
-      const hostId = resolveHostId(false)
-      let local = readLocalEntitlement(authority)
-      let remote = null
-      if (sync && local) {
-        const cred = resolveCredential(hostId, false)
-        const data = await callAuthority('status', hostId, cred, {})
-        const nextClaims = verifyCragGeminiHostEntitlement(data.entitlement, hostId, authority.publicKey, {
-          allowExpired: true,
+      if (sync) {
+        return withLock(async () => {
+          const synced = await syncFromAuthorityLocked(authority)
+          return formatStatus({
+            hostId: synced.hostId,
+            authority,
+            local: synced.local,
+            remote: synced.remote,
+          })
         })
-        if (nextClaims.revision < local.claims.revision) throw fail('gemini_subscription_invalid_entitlement', 502)
-        if (nextClaims.revision > local.claims.revision) {
-          publishFile(entitlementFile, `${data.entitlement}\n`, 0o644)
-          local = { hostId, code: data.entitlement, claims: nextClaims }
-        }
-        remote = data
       }
-      return formatStatus({ hostId, authority, local, remote })
+      const hostId = resolveHostId(false)
+      const local = readLocalEntitlement(authority)
+      return formatStatus({ hostId, authority, local, remote: null })
     },
 
     async redeem(redemptionCode) {
       const code = typeof redemptionCode === 'string' ? redemptionCode.trim() : ''
       if (!validVoucher(code)) throw fail('gemini_subscription_invalid_voucher', 400)
       return withLock(async () => {
-        const authority = packageAuthority()
+        const authority = await ensurePackageAuthority()
         const hostId = resolveHostId(true)
         const cred = resolveCredential(hostId, true)
         const previous = readLocalEntitlement(authority)
@@ -650,6 +919,7 @@ export function createGeminiCragSubscription({
           }
           publishFile(entitlementFile, `${data.entitlement}\n`, 0o644)
           removeFile(syncMarkerFile)
+          autoBindBackoff.clear()
           return formatStatus({ hostId, authority, local: { hostId, code: data.entitlement, claims }, remote: data })
         } catch (error) {
           if (error?.code !== 'gemini_subscription_authority_unavailable') {
@@ -662,7 +932,7 @@ export function createGeminiCragSubscription({
 
     async upgrade() {
       return withLock(async () => {
-        const authority = packageAuthority()
+        const authority = await ensurePackageAuthority()
         const hostId = resolveHostId(false)
         const cred = resolveCredential(hostId, false)
         const previous = readLocalEntitlement(authority)
@@ -678,6 +948,7 @@ export function createGeminiCragSubscription({
           }
           publishFile(entitlementFile, `${data.entitlement}\n`, 0o644)
           removeFile(syncMarkerFile)
+          autoBindBackoff.clear()
           return formatStatus({ hostId, authority, local: { hostId, code: data.entitlement, claims }, remote: data })
         } catch (error) {
           if (error?.code !== 'gemini_subscription_authority_unavailable') removeFile(syncMarkerFile)
@@ -690,7 +961,7 @@ export function createGeminiCragSubscription({
       return withLock(async () => {
         const env = await callHost('get', { id: envId })
         if (env?.auth_method === 'api_key') throw fail('gemini_subscription_oauth_only', 409)
-        const authority = packageAuthority()
+        const authority = await ensurePackageAuthority()
         const hostId = resolveHostId(false)
         const local = readLocalEntitlement(authority)
         if (!local) throw fail('gemini_subscription_not_active', 409)
@@ -702,11 +973,20 @@ export function createGeminiCragSubscription({
 
         publishFile(syncMarkerFile, 'pending\n', 0o644)
         try {
-          const bound = await callAuthority('bind', hostId, cred, {
+          const request = {
             machine_code: machineCode,
             issuer_public_key_id: authority.issuerId,
             payload_key_id: authority.payloadKeyId,
-          })
+          }
+          let bound
+          try {
+            bound = await callAuthority('bind', hostId, cred, request)
+          } catch (error) {
+            if (error?.code !== 'payload_key_conflict' && error?.code !== 'host_binding_conflict') {
+              throw error
+            }
+            bound = await callAuthority('bind', hostId, cred, { ...request, reissue: true })
+          }
           const nextClaims = verifyCragGeminiHostEntitlement(bound.entitlement, hostId, authority.publicKey)
           if (nextClaims.revision < local.claims.revision) {
             throw fail('gemini_subscription_invalid_entitlement', 502)
@@ -722,6 +1002,7 @@ export function createGeminiCragSubscription({
           publishFile(entitlementFile, `${bound.entitlement}\n`, 0o644)
           removeFile(syncMarkerFile)
           const activated = await callHost('license-activate', { id: envId, code: bound.slot_permit })
+          autoBindBackoff.delete(envId)
           return {
             vm_id: envId,
             seat: bound.seat,
@@ -803,6 +1084,7 @@ export function createGeminiCragSubscription({
           publishFile(entitlementFile, `${data.entitlement}\n`, 0o644)
           removeFile(syncMarkerFile)
           await callHost('license-clear', { id: envId })
+          autoBindBackoff.clear()
           return {
             released: true,
             vm_id: envId,
@@ -818,6 +1100,49 @@ export function createGeminiCragSubscription({
           throw error
         }
       })
+    },
+
+    async ensureEnvironmentSeat(envId, { env = null, payloadMode = null } = {}) {
+      if (busy) return { attempted: false, bound: false, reason: 'busy' }
+      const until = autoBindBackoff.get(envId)
+      if (until && Date.now() < until) return { attempted: false, bound: false, reason: 'backoff' }
+      if (!canAutoBindLocal()) return { attempted: false, bound: false, reason: 'inactive_or_full' }
+      const target = env ?? (await callHost('get', { id: envId }).catch(() => null))
+      if (!needsAutoSeatBind(target, { payloadMode })) {
+        return { attempted: false, bound: false, reason: 'not_needed' }
+      }
+      try {
+        const result = await this.bindEnvironment(envId)
+        return { attempted: true, bound: true, seat: result.seat, result }
+      } catch (error) {
+        const code = typeof error?.code === 'string' ? error.code : 'bind_failed'
+        autoBindBackoff.set(envId, Date.now() + AUTO_BIND_BACKOFF_MS)
+        return { attempted: true, bound: false, error_code: code }
+      }
+    },
+
+    async reconcileEnvironmentSeats(environments, { payloadMode = null } = {}) {
+      if (busy || !Array.isArray(environments) || !environments.length) return { boundIds: [] }
+      if (!canAutoBindLocal()) return { boundIds: [] }
+      const boundIds = []
+      for (const env of environments) {
+        if (!needsAutoSeatBind(env, { payloadMode })) continue
+        const outcome = await this.ensureEnvironmentSeat(env.id, { env, payloadMode })
+        if (outcome.bound) {
+          boundIds.push(env.id)
+          continue
+        }
+        if (
+          outcome.reason === 'inactive_or_full' ||
+          outcome.reason === 'busy' ||
+          outcome.error_code === 'slot_limit_reached' ||
+          outcome.error_code === 'host_subscription_inactive' ||
+          outcome.error_code === 'gemini_subscription_authority_unavailable'
+        ) {
+          break
+        }
+      }
+      return { boundIds }
     },
 
     async environmentStatus(envId) {
@@ -850,13 +1175,19 @@ export function createGeminiCragSubscription({
       if (lic?.valid === true) {
         return { ok: true, seat_required: true, seat: lic.seat ?? null }
       }
-      const code =
-        typeof lic?.code === 'string' && Object.hasOwn(GEMINI_LICENSE_MESSAGES, lic.code)
-          ? lic.code
-          : 'license_required'
+      const licCode = typeof lic?.code === 'string' ? lic.code : null
+      if (licCode && GEMINI_SANDBOX_ERROR_CODES.has(licCode)) {
+        return {
+          ok: false,
+          status: 503,
+          code: licCode,
+          message: GEMINI_SANDBOX_MESSAGES[licCode],
+        }
+      }
+      const code = licCode && Object.hasOwn(GEMINI_LICENSE_MESSAGES, licCode) ? licCode : 'license_required'
       return {
         ok: false,
-        status: 403,
+        status: code === 'gemini_subscription_sync_pending' ? 503 : 403,
         code,
         message: GEMINI_LICENSE_MESSAGES[code],
       }

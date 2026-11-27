@@ -3,8 +3,7 @@ import { vmHasSchedulableCredential } from '../lib/vm/vm-registry.mjs'
 const RUNTIME_FAULTS = new Set(['kernel_faulted', 'worker_unhealthy', 'runtime_start_failed'])
 
 export function tenantVmRecoveryBlock(vm, { projectRoot, proxy, availability }) {
-  if (vm.schedule_off_reason === 'tenant_paused')
-    return { code: 'tenant_paused', message: '请先解除自己的调度暂停' }
+  if (vm.schedule_off_reason === 'tenant_paused') return { code: 'tenant_paused', message: '请先解除自己的调度暂停' }
   if (vm.status !== 'running' || vm.schedule_off || vm.schedule_manual)
     return { code: 'operator_disabled', message: '仅运行中且未关闭调度的 VM 可以自助恢复' }
   if (vm.schedule_hold || vm.migration_pending || ['running', 'needs_attention'].includes(vm.slot_migration?.status))

@@ -22,6 +22,7 @@ import {
 } from './model-policy.mjs'
 import { inboundHasOpenAIToolShape } from '../identity/crs-persona.mjs'
 import { openaiReasoningToClaudeThinking, claudeThinkingToOpenAIReasoning } from './thinking.mjs'
+import { firstNonEmptyEffort, isEmptyEffortValue } from './log-fields.mjs'
 import { openaiContentToClaudeContent, openaiImagePartToClaude } from './images.mjs'
 import { remapCodexTools } from './codex-tools.mjs'
 import { ensureOutputConfigSchema } from './request-rectifier.mjs'
@@ -743,7 +744,7 @@ function responsesToClaude(body, opts) {
   const input = body.input ?? body.messages
   const items = typeof input === 'string' ? [input] : input
   if (!Array.isArray(items) || !items.length) invalidResponses('input', 'must contain conversation history')
-  let requestedEffort = body.reasoning?.effort ?? body.reasoning_effort
+  let requestedEffort = firstNonEmptyEffort(body.reasoning?.effort, body.reasoning_effort)
   let replied = false
   for (const [index, raw] of items.entries()) {
     const param = `input[${index}]`
@@ -756,7 +757,7 @@ function responsesToClaude(body, opts) {
       continue
     }
     if (item.type === 'configuration_update') {
-      if (item.reasoning?.effort != null) requestedEffort = item.reasoning.effort
+      if (!isEmptyEffortValue(item.reasoning?.effort)) requestedEffort = item.reasoning.effort
       continue
     }
     if (item.type === 'additional_tools') {
@@ -857,7 +858,8 @@ function responsesToClaude(body, opts) {
     out.tool_choice = { ...(tc || { type: 'auto' }), disable_parallel_tool_use: true }
   }
   const caps = getCapabilities(out.model)
-  const effort = requestedEffort === 'minimal' ? 'low' : requestedEffort
+  const normalizedEffort = typeof requestedEffort === 'string' ? requestedEffort.trim() : requestedEffort
+  const effort = normalizedEffort === 'minimal' ? 'low' : normalizedEffort
   if (effort != null && !['none', 'off', 'low', 'medium', 'high', 'xhigh', 'max'].includes(effort)) {
     invalidResponses('reasoning.effort', 'unsupported reasoning effort')
   }
@@ -1204,7 +1206,7 @@ export function applyClaudeSSELineToMessage(line, state) {
     } else if (evt.delta.type === 'thinking_delta') {
       block.thinking = (block.thinking || '') + (evt.delta.thinking || '')
     } else if (evt.delta.type === 'signature_delta' && evt.delta.signature) {
-      block.signature = evt.delta.signature
+      block.signature = (block.signature || '') + evt.delta.signature
     } else if (evt.delta.type === 'input_json_delta') {
       block._inputJson = (block._inputJson || '') + (evt.delta.partial_json || '')
     } else if (evt.delta.type === 'refusal_delta') {
@@ -1441,8 +1443,8 @@ export function claudeSSELineToResponsesEvents(line, state) {
       emit(`${refusal ? 'refusal' : 'output_text'}.delta`, { ...fields, content_index: 0, delta: text })
     } else if (delta?.type === 'thinking_delta') {
       block.thinking = (block.thinking || '') + (delta.thinking || '')
-    } else if (delta?.type === 'signature_delta') {
-      block.signature = delta.signature
+    } else if (delta?.type === 'signature_delta' && delta.signature) {
+      block.signature = (block.signature || '') + delta.signature
     }
   } else if (evt.type === 'content_block_stop') {
     const entry = state.blocks.get(evt.index)

@@ -2,6 +2,7 @@
 import {
   rustKernelHealth,
   supportsCragTelemetryApply,
+  supportsCragTelemetryUpload,
   toPublicKernelHealth,
   verifyCragTelemetryPolicy,
 } from '../transport/rust-kernel-client.mjs'
@@ -11,6 +12,8 @@ import { slotExec } from './slot-runtime.mjs'
 import { resolveKernelDataplane } from './slot-engine.mjs'
 import { slotHost } from './slot-host.mjs'
 import { isCodexVm } from './vm-kind.mjs'
+import { isKvmRuntime } from './runtime-kind.mjs'
+import { hasClusterComputerBinds } from '../cluster/slot-computer-files.mjs'
 import { runSlotProcess } from '../transport/slot-oauth.mjs'
 import { slotExecArgv, slotExecContainer } from './slot-exec.mjs'
 import { inspectContainerOrNull } from '../cluster/docker-remote.mjs'
@@ -46,9 +49,14 @@ export function retireScriptVerdict(result) {
   return typeof result?.code === 'number' && String(result?.stdout || '').includes(RETIRE_RAN_MARKER)
 }
 
-export async function retireLegacyTelemetry({ vm, run = runSlotProcess, inspect = inspectContainerOrNull } = {}) {
+export async function retireLegacyTelemetry({
+  vm,
+  run = runSlotProcess,
+  inspect = inspectContainerOrNull,
+  host: slotHostOverride = null,
+} = {}) {
   if (!vm?.id) return { ok: false, code: 'invalid_vm' }
-  const host = slotHost(vm)
+  const host = slotHostOverride || slotHost(vm)
   if (host.native) return { ok: false, code: 'telemetry_unsupported' }
   let runtime
   try {
@@ -57,13 +65,16 @@ export async function retireLegacyTelemetry({ vm, run = runSlotProcess, inspect 
     return { ok: false, code: 'telemetry_runtime_unavailable' }
   }
   if (!runtime?.State?.Running) return { ok: true, running: false, state: 'stopped' }
+  const needsRecreate = Boolean(vm.node_id) && !isKvmRuntime(vm) && !hasClusterComputerBinds(runtime)
+  const recreateMeta = needsRecreate ? { needsRecreate: true } : {}
+  const env = host.dockerEnv()
   const attempt = () =>
     run(slotExecArgv(vm, ['sh', '-c', RETIRE_LEGACY_TELEMETRY]), {
       timeoutMs: 5000,
-      env: host.dockerEnv(),
+      env,
     })
   const result = await attempt()
-  if (result.code === 0 && !result.timed_out) return { ok: true, running: true }
+  if (result.code === 0 && !result.timed_out) return { ok: true, running: true, ...recreateMeta }
   // Only a numeric exit after the marker means the script really ran and the
   // sender survived; anything else (docker CLI transport error, null code,
   // timeout) is the slot exec never completing — node-link flap, not a dead
@@ -73,7 +84,7 @@ export async function retireLegacyTelemetry({ vm, run = runSlotProcess, inspect 
     return { ok: false, code: 'legacy_telemetry_stop_failed', error: 'Legacy telemetry process did not stop' }
   }
   const retry = await attempt()
-  if (retry.code === 0 && !retry.timed_out) return { ok: true, running: true }
+  if (retry.code === 0 && !retry.timed_out) return { ok: true, running: true, ...recreateMeta }
   if (retireScriptVerdict(retry)) {
     return { ok: false, code: 'legacy_telemetry_stop_failed', error: 'Legacy telemetry process did not stop' }
   }
@@ -82,6 +93,7 @@ export async function retireLegacyTelemetry({ vm, run = runSlotProcess, inspect 
     ok: true,
     running: true,
     unverified: true,
+    ...recreateMeta,
     code: 'legacy_telemetry_unverified',
     error: 'Legacy telemetry retire unverified (slot exec unavailable)',
   }
@@ -104,9 +116,28 @@ export async function readSlotProcessStatus({
   }
   let crag = resolveKernelDataplane(vm, routing) === 'crag'
   const unconfirmed = '未能核验 CRAG 启动策略'
-  const cragStatus = ({ enabled = null, error = null } = {}) => ({
+  const cragStatus = ({
+    enabled = null,
+    error = null,
+    reason = null,
+    upstream_message = null,
+    upload_confirmed = false,
+    upload_supported = false,
+    last_upload_at = null,
+    last_error = null,
+  } = {}) => ({
     ...unknown,
-    telemetry: { state: 'launch_policy', enabled, error, upload_confirmed: false },
+    telemetry: {
+      state: 'launch_policy',
+      enabled,
+      error,
+      upload_confirmed: enabled === true && upload_confirmed === true,
+      ...(upload_supported ? { upload_supported: true } : {}),
+      ...(upload_supported || last_upload_at ? { last_upload_at: last_upload_at ?? null } : {}),
+      ...(upload_supported || last_error ? { last_error: last_error ?? null } : {}),
+      ...(reason ? { reason } : {}),
+      ...(upstream_message ? { upstream_message } : {}),
+    },
   })
   try {
     const exec = slotExec(projectRoot, vm)
@@ -118,7 +149,7 @@ export async function readSlotProcessStatus({
     if (!liveCrag) return cragStatus({ error: '运行中的内核不是 CRAG' })
     if (!supportsCragTelemetryApply(observed)) return cragStatus({ error: '运行中的 CRAG 不支持遥测核验' })
     const verified = await verifyCragTelemetryPolicy(exec, isTelemetryEnabled(vm.seed_policy), timeoutMs)
-    return cragStatus(verified)
+    return cragStatus({ ...verified, upload_supported: supportsCragTelemetryUpload(observed) })
   } catch {
     return crag ? cragStatus({ error: unconfirmed }) : unknown
   }

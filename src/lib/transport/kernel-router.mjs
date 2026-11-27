@@ -203,8 +203,10 @@ function credentialEnsureFailure(result, ensured) {
   const rawError = ensured?.error
   const error = rawError && typeof rawError === 'object' ? rawError : {}
   const blob = `${error.code || ''} ${error.message || ''} ${typeof rawError === 'string' ? rawError : ''}`
-  const fatal = /invalid_grant|oauth_revoked|token has been revoked|refresh_token_missing/i.test(blob)
-  const revoked = /token has been revoked|oauth_revoked/i.test(blob)
+  const fatal = /invalid_grant|oauth_revoked|token has been revoked|token_revoked|invalidated oauth token|refresh_token_missing/i.test(
+    blob,
+  )
+  const revoked = /token has been revoked|token_revoked|invalidated oauth token|oauth_revoked/i.test(blob)
   return {
     ...result,
     ok: false,
@@ -371,11 +373,13 @@ async function prepareRust(exec, { ensure, routing, slotWaitMs, slotWaitDeadline
       )
   }
   clearRustHealthCache(cacheKey(exec))
-  const code = /^[a-zA-Z0-9_]{1,64}$/.test(String(health?.code || '')) ? health.code : 'unreachable'
+  const status = Number(last?.status) || 0
+  let code = status === 200 ? 'not_ready' : 'unreachable'
+  if (typeof last?.code === 'string' && /^[a-zA-Z0-9_]{1,64}$/.test(last.code)) code = last.code
   return {
     ok: false,
     reason: 'kernel_unavailable',
-    error: `rust kernel health probe failed (${code}, status ${Number(health?.status) || 0}); watchdog recovery pending`,
+    error: `rust kernel is down (${code}, status ${status}); watchdog recovery pending`,
   }
 }
 

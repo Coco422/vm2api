@@ -134,6 +134,23 @@ test('#163: a bare 429 is unknown for every model; the model name never decides 
   }
 })
 
+test('a long Retry-After alone never parks an account or model', () => {
+  for (const model of ['claude-fable-5-2', 'claude-opus-5-5']) {
+    const policy = classifyUpstreamResult(
+      {
+        status: 429,
+        headers: { 'retry-after': '109005' },
+        body: { error: { type: 'rate_limit_error', message: "This request would exceed your account's rate limit." } },
+      },
+      { model, now: 1000 },
+    )
+    assert.equal(policy.reason, 'rate_limited_unknown')
+    assert.equal(policy.action, 'continue')
+    assert.equal(policy.cooldownUntil, null)
+    assert.equal(policy.decision.cooldownUntilMs, null)
+  }
+})
+
 test('#1139: only a proven Fable window cools the Fable family', () => {
   const error = { type: 'rate_limit_error', message: 'Error' }
   const body = { type: 'error', error }
@@ -155,12 +172,7 @@ test('#1139: only a proven Fable window cools the Fable family', () => {
       'fable_rate_limited',
       'continue-and-cooldown',
     ],
-    [
-      'forwarded Retry-After',
-      { ...result, headers: { 'Retry-After': '7' } },
-      'rate_limited_unknown',
-      'continue-and-cooldown',
-    ],
+    ['forwarded Retry-After', { ...result, headers: { 'Retry-After': '7' } }, 'rate_limited_unknown', 'continue'],
     ['no native facts', { status: 429, body }, 'rate_limited_unknown', 'continue'],
     [
       'different error text',
@@ -1298,4 +1310,147 @@ test('#1562: committed or post-first-byte streams are not classified as pre-firs
     { committed: false, firstByteAt: now - 50 },
   )
   assert.equal(classifyUpstreamResult(postFirstByteSocksTimeout, { now }).reason, 'provider_timeout')
+})
+
+test('upstream 400/403 count toward unit circuit while local validation, refusals, license and first repairable 400 do not', () => {
+  const now = 1_700_000_000_000
+
+  // Upstream generic 400 stops (no failover) and counts toward circuit.
+  const generic400 = classifyUpstreamResult(
+    { status: 400, body: { error: { type: 'invalid_request_error', message: 'bad upstream payload' } } },
+    { model: 'claude-sonnet-5', now },
+  )
+  assert.equal(generic400.action, 'stop')
+  assert.equal(generic400.reason, 'invalid_request')
+  assert.equal(generic400.circuit, true)
+  assert.equal(shouldContinue(generic400), false)
+
+  // First-attempt repairable 400 does NOT count; post-repair 400 DOES count.
+  const firstRepairable = classifyUpstreamResult(
+    { status: 400, body: { error: { message: 'Conversation must end with a user message' } } },
+    { repaired: false, now },
+  )
+  assert.equal(firstRepairable.action, 'repair-and-retry')
+  assert.equal(firstRepairable.circuit, undefined)
+  const postRepair400 = classifyUpstreamResult(
+    { status: 400, body: { error: { message: 'Conversation must end with a user message' } } },
+    { repaired: true, now },
+  )
+  assert.equal(postRepair400.action, 'stop')
+  assert.equal(postRepair400.reason, 'invalid_request')
+  assert.equal(postRepair400.circuit, true)
+
+  // Upstream 400 credential_ensure_failed and organization_disabled count toward circuit.
+  const ensure400 = classifyUpstreamResult(
+    {
+      status: 400,
+      credential_ensure_failed: true,
+      body: { error: { type: 'worker_error', code: 'refresh_failed', message: 'OAuth refresh failed' } },
+    },
+    { now },
+  )
+  assert.equal(ensure400.reason, 'credential_refresh_failed')
+  assert.equal(ensure400.circuit, true)
+
+  const org400 = classifyUpstreamResult(
+    { status: 400, body: { error: { message: 'This organization has been disabled.' } } },
+    { now },
+  )
+  assert.equal(org400.reason, 'organization_disabled')
+  assert.equal(org400.circuit, true)
+
+  const org401 = classifyUpstreamResult(
+    { status: 401, body: { error: { message: 'This organization has been disabled.' } } },
+    { now },
+  )
+  assert.equal(org401.reason, 'organization_disabled')
+  assert.equal(org401.circuit, undefined)
+
+  // Upstream 403s count toward circuit.
+  for (const [label, result, opts] of [
+    [
+      'permission_denied',
+      { status: 403, body: { error: { type: 'permission_error', message: 'permission denied' } } },
+      { model: 'claude-sonnet-5', now },
+    ],
+    [
+      'proxy_or_edge_forbidden',
+      { status: 403, body: { error: { message: '<html>Cloudflare blocked</html>' } } },
+      { model: 'claude-sonnet-5', now },
+    ],
+    [
+      'fable_plan_denied',
+      { status: 403, body: { error: { type: 'permission_error', message: 'permission denied' } } },
+      { model: 'claude-fable-5', now },
+    ],
+    [
+      'organization_disabled_403',
+      {
+        status: 403,
+        body: { error: { message: 'OAuth authentication is currently not allowed for this organization.' } },
+      },
+      { model: 'claude-sonnet-5', now },
+    ],
+  ]) {
+    const policy = classifyUpstreamResult(result, opts)
+    assert.equal(policy.circuit, true, label)
+  }
+
+  // Local validation / capability / refusal / license 400 & 403 do NOT count toward circuit.
+  for (const [label, result] of [
+    [
+      'invalid_kernel_request',
+      { status: 400, body: { error: { code: 'invalid_kernel_request', message: 'bad field' } } },
+    ],
+    [
+      'unsupported_capability',
+      { status: 400, body: { error: { code: 'unsupported_capability', message: 'unsupported' } } },
+    ],
+    [
+      'thinking_incompatible',
+      { status: 400, body: { error: { code: 'thinking_incompatible', message: 'budget too large' } } },
+    ],
+    [
+      'usage_policy_refusal',
+      {
+        status: 400,
+        body: {
+          error: {
+            message:
+              'API Error: Claude Code is unable to respond to this request, which appears to violate our Usage Policy.',
+          },
+        },
+      },
+    ],
+    ['content_policy_refusal', { status: 400, body: { error: { upstream_code: 'cyber_policy', message: 'blocked' } } }],
+    ['license_required', { status: 403, body: { error: { code: 'license_required', message: 'no license' } } }],
+  ]) {
+    const policy = classifyUpstreamResult(result, { model: 'claude-sonnet-5', now })
+    assert.equal(policy.circuit, undefined, label)
+  }
+})
+
+test('deterministic request-schema 400s stop without tripping unit circuits', () => {
+  const now = 1_700_000_000_000
+  for (const [label, message] of [
+    ['advisor_extra_input_schema', 'tools.0.advisor_20260301.input_schema: Extra inputs are not permitted'],
+    [
+      'advisor_missing_beta_tag',
+      "tools.0: Input tag 'advisor_20260301' found using 'type' does not match any of the expected tags: 'bash_20250124'",
+    ],
+    ['field_required', 'messages.0.content: Field required'],
+    ['type_validation', 'max_tokens: Input should be a valid integer'],
+    ['unknown_extra_input', 'tools.1.custom.foo: Extra inputs are not permitted'],
+  ]) {
+    const policy = classifyUpstreamResult(
+      { status: 400, body: { error: { type: 'invalid_request_error', message } } },
+      { model: 'claude-sonnet-5', now },
+    )
+    assert.equal(policy.scope, 'request', label)
+    assert.equal(policy.action, 'stop', label)
+    assert.equal(policy.reason, 'invalid_request_schema', label)
+    assert.equal(policy.cooldownUntil, null, label)
+    assert.equal(policy.circuit, undefined, label)
+    assert.equal(shouldContinue(policy), false, label)
+  }
 })

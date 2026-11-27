@@ -5,8 +5,14 @@ import OpenAI from '@lobehub/icons/es/OpenAI/components/Mono'
 import { credentialRegistrationOf } from '@/lib/cred-type'
 import { tierVisual } from '@/lib/tier-visual'
 import { cn } from '@/lib/utils'
-import { clipLabel, isCodexVm } from '@/lib/vm-kind'
+import {
+  clipLabel,
+  formatSlotEmail,
+  isCodexVm,
+  slotRawEmail,
+} from '@/lib/vm-kind'
 import { claudeTier } from '@/lib/vm-status'
+import { NodePoolBadges } from '@/features/pools/node-pool-badges'
 import { ActiveVmBadge } from '@/features/vm/active-vm-badge'
 import { VmRentedMark } from '@/features/vm/vm-owner-line'
 
@@ -27,9 +33,11 @@ export function PlatformMark({ vm }: { vm: Vm }) {
 }
 
 export function VmAccountIdentity({ vm }: { vm: Vm }) {
-  const email = vm.email?.trim() || ''
+  const email = slotRawEmail(vm)
   const registration = credentialRegistrationOf(vm)
-  const crag = (vm.resolved_dataplane ?? vm.dataplane) === 'crag'
+  const crag =
+    (vm.resolved_dataplane ?? vm.dataplane) === 'crag' ||
+    vm.gemini?.auth_method === 'oauth'
   const node = vm.node_name || vm.node_id || 'local'
   return (
     <div className='min-w-0 space-y-0.5'>
@@ -47,7 +55,7 @@ export function VmAccountIdentity({ vm }: { vm: Vm }) {
           className='truncate text-xs font-semibold'
           title={email || undefined}
         >
-          {email ? clipLabel(email) : '未绑定邮箱'}
+          {email ? formatSlotEmail(email) : '未绑定邮箱'}
         </div>
         <ActiveVmBadge vm={vm} />
       </div>
@@ -82,6 +90,7 @@ export function VmAccountIdentity({ vm }: { vm: Vm }) {
         <span className='truncate' title={node}>
           {node}
         </span>
+        <NodePoolBadges pools={vm.pools} maxVisible={2} compact />
       </div>
     </div>
   )

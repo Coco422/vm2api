@@ -207,11 +207,19 @@ test('a session reset keeps the weekly reading and protects a five-hour sample t
   const { transport, posts } = scripted({ claim: { result: 'reset', cleared: ['five_hour'] } })
   const refreshUsage = createActiveUsageQuery({
     probe: async () => {
-      accountQuota.ingestHeaders(accountId, {
-        'anthropic-ratelimit-unified-5h-utilization': '0.44',
-        'anthropic-ratelimit-unified-5h-status': 'allowed',
-        'anthropic-ratelimit-unified-5h-reset': new Date(Date.now() + 3_600_000).toISOString(),
-      })
+      accountQuota.ingestHeaders(
+        accountId,
+        {
+          'anthropic-ratelimit-unified-5h-utilization': '0.44',
+          'anthropic-ratelimit-unified-5h-status': 'allowed',
+          'anthropic-ratelimit-unified-5h-reset': new Date(Date.now() + 3_600_000).toISOString(),
+        },
+        null,
+        {
+          requestStartedAt: new Date().toISOString(),
+          resetGenerations: accountQuota.resetGenerations(accountId),
+        },
+      )
       return { ...fresh, probed_at: new Date().toISOString() }
     },
   })

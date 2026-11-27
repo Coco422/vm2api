@@ -190,6 +190,8 @@ test('CRAG telemetry publishes settings, uses authenticated apply, and restores 
   let active = 0
   let bootEnabled = false
   let nextError = null
+  let nextReason = null
+  let nextMessage = null
   const server = http.createServer(async (req, res) => {
     res.setHeader('content-type', 'application/json')
     if (req.headers['x-internal-token'] !== 'fixture-internal-token') {
@@ -218,7 +220,15 @@ test('CRAG telemetry publishes settings, uses authenticated apply, and restores 
     const { enabled } = JSON.parse(value)
     events.push(['apply', enabled])
     if (nextError || enabled !== bootEnabled) {
-      res.writeHead(409).end(JSON.stringify({ error: { type: nextError || 'telemetry_restart_required' } }))
+      res.writeHead(409).end(
+        JSON.stringify({
+          error: {
+            type: nextError || 'telemetry_restart_required',
+            ...(nextReason ? { reason: nextReason } : {}),
+            ...(nextMessage ? { message: nextMessage } : {}),
+          },
+        }),
+      )
       return
     }
     res.end(
@@ -242,6 +252,13 @@ test('CRAG telemetry publishes settings, uses authenticated apply, and restores 
   }
   const ops = {
     retire: async () => ({ ok: true, running }),
+    writeKernelConfig: (projectRoot, record, options) => {
+      assert.equal(projectRoot, root)
+      assert.equal(record.id, id)
+      assert.equal(read(vmPath).schedule_hold.reason, 'maintenance')
+      assert.equal(options.publish, false)
+      events.push(['write-config'])
+    },
     restart: async () => {
       assert.equal(read(vmPath).schedule_hold.reason, 'maintenance')
       assert.equal(read(vmPath).schedulable, false)
@@ -261,6 +278,7 @@ test('CRAG telemetry publishes settings, uses authenticated apply, and restores 
     ['apply', true],
     ['hold'],
     ['apply', true],
+    ['write-config'],
     ['restart'],
     ['apply', true],
     ['release'],
@@ -329,9 +347,61 @@ test('CRAG telemetry publishes settings, uses authenticated apply, and restores 
   assert.deepEqual(events.splice(0), [['apply', false]])
 
   nextError = 'telemetry_native_settings_blocked'
-  assert.equal((await apply()).code, nextError)
+  nextReason = 'guest_source_invalid'
+  nextMessage = 'Native guest settings, telemetry allowlist or guest source prevent enabling telemetry'
+  const blocked = await apply()
+  assert.equal(blocked.code, nextError)
+  assert.equal(blocked.reason, 'guest_source_invalid')
+  assert.equal(blocked.upstream_message, nextMessage)
+  assert.match(blocked.error, /Claude Code 槽内设置或 OS 特征阻止开启遥测/)
+  assert.match(blocked.error, /guest_source_invalid/)
+  assert.match(blocked.error, /guest source prevent enabling telemetry/)
   assert.deepEqual(events.splice(0), [['apply', false]])
+
+  // Legacy cluster Docker container missing /etc/kin-computer mount: needsRecreate=true
+  // drains under maintenance, recreates the container (updating vm.runtime), and re-applies.
+  const recreateLifecycle = {
+    watchdog: {
+      hold: () => events.push(['hold']),
+      release: () => events.push(['release']),
+    },
+    poolScheduler: { vmInflight: new Map(), healthCache: new Map() },
+  }
+  const recreateResult = await applyNativeTelemetry({
+    projectRoot: root,
+    vm,
+    lifecycle: recreateLifecycle,
+    ops: {
+      retire: async () => ({ ok: true, running: true, needsRecreate: true }),
+      recreate: async () => {
+        events.push(['recreate'])
+        const latest = read(vmPath)
+        latest.runtime = { ...latest.runtime, container_id: 'new-cid-with-mounts' }
+        fs.writeFileSync(vmPath, JSON.stringify(latest))
+        nextError = null
+        nextReason = null
+        nextMessage = null
+        bootEnabled =
+          read(path.join(path.dirname(settingsPath), 'kin-seed.json')).seed_policy.telemetry_disabled === false
+        return { ok: true, action: 'reloaded' }
+      },
+    },
+  })
+  assert.equal(recreateResult.ok, true, recreateResult.error)
+  assert.equal(recreateResult.applied, true)
+  assert.equal(recreateResult.restarted, true)
+  assert.equal(read(vmPath).runtime.container_id, 'new-cid-with-mounts')
+  assert.deepEqual(events.splice(0), [
+    ['apply', false],
+    ['hold'],
+    ['apply', false],
+    ['recreate'],
+    ['apply', false],
+    ['release'],
+  ])
   nextError = null
+  nextReason = null
+  nextMessage = null
   capability = false
   assert.equal((await apply()).code, 'crag_telemetry_apply_unavailable')
   assert.equal((await probe()).telemetry.enabled, null)
@@ -351,4 +421,108 @@ test('CRAG telemetry publishes settings, uses authenticated apply, and restores 
     assert.equal(Object.hasOwn(read(settingsPath).env, key), false)
   }
   assert.deepEqual(events, [])
+})
+
+test('CRAG telemetry upload verification surfaces confirmed uploads, errors, and sanitized fields', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-crag-telemetry-upload-'))
+  const id = 'vm-02'
+  const slotDir = path.join(root, 'vms', id)
+  const runDir = path.join(slotDir, 'run')
+  const vmPath = path.join(root, 'vms', `${id}.json`)
+  writeSlot(root, id, { dataplane: 'crag', schedulable: true, seed_policy: { telemetry_disabled: false } })
+  fs.mkdirSync(runDir, { recursive: true })
+  fs.writeFileSync(path.join(runDir, 'internal.token'), 'fixture-internal-token')
+  let uploadState = { upload_confirmed: false, last_upload_at: null, last_error: null }
+  const server = http.createServer(async (req, res) => {
+    res.setHeader('content-type', 'application/json')
+    if (req.headers['x-internal-token'] !== 'fixture-internal-token') {
+      res.writeHead(401).end('{}')
+      return
+    }
+    if (req.url === '/internal/health') {
+      res.end(
+        JSON.stringify({
+          ok: true,
+          runtime_variant: 'crag-v2',
+          crag_telemetry_apply_v1: true,
+          crag_telemetry_upload_v1: true,
+        }),
+      )
+      return
+    }
+    if (req.url === '/internal/v1/telemetry/apply' && req.method === 'POST') {
+      let raw = ''
+      for await (const chunk of req) raw += chunk
+      const { enabled } = JSON.parse(raw)
+      res.end(
+        JSON.stringify({
+          ok: true,
+          applied: true,
+          enabled,
+          scope: 'native_claude_launch',
+          ...uploadState,
+        }),
+      )
+      return
+    }
+    res.writeHead(404).end('{}')
+  })
+  await new Promise((resolve, reject) => server.once('error', reject).listen(path.join(runDir, 'kernel.sock'), resolve))
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  const probe = () => readSlotProcessStatus({ projectRoot: root, vm: JSON.parse(fs.readFileSync(vmPath, 'utf8')) })
+
+  assert.deepEqual((await probe()).telemetry, {
+    state: 'launch_policy',
+    enabled: true,
+    error: null,
+    upload_confirmed: false,
+    upload_supported: true,
+    last_upload_at: null,
+    last_error: null,
+  })
+
+  uploadState = { upload_confirmed: true, last_upload_at: '2026-11-26T00:05:00.000Z', last_error: null }
+  assert.deepEqual((await probe()).telemetry, {
+    state: 'launch_policy',
+    enabled: true,
+    error: null,
+    upload_confirmed: true,
+    upload_supported: true,
+    last_upload_at: '2026-11-26T00:05:00.000Z',
+    last_error: null,
+  })
+
+  uploadState = {
+    upload_confirmed: false,
+    last_upload_at: '2026-11-26T00:05:00.000Z',
+    last_error: 'http_403',
+  }
+  assert.deepEqual((await probe()).telemetry, {
+    state: 'launch_policy',
+    enabled: true,
+    error: null,
+    upload_confirmed: false,
+    upload_supported: true,
+    last_upload_at: '2026-11-26T00:05:00.000Z',
+    last_error: 'http_403',
+  })
+
+  // Malformed free-text errors and invalid timestamps are sanitized out.
+  uploadState = {
+    upload_confirmed: false,
+    last_upload_at: 'not-a-timestamp',
+    last_error: 'https://secret.example/token',
+  }
+  assert.deepEqual((await probe()).telemetry, {
+    state: 'launch_policy',
+    enabled: true,
+    error: null,
+    upload_confirmed: false,
+    upload_supported: true,
+    last_upload_at: null,
+    last_error: null,
+  })
 })

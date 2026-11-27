@@ -2,6 +2,7 @@ import { findClaudeSecurityMonitorPrompt } from '../identity/crs-persona.mjs'
 import { getModelEntry, validateBetweenToolsThinking } from './model-policy.mjs'
 import { officialMessagesBody } from './anthropic-messages.mjs'
 import { stripIllegalCacheControlFields } from './cache-ttl.mjs'
+import { isEmptyEffortValue } from './log-fields.mjs'
 
 function textOf(content) {
   if (typeof content === 'string') return content
@@ -74,7 +75,7 @@ export function prepareClassifierBody(input, { stream = true } = {}) {
   if (entry._heuristic) incompatible('Classifier model capabilities are unknown; specify a supported model explicitly.')
   if (input.max_tokens != null && (!Number.isInteger(input.max_tokens) || input.max_tokens <= 0))
     incompatible('Classifier max_tokens must be a positive integer.')
-  let body = officialMessagesBody(input, { stream })
+  let body = officialMessagesBody(input, { stream, preserveConsecutiveUser: true })
   body.model = entry.id
   const alwaysOn = entry.capabilities.requires_adaptive === true
   if (body.thinking && !['disabled', 'adaptive', 'enabled', 'between_tools'].includes(body.thinking.type))
@@ -89,7 +90,7 @@ export function prepareClassifierBody(input, { stream = true } = {}) {
       body.thinking.budget_tokens >= body.max_tokens)
   )
     incompatible('Classifier thinking budget must be at least 1024 and below max_tokens.')
-  if (body.output_config?.effort != null && !entry.capabilities.supports_effort)
+  if (!isEmptyEffortValue(body.output_config?.effort) && !entry.capabilities.supports_effort)
     incompatible('The selected classifier model does not support output effort.')
   if (alwaysOn && ['tool', 'any', 'required'].includes(body.tool_choice?.type)) {
     incompatible('The selected classifier model requires thinking and cannot honor forced classify_result tool choice.')

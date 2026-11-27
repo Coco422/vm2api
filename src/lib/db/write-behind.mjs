@@ -75,7 +75,7 @@ function drainBatch() {
   const batch = queue.slice(0, BATCH)
   let began = false
   try {
-    db.exec('BEGIN IMMEDIATE')
+    db.exec(db.engine === 'postgres' ? 'BEGIN' : 'BEGIN IMMEDIATE')
     began = true
     for (const fn of batch) fn()
     db.exec('COMMIT')

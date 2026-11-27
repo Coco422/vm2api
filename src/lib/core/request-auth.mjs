@@ -1,5 +1,6 @@
 import { extractApiKey, extractPanelToken, verifyPanelSession, timingSafeEqualStr } from './security.mjs'
 import { makeError, ErrorType, ErrorCode } from './errors.mjs'
+import { makeApiKeyGateError } from '../admin/api-keys.mjs'
 
 /** Panel sessions are accepted only on panel routes; inference must pass managed-key gates. */
 export function createRequestAuth({ cfg, apiKeyStore, panelUsers, allowRate, json, validateManagedKey, resolveBuyer }) {
@@ -9,12 +10,16 @@ export function createRequestAuth({ cfg, apiKeyStore, panelUsers, allowRate, jso
       message: error?.body?.error?.message || 'Invalid credentials',
       status: error?.status || 401,
     }
+    for (const [name, value] of Object.entries(error.headers || {})) {
+      if (value != null) res.setHeader?.(name, value)
+    }
     json(res, error.status, error.body)
     return false
   }
 
   function rejectBuyer(res, optionalBuyer) {
-    if (!optionalBuyer) json(res, 403, { ok: false, error: { code: 'shop_login_required', message: 'Admin login required' } })
+    if (!optionalBuyer)
+      json(res, 403, { ok: false, error: { code: 'shop_login_required', message: 'Admin login required' } })
     return false
   }
 
@@ -64,9 +69,9 @@ export function createRequestAuth({ cfg, apiKeyStore, panelUsers, allowRate, jso
       return true
     }
     if (buyer) return rejectBuyer(res, optionalBuyer)
-    // Master env API key — unlimited admin
+    // Master key uses the gateway bucket only when explicitly configured.
     if (timingSafeEqualStr(token, cfg.api_key)) {
-      if (keyGate && !allowRate(token)) {
+      if (keyGate && cfg.limits?.rate_capacity_explicit && !allowRate(token)) {
         return rejectAuth(
           req,
           res,
@@ -102,35 +107,7 @@ export function createRequestAuth({ cfg, apiKeyStore, panelUsers, allowRate, jso
     if (keyError) return rejectAuth(req, res, keyError)
     const gate = keyGate ? apiKeyStore.canAccept(managed.record) : { ok: true }
     if (!gate.ok) {
-      const type =
-        gate.status === 429
-          ? gate.code.includes('quota')
-            ? ErrorType.QUOTA
-            : ErrorType.RATE_LIMIT
-          : ErrorType.PERMISSION
-      return rejectAuth(
-        req,
-        res,
-        makeError({
-          type,
-          code: gate.code,
-          message: gate.message,
-          status: gate.status,
-          details: gate.detail || undefined,
-        }),
-      )
-    }
-    if (keyGate && !allowRate(token)) {
-      return rejectAuth(
-        req,
-        res,
-        makeError({
-          type: ErrorType.RATE_LIMIT,
-          code: ErrorCode.GATEWAY_RATE_LIMIT,
-          message: 'Gateway rate limit exceeded. Retry later.',
-          status: 429,
-        }),
-      )
+      return rejectAuth(req, res, makeApiKeyGateError(gate))
     }
     req.apiKeyKind = 'managed'
     req.apiKeyRecord = managed.record

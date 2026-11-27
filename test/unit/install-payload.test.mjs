@@ -51,6 +51,65 @@ test('installation and release scripts do not require cc-node', () => {
   assert.doesNotMatch(arm64, /image-wrap-cli\/cc-node/)
   assert.doesNotMatch(release, /dist\/cc-node/)
   assert.doesNotMatch(installer, /cc-node/)
+  const native = JSON.parse(fs.readFileSync(path.join(root, 'deploy/arm64-cli.json'), 'utf8'))
+  assert.ok(arm64.includes(`ADD --checksum=sha256:${native.cli_sha256} https://github.com/`))
+  assert.doesNotMatch(arm64, /COPY --from=payload \/payload\/share\/wrap-cli\/cli-node \/input\/cli-node/)
+})
+
+test('payload download preserves upstream sources and verifies a fork overlay through a mirror', (t) => {
+  const dest = fs.mkdtempSync(path.join(os.tmpdir(), 'install-payload-source-'))
+  t.after(() => fs.rmSync(dest, { recursive: true, force: true }))
+  const content = Buffer.from('fixture-only-payload')
+  const digest = crypto.createHash('sha256').update(content).digest('hex')
+  const files = [
+    { path: 'bin/kernel', asset: 'kernel' },
+    { path: 'share/crag/kernel', asset: 'crag' },
+    { path: 'share/wrap-cli/cli-node', asset: 'cli-node', repo: 'company/fork', release: 'memory-fix' },
+  ].map((f) => ({ ...f, size: content.length, sha256: digest }))
+  const manifest = path.join(dest, 'manifest.json')
+  const bootstrap = path.join(dest, 'fetch.mjs')
+  const urls = path.join(dest, 'urls.jsonl')
+  fs.writeFileSync(
+    manifest,
+    JSON.stringify({ repo: 'upstream/repo', release: 'kernels', crag_release: 'crags', files }),
+  )
+  fs.writeFileSync(
+    bootstrap,
+    `import fs from 'node:fs';
+globalThis.fetch = async (url) => {
+  fs.appendFileSync(${JSON.stringify(urls)}, JSON.stringify(url)+'\\n');
+  return new Response(${JSON.stringify(content.toString())});
+};`,
+  )
+  for (const mirror of ['', 'https://mirror.invalid/payload/']) {
+    const target = path.join(dest, mirror ? 'mirror' : 'default')
+    fs.writeFileSync(urls, '')
+    const result = spawnSync(
+      process.execPath,
+      ['--import', bootstrap, path.join(root, 'scripts/fetch-payload.mjs'), '--manifest', manifest, '--dest', target],
+      {
+        encoding: 'utf8',
+        env: { ...process.env, VM2API_PAYLOAD_BASE_URL: mirror },
+      },
+    )
+    assert.equal(result.status, 0, result.stderr)
+    const actual = fs.readFileSync(urls, 'utf8').trim().split('\n').map(JSON.parse)
+    assert.deepEqual(
+      actual,
+      mirror
+        ? [
+            'https://mirror.invalid/payload/kernels/kernel',
+            'https://mirror.invalid/payload/crags/crag',
+            'https://mirror.invalid/payload/memory-fix/cli-node',
+          ]
+        : [
+            'https://github.com/upstream/repo/releases/download/kernels/kernel',
+            'https://github.com/upstream/repo/releases/download/crags/crag',
+            'https://github.com/company/fork/releases/download/memory-fix/cli-node',
+          ],
+    )
+    for (const file of files) assert.deepEqual(fs.readFileSync(path.join(target, file.path)), content)
+  }
 })
 
 test('the release manifest job publishes amd64 tags even when the ARM64 image is missing', () => {

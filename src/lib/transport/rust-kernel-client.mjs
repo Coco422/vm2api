@@ -108,10 +108,37 @@ export function supportsCragTelemetryApply(health) {
   return health?.ok === true && health.crag_telemetry_apply_v1 === true && cragV2KernelActive({ health })
 }
 
+export function supportsCragTelemetryUpload(health) {
+  return supportsCragTelemetryApply(health) && health.crag_telemetry_upload_v1 === true
+}
+
+function sanitizeTelemetryIso(value) {
+  return typeof value === 'string' && Number.isFinite(Date.parse(value)) ? value : null
+}
+
+function sanitizeTelemetryError(value) {
+  return typeof value === 'string' && /^[a-z][a-z0-9_]{0,63}$/.test(value) ? value : null
+}
+
 const CRAG_TELEMETRY_ERRORS = {
   telemetry_policy_not_published: 'CRAG 未读到已发布的槽内设置',
   telemetry_native_settings_blocked: 'Claude Code 槽内设置或 OS 特征阻止开启遥测',
   telemetry_restart_required: '槽内设置已发布；需排空并重启 CRAG 内核',
+}
+
+function cleanUpstreamTelemetryField(value, maxLen) {
+  if (typeof value !== 'string') return ''
+  return value.replace(/\s+/g, ' ').trim().slice(0, maxLen)
+}
+
+function formatTelemetryErrorMessage(summary, reason, upstreamMessage) {
+  let detail = ''
+  if (reason && upstreamMessage) {
+    detail = upstreamMessage.includes(reason) ? upstreamMessage : `${reason}: ${upstreamMessage}`
+  } else {
+    detail = reason || upstreamMessage
+  }
+  return detail ? `${summary} (${detail})` : summary
 }
 
 export async function verifyCragTelemetryPolicy(exec, enabled, timeoutMs) {
@@ -127,15 +154,51 @@ export async function verifyCragTelemetryPolicy(exec, enabled, timeoutMs) {
     body.applied === true &&
     body.enabled === enabled &&
     body.scope === 'native_claude_launch' &&
-    body.upload_confirmed === false
+    typeof body.upload_confirmed === 'boolean'
   ) {
-    return { ok: true, applied: true, action: 'applied', enabled, scope: body.scope, upload_confirmed: false }
+    const uploadConfirmed = enabled ? body.upload_confirmed === true : false
+    const lastUploadAt = sanitizeTelemetryIso(body.last_upload_at)
+    const lastError = enabled ? sanitizeTelemetryError(body.last_error) : null
+    return {
+      ok: true,
+      applied: true,
+      action: 'applied',
+      enabled,
+      scope: body.scope,
+      upload_confirmed: uploadConfirmed,
+      ...(lastUploadAt ? { last_upload_at: lastUploadAt } : {}),
+      ...(lastError ? { last_error: lastError } : {}),
+    }
   }
   const code = body?.error?.type
-  if (status === 409 && Object.hasOwn(CRAG_TELEMETRY_ERRORS, code)) {
-    return { ok: false, code, error: CRAG_TELEMETRY_ERRORS[code] }
+  const reason = cleanUpstreamTelemetryField(body?.error?.reason, 120)
+  const upstreamMessage = cleanUpstreamTelemetryField(body?.error?.message, 300)
+  const upstreamMeta = {
+    ...(reason ? { reason } : {}),
+    ...(upstreamMessage ? { upstream_message: upstreamMessage } : {}),
   }
-  return { ok: false, code: 'telemetry_observation_unavailable', error: 'CRAG 未确认原生遥测启动策略' }
+  if (status === 409 && Object.hasOwn(CRAG_TELEMETRY_ERRORS, code)) {
+    return {
+      ok: false,
+      code,
+      error: formatTelemetryErrorMessage(CRAG_TELEMETRY_ERRORS[code], reason, upstreamMessage),
+      ...upstreamMeta,
+    }
+  }
+  if (status === 409 && typeof code === 'string' && /^telemetry_[a-z0-9_]{1,64}$/.test(code)) {
+    return {
+      ok: false,
+      code,
+      error: formatTelemetryErrorMessage('CRAG 拒绝应用遥测策略', reason, upstreamMessage),
+      ...upstreamMeta,
+    }
+  }
+  return {
+    ok: false,
+    code: 'telemetry_observation_unavailable',
+    error: formatTelemetryErrorMessage('CRAG 未确认原生遥测启动策略', reason, upstreamMessage),
+    ...upstreamMeta,
+  }
 }
 
 export function withCragCredential(exec, health) {
@@ -243,12 +306,8 @@ export function toPublicTelemetryState(value) {
     enabled: value.enabled,
     state: value.state,
     pending_events: pending,
-    last_upload_at:
-      typeof value.last_upload_at === 'string' && Number.isFinite(Date.parse(value.last_upload_at))
-        ? value.last_upload_at
-        : null,
-    last_error:
-      typeof value.last_error === 'string' && /^[a-z][a-z0-9_]{0,63}$/.test(value.last_error) ? value.last_error : null,
+    last_upload_at: sanitizeTelemetryIso(value.last_upload_at),
+    last_error: sanitizeTelemetryError(value.last_error),
   }
 }
 
@@ -294,6 +353,11 @@ export function isNeedsRefreshResult(result) {
   if (code.startsWith('license_')) return false
   if (code === 'needs_refresh' || /needs_refresh/i.test(hay)) return true
   if (status === 401) return true
-  if (/authentication_error|token has been revoked|oauth_revoked|invalid_grant/i.test(hay)) return true
+  if (
+    /authentication_error|token has been revoked|token_revoked|invalidated oauth token|oauth_revoked|invalid_grant/i.test(
+      hay,
+    )
+  )
+    return true
   return false
 }

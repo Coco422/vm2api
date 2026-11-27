@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "cli_sha256": "f6c3744dda01f756049360113607d2bd9a25911de0fdaf30fe9bb1a1918a6788",
+  "source_sha256": "34951c0743f79668bbda184ba743dd08a2049c31b89ed7349106587053e37d76",
+  "patched_source_sha256": "1b2cef287c3cf91601ee7ac757c05421d7c3b8e31d00a76449cdbfa0e1e3923e",
+  "bun_version": "1.4.0",
+  "bun": {
+    "url": "https://github.com/oven-sh/bun/releases/download/bun-v1.4.0/bun-linux-x64-baseline.zip",
+    "member": "bun-linux-x64-baseline/bun",
+    "sha256": "184fb4595f0d401a217cf7c78c1bc430ba83314dab7a8b94805babbf7fa7097f",
+    "binary_sha256": "33d56b070be6a9e3da0ab013038b43d1645d0534ca811ecdba4472599117eb4b"
+  },
+  "upx": {
+    "url": "https://github.com/upx/upx/releases/download/v5.2.1/upx-5.2.1-amd64_linux.tar.xz",
+    "member": "upx-5.2.1-amd64_linux/upx",
+    "sha256": "402162aad30af47e60dbd767fb2e64ca394ace9727ba1f40283641f1d1b91657"
+  },
+  "projector_sha256": "39e8f86f9645f7a6f0882890b74faa724316e00c935cbe41350533f2bb584393"
+}

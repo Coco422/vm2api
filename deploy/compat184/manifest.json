@@ -1,0 +1,22 @@
+{
+  "base_commit": "864e355f6494c43b18cf2a70ceaf5c75b8ad251c",
+  "patch_sha256": "6533ff259d0e39deac2c6c214f9fa288a28cefc60fd63f14724ee7f0b23cc207",
+  "files": {
+    "src/lib/admin/api-keys.mjs": {
+      "base_sha256": "d3c1ee86871d9afa45be71f21b7f22a4f02a77efa82663ce121e30cbffd1790d",
+      "rollback_sha256": "235d65c868e88310e5e7cd92b448736356b91995df1ef345103303e447268819"
+    },
+    "src/lib/core/request-auth.mjs": {
+      "base_sha256": "97afdbf222cde8a980384f84de1eb8d2fea8c026d733e123ac22a1644d6513b8",
+      "rollback_sha256": "46079ae31f20ad3e0eadd7f755c75f0c1e38fed49d64816c29421b003805c328"
+    },
+    "src/lib/db/repos/usage-logs-repo.mjs": {
+      "base_sha256": "09a36326247ea28ae010199b597122d593b697b6d4d515ed861082721e49c2cb",
+      "rollback_sha256": "e184f39af0327fab1b1605b61cb37c9970805e0bda04f8580688a890c49bea0c"
+    },
+    "src/lib/admin/panel-routes.mjs": {
+      "base_sha256": "0287ed878f11f354063912811712638748366344263dab103c1a6d644eda9376",
+      "rollback_sha256": "bdacd980f770c6237d79b997fe56d95a1a102aea238753a5f7f707ed400f96d7"
+    }
+  }
+}

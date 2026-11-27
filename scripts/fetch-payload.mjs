@@ -77,16 +77,17 @@ if (opts.pin) {
   }
   console.log(`payload ok (${manifest.release}, ${manifest.files.length} files)`)
 } else {
-  const base = (process.env.VM2API_PAYLOAD_BASE_URL || `https://github.com/${manifest.repo}/releases/download`).replace(
-    /\/+$/,
-    '',
-  )
   const downloads = new Map()
   for (const file of manifest.files) {
     const target = path.join(opts.dest, file.path)
     if (matches(readLocal(file), file)) continue
     const isCrag = file.path.startsWith('share/crag/') || file.path === 'dist/crag-v2-licensed-amd64.tar.gz'
-    const release = isCrag ? manifest.crag_release || manifest.release : manifest.release
+    // A source-pinned company overlay may publish one asset in the fork while
+    // retaining upstream provenance for every other payload.
+    const base = (
+      process.env.VM2API_PAYLOAD_BASE_URL || `https://github.com/${file.repo || manifest.repo}/releases/download`
+    ).replace(/\/+$/, '')
+    const release = file.release || (isCrag ? manifest.crag_release || manifest.release : manifest.release)
     const url = `${base}/${release}/${file.asset}`
     if (!downloads.has(url)) {
       let res

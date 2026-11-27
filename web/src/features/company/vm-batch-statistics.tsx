@@ -31,7 +31,8 @@ export function VmBatchStatistics() {
       <CardHeader className='pb-2'>
         <CardTitle className='text-sm'>VM 批次存活周期</CardTitle>
         <p className='text-xs text-muted-foreground'>
-          仅统计已登记交付批次且有成功请求的 VM，含历史关机记录。中位数按已关机 VM 计算。
+          仅统计已登记交付批次且有成功请求的 VM，含历史关机记录。中位数按已关机
+          VM 计算。
         </p>
       </CardHeader>
       <CardContent>

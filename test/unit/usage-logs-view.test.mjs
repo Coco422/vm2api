@@ -277,6 +277,49 @@ test('row badges: via only when non-default, context1m from long_context, fast/p
   assert.equal(logs.find((r) => r.id === plain.id).context1mApplied, null)
 })
 
+test('legacy Gemini tier-suffix rows stored with model_mismatch=1 are normalized to match in view and filter', () => {
+  const db = freshDb()
+  const [tierBare, tierDowngrade, crossModel] = seed(db, [
+    {
+      model: 'gemini-4-neon-high',
+      requested_model: 'gemini-4-neon-high',
+      upstream_model: 'gemini-4-neon',
+      model_mismatch: 1,
+    },
+    {
+      model: 'gemini-4-neon-high',
+      requested_model: 'gemini-4-neon-high',
+      upstream_model: 'gemini-4-neon-low',
+      model_mismatch: 1,
+    },
+    {
+      model: 'gemini-4-hydrogen-high',
+      requested_model: 'gemini-4-hydrogen-high',
+      upstream_model: 'gemini-4-neon',
+      model_mismatch: 1,
+    },
+  ])
+  const view = new UsageLogsView(db)
+  const all = view.listBatch({}).logs
+  const byId = (id) => all.find((r) => r.id === id)
+  assert.equal(byId(tierBare.id).modelMismatch, 0)
+  assert.equal(
+    byId(tierBare.id).specialSettings.some((s) => s.key === 'mismatch'),
+    false,
+  )
+  assert.equal(byId(tierDowngrade.id).modelMismatch, 1)
+  assert.equal(
+    byId(tierDowngrade.id).specialSettings.some((s) => s.key === 'mismatch'),
+    true,
+  )
+  assert.equal(byId(crossModel.id).modelMismatch, 1)
+
+  const filteredIds = view.listBatch({ model_mismatch: true }).logs.map((r) => r.id)
+  assert.equal(filteredIds.includes(tierBare.id), false)
+  assert.equal(filteredIds.includes(tierDowngrade.id), true)
+  assert.equal(filteredIds.includes(crossModel.id), true)
+})
+
 test('request settings show sent Priority or Ultrafast and the upstream echo separately', () => {
   const db = freshDb()
   const [ultrafast, priority, unechoed] = seed(db, [
@@ -469,4 +512,32 @@ test('active sessions flag one-off (single request, no tools) apart without merg
       ['side-2', true],
     ],
   )
+})
+
+test('failed_only filter matches committed HTTP 200 failed terminals without altering exclude_status_200 (#1213)', () => {
+  const db = freshDb()
+  const rows = seed(db, [
+    { status: 200, final_state: 'verified' },
+    { status: 200, final_state: null },
+    { status: 200, final_state: 'rejected', error_code: 'slot_busy' },
+    { status: 200, final_state: 'incomplete' },
+    { status: 200, final_state: 'failed', error_code: 'gemini_tool_call_required' },
+    { status: 529, final_state: 'rejected', error_code: 'slot_busy' },
+  ])
+  const view = new UsageLogsView(db)
+  const ids = (f) =>
+    view
+      .listBatch(f)
+      .logs.map((r) => r.id)
+      .sort()
+
+  // exclude_status_200 stays pure HTTP status filtering.
+  assert.deepEqual(ids({ exclude_status_200: true }), [rows[5].id])
+
+  // failed_only includes non-2xx AND committed 200 rows whose final_state is not verified,
+  // while leaving verified and legacy unrecorded-terminal 200 rows out.
+  assert.deepEqual(ids({ failed_only: true }), [rows[2].id, rows[3].id, rows[4].id, rows[5].id].sort())
+
+  // Combining status_code=200 + failed_only isolates committed 200 streaming failures.
+  assert.deepEqual(ids({ status_code: '200', failed_only: true }), [rows[2].id, rows[3].id, rows[4].id].sort())
 })
