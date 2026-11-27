@@ -133,3 +133,31 @@ test('remote topology accepts tenant scheduling pause only with a physically run
     await assert.rejects(inspectWrapUpdateTopology(vm, {}, ops), /topology_unsupported/)
   }
 })
+
+test('remote controller rejects mismatched local config bytes and capacity before publishing or restarting', async (t) => {
+  const fs = await import('node:fs/promises'),
+    path = await import('node:path'),
+    os = await import('node:os'),
+    crypto = await import('node:crypto')
+  const { expectedKernelSlots } = await import('../../src/lib/transport/rust-kernel-supervisor.mjs')
+  const { slotExec } = await import('../../src/lib/vm/slot-runtime.mjs')
+  const f = fixture()
+  f.args.project = await fs.mkdtemp(path.join(os.tmpdir(), 'remote-config-drift-'))
+  t.after(() => fs.rm(f.args.project, { recursive: true, force: true }))
+  f.args.vm.node_id = 'node'
+  const dir = path.join(f.args.project, 'vms', f.args.vm.id, 'run')
+  await fs.mkdir(dir, { recursive: true })
+  await fs.writeFile(path.join(dir, 'kernel.json'), '{}')
+  const wanted = expectedKernelSlots(slotExec(f.args.project, f.args.vm))
+  const digest = crypto.createHash('sha256').update('{}').digest('hex')
+  for (const [slots, configSha] of [
+    [wanted, '0'.repeat(64)],
+    [wanted + 1, digest],
+  ]) {
+    f.ops.inspect = async () => ({ running: true, slots, configSha })
+    f.ops.health = async () => ({ ok: true, ready_slots: slots, closed_slots: 0 })
+    assert.equal((await f.run()).code, 'slot_kernel_config_drift')
+  }
+  assert.ok(!f.calls.includes('publish'))
+  assert.ok(!f.calls.includes('restart'))
+})

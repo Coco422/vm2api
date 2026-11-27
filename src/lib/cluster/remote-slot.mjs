@@ -2106,6 +2106,7 @@ export async function inspectWrapUpdateTopology(
   return {
     id: slot.Id,
     slots: config.slots_per_worker,
+    configSha: crypto.createHash('sha256').update(raw).digest('hex'),
     running: slot.State.Running,
     memory: slot.HostConfig.Memory,
     swap: slot.HostConfig.MemorySwap,

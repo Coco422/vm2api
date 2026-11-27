@@ -1,8 +1,11 @@
+import fs from 'node:fs/promises'
+import crypto from 'node:crypto'
+import { inspectLocalSlotKernel, publishLocalSlotKernel, restartLocalSlotKernel } from './local-slot-kernel-update.mjs'
 import { isDeepStrictEqual } from 'node:util'
 import { inspectWrapUpdateTopology } from '../cluster/remote-slot.mjs'
 import { pushKernelSelection } from '../cluster/remote-slot-files.mjs'
-import { rustKernelHealth } from '../transport/rust-kernel-client.mjs'
-import { restartRustKernel, wrapHopInflight } from '../transport/rust-kernel-supervisor.mjs'
+import { rustKernelHealth, rustKernelPaths } from '../transport/rust-kernel-client.mjs'
+import { restartRustKernel, wrapHopInflight, expectedKernelSlots } from '../transport/rust-kernel-supervisor.mjs'
 import { slotExec } from './slot-runtime.mjs'
 import { withSlotMaintenance } from './slot-maintenance.mjs'
 import { getVm, markUnschedulable } from './vm-registry.mjs'
@@ -10,7 +13,10 @@ import { getVm, markUnschedulable } from './vm-registry.mjs'
 export async function updateSlotKernel({ project, vm, routing, watchdog, poolScheduler }, ops = {}) {
   const fail = (code) => ({ id: vm.id, ok: false, code })
   if (!poolScheduler?.vmInflight || !watchdog?.hold || !watchdog?.release) return fail('kernel_lifecycle_unavailable')
-  const inspect = ops.inspect || inspectWrapUpdateTopology
+  const local = !vm.node_id
+  const inspect =
+    ops.inspect ||
+    (local ? (record, config) => inspectLocalSlotKernel(project, record, config) : inspectWrapUpdateTopology)
   let writing = false
   try {
     const before = await inspect(vm, routing)
@@ -36,12 +42,30 @@ export async function updateSlotKernel({ project, vm, routing, watchdog, poolSch
         )
           return fail('slot_update_busy')
       }
-      writing = true
-      const published = await (ops.publish || pushKernelSelection)(current, project, 'cli-node')
+      if (before.running && !local) {
+        const bytes = await fs.readFile(rustKernelPaths(exec).configPath)
+        if (
+          expectedKernelSlots(exec) !== before.slots ||
+          crypto.createHash('sha256').update(bytes).digest('hex') !== before.configSha
+        )
+          return fail('slot_kernel_config_drift')
+      }
+      const onReplace = () => {
+        writing = true
+      }
+      if (!local || ops.publish) onReplace()
+      const published =
+        local && !ops.publish
+          ? await publishLocalSlotKernel(current, project, onReplace)
+          : await (ops.publish || pushKernelSelection)(current, project, 'cli-node')
       if (!published?.ok) throw new Error('slot_payload_publish_failed')
-      const kernel = before.running
-        ? await (ops.restart || restartRustKernel)(exec)
-        : { ok: true, skipped: true, reason: 'vm_stopped' }
+      let kernel = { ok: true, skipped: true, reason: 'vm_stopped' }
+      if (before.running) {
+        if (!isDeepStrictEqual(before, await inspect(current, routing))) throw new Error('slot_update_topology_changed')
+        writing = true
+        if (local && !ops.restart) kernel = await restartLocalSlotKernel(exec, before)
+        else kernel = await (ops.restart || restartRustKernel)(exec)
+      }
       if (!kernel?.ok) throw new Error('kernel_restart_failed')
       if (!isDeepStrictEqual(before, await inspect(current, routing))) throw new Error('slot_update_topology_changed')
       return { id: vm.id, ok: true, kernel_changed: !!published.wrap?.pushed, restarted: before.running, kernel }
@@ -67,6 +91,7 @@ export async function updateSlotKernel({ project, vm, routing, watchdog, poolSch
     const code = [
       'slot_update_topology_unsupported',
       'slot_payload_publish_failed',
+      'slot_payload_digest_mismatch',
       'kernel_restart_failed',
       'slot_update_topology_changed',
     ].includes(error.message)
