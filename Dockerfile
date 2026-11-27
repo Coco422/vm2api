@@ -77,3 +77,4 @@ ENV NODE_ENV=production \
     KIN_SCHEDULER_BIN=/opt/vm2api/bin/kin-scheduler
 EXPOSE 8787
 ENTRYPOINT ["/usr/local/bin/vm2api-entrypoint"]
+CMD ["run"]

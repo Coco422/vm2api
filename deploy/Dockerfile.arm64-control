@@ -131,3 +131,4 @@ ENV NODE_ENV=production \
     DOCKER_DEFAULT_PLATFORM=linux/amd64
 EXPOSE 8787
 ENTRYPOINT ["/usr/local/bin/vm2api-entrypoint"]
+CMD ["run"]
