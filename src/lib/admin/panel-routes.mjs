@@ -299,6 +299,7 @@ import {
   retainKernelInstallSafetyHold,
   validateKernelTargets,
 } from '../vm/kernel-install.mjs'
+import { updateSlotKernel } from '../vm/slot-kernel-update.mjs'
 import { withSlotMaintenance } from '../vm/slot-maintenance.mjs'
 import { clearActiveVmFromDb, removeVmFromDb } from '../vm/vm-db-sync.mjs'
 import { renameVmId } from '../vm/vm-rename.mjs'
@@ -4253,7 +4254,37 @@ export function createPanelHandler(ctx) {
       }
 
       if (req.method === 'POST' && p === '/api/panel/wrap-cli/sync') {
-        const body = await readBody(req, 32 * 1024).catch(() => ({}))
+        const body = await readBody(req, 32 * 1024).catch(() => null)
+        if (!body || typeof body !== 'object' || Array.isArray(body))
+          return json(res, 400, { ok: false, error: { code: 'invalid_kernel_sync_request' } })
+        if (body.mode === 'keep' && body.restart === true && Object.hasOwn(body, 'ids')) {
+          if (
+            !Array.isArray(body.ids) ||
+            body.ids.length !== 1 ||
+            typeof body.ids[0] !== 'string' ||
+            !getVm(cfg.paths.project, body.ids[0])
+          ) {
+            return json(res, 400, { ok: false, error: { code: 'single_existing_slot_required' } })
+          }
+          const report = await syncInstalledKernels(
+            { project: cfg.paths.project, body },
+            async ({ project, body: exact }) => {
+              const vm = exact.ids.length === 1 && getVm(project, exact.ids[0])
+              const item = vm
+                ? await updateSlotKernel({
+                    project,
+                    vm,
+                    routing: ctx.routingConfig,
+                    watchdog: ctx.kernelWatchdog,
+                    poolScheduler: ctx.poolScheduler,
+                  })
+                : { ok: false, code: 'vm_not_found' }
+              const cluster = { items: [item], total: 1, ok_count: Number(item.ok), failed_count: Number(!item.ok) }
+              return { ...mergeKernelReports(null, cluster), mode: 'keep' }
+            },
+          )
+          return json(res, report.ok ? 200 : 400, panel.ok(report))
+        }
         const report = await syncInstalledKernels({
           project: cfg.paths.project,
           routingConfig: ctx.routingConfig,

@@ -2044,3 +2044,63 @@ export async function destroyRemoteSlot(vm) {
     return failure(err)
   }
 }
+
+/** Only the fixed-IP Docker wrap layout with its separately owned egress can restart in place. */
+export async function inspectWrapUpdateTopology(vm, routing) {
+  const unsupported = () => {
+    throw new Error('slot_update_topology_unsupported')
+  }
+  if (!clusterDockerClaude(vm) || resolveKernelDataplane(vm, routing) !== 'wrap') unsupported()
+  const session = await nodeSession(vmNodeId(vm))
+  const slot = await inspectContainerOrNull(session.docker, vm.runtime?.container || containerName(vm.id))
+  const helper = await inspectContainerOrNull(session.docker, slotEgressNames(vm.id).egress)
+  const network = slot?.HostConfig?.NetworkMode
+  const net = network && (await inspectNetworkOrNull(session.docker, network))
+  const endpoint = slot?.NetworkSettings?.Networks?.[network]
+  const ip = endpoint?.IPAMConfig?.IPv4Address
+  const dir = remoteSlotDir(session.host, vm.id) + '/slot-bin'
+  if (
+    !slot?.Id ||
+    slot.Config?.Labels?.['kin.vm.id'] !== vm.id ||
+    !clusterDockerCommandReady(vm, slot, routing) ||
+    !slot.Mounts?.some((m) => m.Type === 'bind' && m.Destination === LIVE_BIN && m.Source === dir && m.RW === false) ||
+    net?.Driver !== 'bridge' ||
+    !ip ||
+    Object.keys(slot.NetworkSettings.Networks).length !== 1 ||
+    (slot.State.Running && endpoint.IPAddress !== ip) ||
+    !helper?.Id ||
+    helper.Config?.Labels?.['kin.egress.vm'] !== vm.id ||
+    helper.HostConfig?.NetworkMode !== 'host' ||
+    (slot.State.Running && !helper.State?.Running) ||
+    !['running', 'exited', 'created'].includes(slot.State.Status) ||
+    !['running', 'stopped'].includes(vm.status) ||
+    (vm.status === 'running') !== slot.State.Running
+  )
+    unsupported()
+  const configDir = remoteSlotDir(session.host, vm.id) + '/run'
+  if (!slot.Mounts.some((m) => m.Type === 'bind' && m.Destination === '/run/kin' && m.Source === configDir))
+    unsupported()
+  const raw = await readRemoteFileNoFollow(session.client, configDir + '/kernel.json')
+  const config = raw && JSON.parse(raw)
+  if (
+    config?.vm_id !== vm.id ||
+    config.claude_bin !== LIVE_BIN + '/cli-node' ||
+    config.dataplane !== 'wrap' ||
+    !Number.isInteger(config.slots_per_worker) ||
+    config.slots_per_worker < 1
+  )
+    unsupported()
+  return {
+    id: slot.Id,
+    slots: config.slots_per_worker,
+    running: slot.State.Running,
+    memory: slot.HostConfig.Memory,
+    swap: slot.HostConfig.MemorySwap,
+    nanoCpus: slot.HostConfig.NanoCpus,
+    network: net.Id,
+    ip,
+    helper: helper.Id,
+    helperStarted: helper.State.StartedAt,
+    helperRunning: helper.State.Running,
+  }
+}
