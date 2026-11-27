@@ -79,3 +79,57 @@ test('partial publication or failed restart blocks scheduling before releasing h
     assert.deepEqual(f.calls.slice(-2), ['block', 'release'])
   }
 })
+
+test('remote topology accepts tenant scheduling pause only with a physically running unpaused Docker slot', async () => {
+  const { inspectWrapUpdateTopology } = await import('../../src/lib/cluster/remote-slot.mjs')
+  const id = 'vm-fixture'
+  const vm = {
+    id,
+    node_id: 'node-fixture',
+    platform: 'anthropic',
+    status: 'paused',
+    schedule_off: true,
+    schedule_off_reason: 'tenant_paused',
+    runtime: { container: 'slot' },
+  }
+  const before = structuredClone(vm)
+  const root = '/fixture/vms/' + id
+  const slot = {
+    Id: 'same-slot',
+    Config: { Cmd: ['/opt/kin-live/kin-kernel'], Labels: { 'kin.vm.id': id } },
+    HostConfig: { NetworkMode: 'private', Memory: 3 * 2 ** 30, MemorySwap: 5 * 2 ** 30 },
+    State: { Status: 'running', Running: true, Paused: false },
+    Mounts: [
+      { Type: 'bind', Source: root + '/slot-bin', Destination: '/opt/kin-live', RW: false },
+      { Type: 'bind', Source: root + '/run', Destination: '/run/kin' },
+    ],
+    NetworkSettings: { Networks: { private: { IPAddress: '192.0.2.5', IPAMConfig: { IPv4Address: '192.0.2.5' } } } },
+  }
+  const helper = {
+    Id: 'same-helper',
+    Config: { Labels: { 'kin.egress.vm': id } },
+    HostConfig: { NetworkMode: 'host' },
+    State: { Running: true, StartedAt: 'fixture' },
+  }
+  const ops = {
+    sessionFor: async () => ({ host: { root: '/fixture' } }),
+    inspect: async (_, name) => (name === 'slot' ? slot : helper),
+    inspectNetwork: async () => ({ Driver: 'bridge', Id: 'fixed' }),
+    readConfig: async () =>
+      JSON.stringify({ vm_id: id, claude_bin: '/opt/kin-live/cli-node', dataplane: 'wrap', slots_per_worker: 2 }),
+  }
+  assert.equal((await inspectWrapUpdateTopology(vm, {}, ops)).running, true)
+  assert.deepEqual(vm, before)
+  for (const patch of [{ schedule_off: false }, { schedule_off_reason: 'operator' }, { status: 'stopped' }]) {
+    await assert.rejects(inspectWrapUpdateTopology({ ...vm, ...patch }, {}, ops), /topology_unsupported/)
+  }
+  for (const state of [
+    { Status: 'paused', Running: true, Paused: true },
+    { Status: 'running', Running: true, Paused: true },
+    { Status: 'exited', Running: false, Paused: false },
+    { Status: 'exited', Running: true, Paused: false },
+  ]) {
+    slot.State = state
+    await assert.rejects(inspectWrapUpdateTopology(vm, {}, ops), /topology_unsupported/)
+  }
+})

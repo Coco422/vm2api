@@ -2046,19 +2046,30 @@ export async function destroyRemoteSlot(vm) {
 }
 
 /** Only the fixed-IP Docker wrap layout with its separately owned egress can restart in place. */
-export async function inspectWrapUpdateTopology(vm, routing) {
+export async function inspectWrapUpdateTopology(
+  vm,
+  routing,
+  {
+    sessionFor = nodeSession,
+    inspect = inspectContainerOrNull,
+    inspectNetwork = inspectNetworkOrNull,
+    readConfig = readRemoteFileNoFollow,
+  } = {},
+) {
   const unsupported = () => {
     throw new Error('slot_update_topology_unsupported')
   }
   if (!clusterDockerClaude(vm) || resolveKernelDataplane(vm, routing) !== 'wrap') unsupported()
-  const session = await nodeSession(vmNodeId(vm))
-  const slot = await inspectContainerOrNull(session.docker, vm.runtime?.container || containerName(vm.id))
-  const helper = await inspectContainerOrNull(session.docker, slotEgressNames(vm.id).egress)
+  const session = await sessionFor(vmNodeId(vm))
+  const slot = await inspect(session.docker, vm.runtime?.container || containerName(vm.id))
+  const helper = await inspect(session.docker, slotEgressNames(vm.id).egress)
   const network = slot?.HostConfig?.NetworkMode
-  const net = network && (await inspectNetworkOrNull(session.docker, network))
+  const net = network && (await inspectNetwork(session.docker, network))
   const endpoint = slot?.NetworkSettings?.Networks?.[network]
   const ip = endpoint?.IPAMConfig?.IPv4Address
   const dir = remoteSlotDir(session.host, vm.id) + '/slot-bin'
+  const tenantPaused = vm.status === 'paused' && vm.schedule_off === true && vm.schedule_off_reason === 'tenant_paused'
+  const expectsRunning = vm.status === 'running' || tenantPaused
   if (
     !slot?.Id ||
     slot.Config?.Labels?.['kin.vm.id'] !== vm.id ||
@@ -2073,14 +2084,16 @@ export async function inspectWrapUpdateTopology(vm, routing) {
     helper.HostConfig?.NetworkMode !== 'host' ||
     (slot.State.Running && !helper.State?.Running) ||
     !['running', 'exited', 'created'].includes(slot.State.Status) ||
-    !['running', 'stopped'].includes(vm.status) ||
-    (vm.status === 'running') !== slot.State.Running
+    slot.State.Paused !== false ||
+    (!expectsRunning && vm.status !== 'stopped') ||
+    expectsRunning !== slot.State.Running ||
+    expectsRunning !== (slot.State.Status === 'running')
   )
     unsupported()
   const configDir = remoteSlotDir(session.host, vm.id) + '/run'
   if (!slot.Mounts.some((m) => m.Type === 'bind' && m.Destination === '/run/kin' && m.Source === configDir))
     unsupported()
-  const raw = await readRemoteFileNoFollow(session.client, configDir + '/kernel.json')
+  const raw = await readConfig(session.client, configDir + '/kernel.json')
   const config = raw && JSON.parse(raw)
   if (
     config?.vm_id !== vm.id ||
