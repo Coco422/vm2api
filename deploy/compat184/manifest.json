@@ -1,6 +1,6 @@
 {
   "base_commit": "864e355f6494c43b18cf2a70ceaf5c75b8ad251c",
-  "patch_sha256": "6533ff259d0e39deac2c6c214f9fa288a28cefc60fd63f14724ee7f0b23cc207",
+  "patch_sha256": "e8335f3983511115c02dda1a72b451fdfd9f482932787bb1eb3108dfc1b07ffa",
   "files": {
     "src/lib/admin/api-keys.mjs": {
       "base_sha256": "d3c1ee86871d9afa45be71f21b7f22a4f02a77efa82663ce121e30cbffd1790d",
@@ -12,11 +12,39 @@
     },
     "src/lib/db/repos/usage-logs-repo.mjs": {
       "base_sha256": "09a36326247ea28ae010199b597122d593b697b6d4d515ed861082721e49c2cb",
-      "rollback_sha256": "e184f39af0327fab1b1605b61cb37c9970805e0bda04f8580688a890c49bea0c"
+      "rollback_sha256": "0e4d02b0f5d285c61958a44c58b225a1cca2c4c233071e2d73320ebc194cff28"
     },
     "src/lib/admin/panel-routes.mjs": {
       "base_sha256": "0287ed878f11f354063912811712638748366344263dab103c1a6d644eda9376",
       "rollback_sha256": "bdacd980f770c6237d79b997fe56d95a1a102aea238753a5f7f707ed400f96d7"
+    },
+    "src/lib/admin/pricing.mjs": {
+      "base_sha256": "94c245e24289bd0e584b9d31d6dcfe8758c56f5c297fbe64e872ef1c24566a3f",
+      "rollback_sha256": "e456cd5190607b83557a57c2ab78a7a07e967741ddb2eaa31ef61c05cf38ffdf"
+    },
+    "src/lib/admin/request-log.mjs": {
+      "base_sha256": "b98562e227ce2756c1fc8cfeaa71cc4d0d385a7a8bd40b53cb4977fe8b7c606b",
+      "rollback_sha256": "4a296d8dc0d926a45b203c7a0374e80ecd9bc95320c44752cded23326d5d841d"
+    },
+    "src/lib/protocol/openai-usage.mjs": {
+      "base_sha256": "6e1a2820a3b191802ddbb198c240b045a8b9b8f27c5e7fecc1e3d5d50e9845cc",
+      "rollback_sha256": "a4b02d3e1dee3bd1056fe373d9dded36033fe28a810b15a7825feb69dc197aea"
+    },
+    "src/lib/db/migrations/068_multi_tier_key_permissions.sql": {
+      "base_sha256": null,
+      "rollback_sha256": "08cd9f44f9a7bdb431c7928d9297782e8e932ea91015889f93df54f668b06f71"
+    },
+    "src/lib/db/migrations/069_log_error_details_and_hop_correlation.sql": {
+      "base_sha256": null,
+      "rollback_sha256": "0c709373ed1e8d7d9a4319836b7ad0ae3a24aca7b570796be959d6ffb68553b7"
+    },
+    "src/lib/db/migrations/070_usage_logs_advisor_billing.sql": {
+      "base_sha256": null,
+      "rollback_sha256": "e5f1955795d5f8dada8e46e4ba19fa10eb25961e57b198299d1703eec51c7dcd"
+    },
+    "src/lib/db/migrations/071_scheduler_center.sql": {
+      "base_sha256": null,
+      "rollback_sha256": "d990e9d096869bf5217b7fc2019dd0df365277d2d87b7ea9cf267d05ae31b607"
     }
   }
 }

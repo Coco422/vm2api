@@ -32,7 +32,12 @@ def prepare(repo, output):
         with tarfile.open(archive) as tar:
             tar.extractall(stage, filter='data')
         for file, hashes in manifest['files'].items():
-            if sha(stage / file) != hashes['base_sha256']:
+            source = stage / file
+            if hashes['base_sha256'] is None:
+                if source.exists() or source.is_symlink():
+                    raise ValueError(f'unexpected base file: {file}')
+                continue
+            if sha(source) != hashes['base_sha256']:
                 raise ValueError(f'base digest mismatch: {file}')
         subprocess.run(['git', 'apply', '--check', str(patch)], cwd=stage, check=True)
         subprocess.run(['git', 'apply', str(patch)], cwd=stage, check=True)
